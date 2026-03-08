@@ -1832,6 +1832,46 @@ def test_generate_scheduler_kv_cache_config():
     )
 
 
+def test_generate_scheduler_kv_cache_config_uses_global_min_num_blocks():
+    kv_cache_specs = {
+        "layer_1": new_kv_cache_spec(),
+        "layer_2": new_kv_cache_spec(head_size=128),
+    }
+    kv_cache_configs = [
+        KVCacheConfig(
+            num_blocks=10,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["layer_1", "layer_2"],
+                    UniformTypeKVCacheSpecs(
+                        block_size=16, kv_cache_specs=kv_cache_specs
+                    ),
+                ),
+            ],
+        ),
+        KVCacheConfig(
+            num_blocks=6,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["layer_1", "layer_2"],
+                    UniformTypeKVCacheSpecs(
+                        block_size=16, kv_cache_specs=kv_cache_specs
+                    ),
+                ),
+            ],
+        ),
+    ]
+
+    scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+    assert scheduler_kv_cache_config == KVCacheConfig(
+        num_blocks=6,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer_1", "layer_2"], new_kv_cache_spec())],
+    )
+
+
 def new_mla_spec(cache_dtype_str=None):
     return MLAAttentionSpec(
         block_size=16,

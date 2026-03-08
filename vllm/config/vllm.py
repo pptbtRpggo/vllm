@@ -1024,6 +1024,7 @@ class VllmConfig:
                 "to True to enable."
             )
         current_platform.check_and_update_config(self)
+        self.resolve_auto_pp_layer_partition()
 
         # If DCP, ensure the block size is right.
         if self.parallel_config.decode_context_parallel_size > 1:
@@ -1621,6 +1622,18 @@ class VllmConfig:
                     f"but got '{self.load_config.load_format}'. "
                     f"Model: {self.model_config.model}"
                 )
+
+    def resolve_auto_pp_layer_partition(self) -> None:
+        if (
+            self.model_config is None
+            or not self.parallel_config.uses_auto_pp_partitioning
+        ):
+            return
+
+        from vllm.distributed.pp_partition import resolve_auto_pp_layer_partition
+
+        partitions = resolve_auto_pp_layer_partition(self)
+        self.parallel_config.set_pp_layer_partition(partitions)
 
     def compile_debug_dump_path(self) -> Path | None:
         """Returns a rank-aware path for dumping

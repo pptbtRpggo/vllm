@@ -108,6 +108,19 @@ def get_pp_indices(
     are attempting to reduce maximum memory consumption across partitions.
     """
     partition_list_str = envs.VLLM_PP_LAYER_PARTITION
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is not None:
+        config_partition = vllm_config.parallel_config.get_pp_layer_partition(
+            num_hidden_layers
+        )
+        if config_partition is not None:
+            partitions = config_partition
+            start_layer = sum(partitions[:pp_rank])
+            end_layer = start_layer + partitions[pp_rank]
+            return (start_layer, end_layer)
+
     if partition_list_str is not None:
         try:
             partitions = [int(layer) for layer in partition_list_str.split(",")]

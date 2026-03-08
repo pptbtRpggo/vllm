@@ -4,7 +4,7 @@
 import logging
 import os
 from dataclasses import MISSING, Field, asdict, dataclass, field
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -56,6 +56,70 @@ def test_async_scheduling_with_pipeline_parallelism_is_allowed():
         ),
     )
     assert cfg.scheduler_config.async_scheduling is True
+
+
+def test_pp_layer_partition_config_parsing():
+    config = ParallelConfig(pipeline_parallel_size=2, pp_layer_partition="10,14")
+    assert config.get_pp_layer_partition(24) == [10, 14]
+
+
+def test_pp_stage_device_map_config_parsing():
+    with patch.object(current_platform, "is_cuda_alike", return_value=True):
+        config = ParallelConfig(
+            pipeline_parallel_size=2,
+            tensor_parallel_size=2,
+            distributed_executor_backend="mp",
+            pp_stage_device_map="0,1;2,3",
+        )
+
+    assert config.get_pp_stage_device_map() == [[0, 1], [2, 3]]
+    assert config.get_stage_local_device_id(0) == 0
+    assert config.get_stage_local_device_id(1) == 1
+    assert config.get_stage_local_device_id(2) == 2
+    assert config.get_stage_local_device_id(3) == 3
+
+
+def test_pp_stage_device_map_rejects_duplicate_devices():
+    with patch.object(current_platform, "is_cuda_alike", return_value=True):
+        with pytest.raises(ValueError, match="must not reuse CUDA device ids"):
+            ParallelConfig(
+                pipeline_parallel_size=2,
+                tensor_parallel_size=2,
+                distributed_executor_backend="mp",
+                pp_stage_device_map="0,1;1,2",
+            )
+
+
+def test_auto_pp_partition_requires_stage_device_map():
+    with pytest.raises(ValueError, match="requires pp_stage_device_map"):
+        ParallelConfig(
+            pipeline_parallel_size=2,
+            pp_partition_strategy="auto_hetero",
+        )
+
+
+def test_auto_pp_partition_rejects_manual_partition():
+    with pytest.raises(ValueError, match="pp_layer_partition cannot be set"):
+        ParallelConfig(
+            pipeline_parallel_size=2,
+            pp_partition_strategy="auto_memory",
+            pp_layer_partition="10,14",
+        )
+
+
+def test_vllm_config_resolves_auto_pp_partition():
+    cfg = object.__new__(VllmConfig)
+    cfg.model_config = object()
+    cfg.parallel_config = Mock()
+    cfg.parallel_config.uses_auto_pp_partitioning = True
+
+    with patch(
+        "vllm.distributed.pp_partition.resolve_auto_pp_layer_partition",
+        return_value=[10, 14],
+    ):
+        VllmConfig.resolve_auto_pp_layer_partition(cfg)
+
+    cfg.parallel_config.set_pp_layer_partition.assert_called_once_with([10, 14])
 
 
 @dataclass

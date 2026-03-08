@@ -224,11 +224,22 @@ class Worker(WorkerBase):
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             parallel_config = self.parallel_config
+            explicit_device_id = parallel_config.get_stage_local_device_id(self.rank)
+            if explicit_device_id is not None:
+                visible_device_count = (
+                    torch.cuda.device_count() if torch.cuda.is_available() else 0
+                )
+                assert explicit_device_id < visible_device_count, (
+                    f"Configured CUDA device id {explicit_device_id} is out of bounds "
+                    f"for {visible_device_count} visible devices."
+                )
+                self.local_rank = explicit_device_id
             if (
                 parallel_config.distributed_executor_backend
                 not in ("ray", "external_launcher")
                 and parallel_config.data_parallel_backend != "ray"
                 and parallel_config.nnodes_within_dp == 1
+                and explicit_device_id is None
             ):
                 # Use local DP rank if available, otherwise use global DP rank.
                 dp_local_rank = self.parallel_config.data_parallel_rank_local

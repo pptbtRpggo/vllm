@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import format_gib
+from vllm.utils.torch_utils import get_dtype_size, get_kv_cache_torch_dtype
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
@@ -86,6 +87,28 @@ logger = init_logger(__name__)
 # The function `init_none_hash` initializes this variable globally.
 NONE_HASH: BlockHash
 _CBOR_HASH_FUNCTIONS = frozenset({sha256_cbor, xxhash_cbor})
+
+
+def estimate_decoder_layer_kv_cache_bytes(vllm_config: VllmConfig) -> int:
+    """Estimate per-rank KV cache bytes needed for one decoder layer."""
+
+    model_config = vllm_config.model_config
+    cache_config = vllm_config.cache_config
+    parallel_config = vllm_config.parallel_config
+    assert model_config is not None
+    assert cache_config.block_size is not None
+
+    aligned_tokens = (
+        cdiv(model_config.max_model_len, cache_config.block_size) * cache_config.block_size
+    )
+    num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+    head_size = model_config.get_head_size()
+    kv_cache_dtype = get_kv_cache_torch_dtype(
+        cache_config.cache_dtype, model_config.dtype
+    )
+    return (
+        2 * aligned_tokens * num_kv_heads * head_size * get_dtype_size(kv_cache_dtype)
+    )
 
 
 def init_none_hash(hash_fn: Callable[[Any], bytes]):
@@ -1263,12 +1286,15 @@ def generate_scheduler_kv_cache_config(
     """
     Generate the KV cache configuration for the scheduler.
     """
-    assert all(
-        [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
-    )
     # All workers have the same kv_cache_config except layer names, so use
-    # an arbitrary one to initialize the scheduler.
+    # an arbitrary one to initialize the scheduler. The scheduler must honor
+    # the smallest stage-local KV capacity because every request traverses all
+    # PP stages.
     cfg = copy.deepcopy(kv_cache_configs[0])
+    min_num_blocks = min(
+        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+    )
+    _shrink_kv_cache_config_num_blocks(cfg, min_num_blocks)
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
@@ -1277,6 +1303,20 @@ def generate_scheduler_kv_cache_config(
                 iter(group.kv_cache_spec.kv_cache_specs.values())
             )
     return cfg
+
+
+def _shrink_kv_cache_config_num_blocks(
+    kv_cache_config: KVCacheConfig, target_num_blocks: int
+) -> None:
+    num_blocks_old = kv_cache_config.num_blocks
+    kv_cache_config.num_blocks = target_num_blocks
+
+    if num_blocks_old == target_num_blocks:
+        return
+
+    for tensor in kv_cache_config.kv_cache_tensors:
+        assert tensor.size % num_blocks_old == 0
+        tensor.size = tensor.size // num_blocks_old * target_num_blocks
 
 
 def _report_kv_cache_config(
@@ -1589,21 +1629,23 @@ def get_kv_cache_configs(
             )
         )
 
-    # Change the num_blocks of each rank to the smallest among all ranks.
-    # We also need to shrink the tensor size proportionally to avoid
-    # allocating unused memory.
-    min_num_blocks = min(
-        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
-    )
-    for kv_cache_config in kv_cache_configs:
-        num_blocks_old = kv_cache_config.num_blocks
-        kv_cache_config.num_blocks = min_num_blocks
+    # Keep KV capacity stage-local for PP, but still make TP ranks within the
+    # same stage agree on the smallest capacity available to that stage.
+    min_num_blocks_by_pp_stage: dict[int, int] = {}
+    for rank, kv_cache_config in enumerate(kv_cache_configs):
+        pp_rank = vllm_config.parallel_config.get_pp_rank(rank)
+        if pp_rank not in min_num_blocks_by_pp_stage:
+            min_num_blocks_by_pp_stage[pp_rank] = kv_cache_config.num_blocks
+        else:
+            min_num_blocks_by_pp_stage[pp_rank] = min(
+                min_num_blocks_by_pp_stage[pp_rank], kv_cache_config.num_blocks
+            )
 
-        # Shrink tensor size proportionally
-        for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
-
+    for rank, kv_cache_config in enumerate(kv_cache_configs):
+        _shrink_kv_cache_config_num_blocks(
+            kv_cache_config,
+            min_num_blocks_by_pp_stage[vllm_config.parallel_config.get_pp_rank(rank)],
+        )
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)
 

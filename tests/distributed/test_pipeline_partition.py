@@ -5,6 +5,7 @@ import os
 
 import pytest
 
+from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.utils import get_pp_indices
 
 
@@ -36,6 +37,19 @@ def test_custom_layer_partition(monkeypatch: pytest.MonkeyPatch):
         # Wrong number of layers
         with pytest.raises(ValueError):
             _verify("5,5,5,5", 21, 4, [(0, 5), (5, 10), (10, 15), (15, 20)])
+
+
+def test_config_layer_partition_overrides_env(monkeypatch: pytest.MonkeyPatch):
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_PP_LAYER_PARTITION", "5,5")
+        vllm_config = VllmConfig(
+            parallel_config=ParallelConfig(
+                pipeline_parallel_size=2, pp_layer_partition="4,6"
+            )
+        )
+        with set_current_vllm_config(vllm_config):
+            assert get_pp_indices(10, 0, 2) == (0, 4)
+            assert get_pp_indices(10, 1, 2) == (4, 10)
 
 
 @pytest.mark.parametrize(

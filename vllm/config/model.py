@@ -1172,7 +1172,12 @@ class ModelConfig:
             parallel_config.rank // parallel_config.tensor_parallel_size
         ) % parallel_config.pipeline_parallel_size
         pp_size = parallel_config.pipeline_parallel_size
-        start, end = get_pp_indices(total_num_hidden_layers, pp_rank, pp_size)
+        partitions = parallel_config.get_pp_layer_partition(total_num_hidden_layers)
+        if partitions is None:
+            start, end = get_pp_indices(total_num_hidden_layers, pp_rank, pp_size)
+        else:
+            start = sum(partitions[:pp_rank])
+            end = start + partitions[pp_rank]
         return start, end
 
     def get_num_layers(self, parallel_config: ParallelConfig) -> int:

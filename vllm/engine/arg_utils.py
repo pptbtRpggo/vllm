@@ -399,6 +399,15 @@ class EngineArgs:
     ) = ParallelConfig.distributed_executor_backend
     # number of P/D disaggregation (or other disaggregation) workers
     pipeline_parallel_size: int = ParallelConfig.pipeline_parallel_size
+    pp_partition_strategy: str = ParallelConfig.pp_partition_strategy
+    pp_layer_partition: str | None = ParallelConfig.pp_layer_partition
+    pp_stage_device_map: str | None = ParallelConfig.pp_stage_device_map
+    pp_auto_partition_safety_margin_gb: float = (
+        ParallelConfig.pp_auto_partition_safety_margin_gb
+    )
+    pp_auto_partition_log_details: bool = (
+        ParallelConfig.pp_auto_partition_log_details
+    )
     master_addr: str = ParallelConfig.master_addr
     master_port: int = ParallelConfig.master_port
     nnodes: int = ParallelConfig.nnodes
@@ -812,6 +821,28 @@ class EngineArgs:
             "--pipeline-parallel-size",
             "-pp",
             **parallel_kwargs["pipeline_parallel_size"],
+        )
+        parallel_group.add_argument(
+            "--pp-partition-strategy",
+            **parallel_kwargs["pp_partition_strategy"],
+        )
+        parallel_group.add_argument(
+            "--pp-layer-partition",
+            **parallel_kwargs["pp_layer_partition"],
+        )
+        parallel_group.add_argument(
+            "--pp-stage-device-map",
+            **parallel_kwargs["pp_stage_device_map"],
+        )
+        parallel_group.add_argument(
+            "--pp-auto-partition-safety-margin-gb",
+            **parallel_kwargs["pp_auto_partition_safety_margin_gb"],
+        )
+        parallel_group.add_argument(
+            "--disable-pp-auto-partition-log-details",
+            action="store_false",
+            dest="pp_auto_partition_log_details",
+            help="Disable detailed logging for automatically resolved heterogeneous PP partitions.",
         )
         parallel_group.add_argument("--master-addr", **parallel_kwargs["master_addr"])
         parallel_group.add_argument("--master-port", **parallel_kwargs["master_port"])
@@ -1706,6 +1737,11 @@ class EngineArgs:
 
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
+            pp_partition_strategy=self.pp_partition_strategy,
+            pp_layer_partition=self.pp_layer_partition,
+            pp_stage_device_map=self.pp_stage_device_map,
+            pp_auto_partition_safety_margin_gb=self.pp_auto_partition_safety_margin_gb,
+            pp_auto_partition_log_details=self.pp_auto_partition_log_details,
             tensor_parallel_size=self.tensor_parallel_size,
             prefill_context_parallel_size=self.prefill_context_parallel_size,
             data_parallel_size=self.data_parallel_size,

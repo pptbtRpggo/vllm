@@ -37,6 +37,7 @@ DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
 EPLBPolicyOption = Literal["default"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
+PPPartitionStrategy = Literal["manual", "uniform", "auto_memory", "auto_hetero"]
 All2AllBackend = Literal[
     "naive",
     "pplx",
@@ -46,6 +47,18 @@ All2AllBackend = Literal[
     "allgather_reducescatter",
     "flashinfer_all2allv",
 ]
+
+
+def _parse_non_negative_int_csv(raw: str, field_name: str) -> list[int]:
+    try:
+        values = [int(item.strip()) for item in raw.split(",")]
+    except ValueError as err:
+        raise ValueError(f"Invalid {field_name}: {raw}") from err
+
+    if not values or any(item < 0 for item in values):
+        raise ValueError(f"Invalid {field_name}: {raw}")
+
+    return values
 
 
 @config
@@ -97,6 +110,20 @@ class ParallelConfig:
 
     pipeline_parallel_size: int = 1
     """Number of pipeline parallel groups."""
+    pp_partition_strategy: PPPartitionStrategy = "manual"
+    """Strategy used to resolve PP layer partitioning."""
+    pp_layer_partition: str | None = None
+    """Optional comma-separated hidden-layer counts for each PP stage.
+    Example: "10,14" for a 2-stage pipeline with 24 hidden layers."""
+    pp_stage_device_map: str | None = None
+    """Optional semicolon-separated CUDA device groups for each PP stage.
+    Example: "0,1;2,3" for PP=2 and TP=2. Each stage must contain exactly
+    tensor_parallel_size device ids, and all device ids must be unique."""
+    pp_auto_partition_safety_margin_gb: float = Field(default=2.0, ge=0.0)
+    """Reserved GPU memory per rank when auto-computing heterogeneous PP
+    partitions."""
+    pp_auto_partition_log_details: bool = True
+    """Whether to log detailed heterogeneous PP partition decisions."""
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""
     prefill_context_parallel_size: int = 1
@@ -412,7 +439,179 @@ class ParallelConfig:
                 "dcp_comm_backend='a2a' requires decode_context_parallel_size > 1."
             )
 
+        pp_partition = self.get_pp_layer_partition()
+        if (
+            pp_partition is not None
+            and len(pp_partition) != self.pipeline_parallel_size
+        ):
+            raise ValueError(
+                "pp_layer_partition must provide exactly one partition size per "
+                f"pipeline stage, but got {len(pp_partition)} values for "
+                f"pipeline_parallel_size={self.pipeline_parallel_size}."
+            )
+
+        pp_device_map = self.get_pp_stage_device_map()
+        if (
+            self.pp_partition_strategy != "manual"
+            and self.pp_layer_partition is not None
+        ):
+            raise ValueError(
+                "pp_layer_partition cannot be set when pp_partition_strategy is "
+                f"{self.pp_partition_strategy!r}. Use the manual strategy or "
+                "remove pp_layer_partition."
+            )
+
+        if self.pp_partition_strategy in ("auto_memory", "auto_hetero"):
+            if self.pipeline_parallel_size <= 1:
+                raise ValueError(
+                    f"{self.pp_partition_strategy} requires pipeline_parallel_size > 1."
+                )
+            if pp_device_map is None:
+                raise ValueError(
+                    f"{self.pp_partition_strategy} requires pp_stage_device_map."
+                )
+            if self.data_parallel_size != 1:
+                raise ValueError(
+                    f"{self.pp_partition_strategy} currently requires "
+                    "data_parallel_size == 1."
+                )
+            if self.nnodes != 1:
+                raise ValueError(
+                    f"{self.pp_partition_strategy} currently requires nnodes == 1."
+                )
+            if (
+                self.distributed_executor_backend is not None
+                and self.distributed_executor_backend != "mp"
+            ):
+                raise ValueError(
+                    f"{self.pp_partition_strategy} is only supported with "
+                    "the mp executor."
+                )
+
+        if pp_device_map is not None:
+            if self.pipeline_parallel_size <= 1:
+                raise ValueError(
+                    "pp_stage_device_map requires pipeline_parallel_size > 1."
+                )
+            if self.data_parallel_size != 1:
+                raise ValueError(
+                    "pp_stage_device_map currently requires data_parallel_size == 1."
+                )
+            if self.nnodes != 1:
+                raise ValueError("pp_stage_device_map currently requires nnodes == 1.")
+            if (
+                self.distributed_executor_backend is not None
+                and self.distributed_executor_backend != "mp"
+            ):
+                raise ValueError(
+                    "pp_stage_device_map is only supported with the mp executor."
+                )
+            if not current_platform.is_cuda_alike():
+                raise ValueError(
+                    "pp_stage_device_map is only supported on CUDA-like devices."
+                )
+            if len(pp_device_map) != self.pipeline_parallel_size:
+                raise ValueError(
+                    "pp_stage_device_map must provide exactly one device group per "
+                    f"pipeline stage, but got {len(pp_device_map)} groups for "
+                    f"pipeline_parallel_size={self.pipeline_parallel_size}."
+                )
+
+            flat_device_ids = [
+                device_id for group in pp_device_map for device_id in group
+            ]
+            if len(set(flat_device_ids)) != len(flat_device_ids):
+                raise ValueError(
+                    "pp_stage_device_map must not reuse CUDA device ids "
+                    "across PP stages."
+                )
+
         return self
+
+    def get_pp_layer_partition(
+        self, total_num_hidden_layers: int | None = None
+    ) -> list[int] | None:
+        if self.pp_layer_partition is None:
+            return None
+
+        partitions = _parse_non_negative_int_csv(
+            self.pp_layer_partition, "pp_layer_partition"
+        )
+
+        if len(partitions) != self.pipeline_parallel_size:
+            raise ValueError(
+                "pp_layer_partition must provide exactly one partition size per "
+                f"pipeline stage, but got {len(partitions)} values for "
+                f"pipeline_parallel_size={self.pipeline_parallel_size}."
+            )
+
+        if (
+            total_num_hidden_layers is not None
+            and sum(partitions) != total_num_hidden_layers
+        ):
+            raise ValueError(
+                "pp_layer_partition must sum to the total number of hidden layers, "
+                f"but got sum(partitions)={sum(partitions)} and "
+                f"total_num_hidden_layers={total_num_hidden_layers}."
+            )
+
+        return partitions
+
+    def set_pp_layer_partition(self, partitions: list[int]) -> None:
+        self.pp_layer_partition = ",".join(str(partition) for partition in partitions)
+
+    def get_pp_stage_device_map(self) -> list[list[int]] | None:
+        if self.pp_stage_device_map is None:
+            return None
+
+        stage_groups = []
+        for raw_group in self.pp_stage_device_map.split(";"):
+            raw_group = raw_group.strip()
+            if not raw_group:
+                raise ValueError(
+                    f"Invalid pp_stage_device_map: {self.pp_stage_device_map}"
+                )
+            stage_groups.append(
+                _parse_non_negative_int_csv(raw_group, "pp_stage_device_map")
+            )
+
+        for stage_idx, group in enumerate(stage_groups):
+            if len(group) != self.tensor_parallel_size:
+                raise ValueError(
+                    "Each pp_stage_device_map stage must contain exactly "
+                    f"tensor_parallel_size={self.tensor_parallel_size} devices, but "
+                    f"stage {stage_idx} has {len(group)} entries."
+                )
+
+        return stage_groups
+
+    @property
+    def uses_heterogeneous_pp(self) -> bool:
+        return (
+            self.pp_stage_device_map is not None
+            or self.pp_layer_partition is not None
+        )
+
+    @property
+    def uses_auto_pp_partitioning(self) -> bool:
+        return self.pp_partition_strategy in ("auto_memory", "auto_hetero")
+
+    def get_pp_rank(self, rank: int | None = None) -> int:
+        rank = self.rank if rank is None else rank
+        return (rank // self.tensor_parallel_size) % self.pipeline_parallel_size
+
+    def get_tp_rank(self, rank: int | None = None) -> int:
+        rank = self.rank if rank is None else rank
+        return rank % self.tensor_parallel_size
+
+    def get_stage_local_device_id(self, rank: int | None = None) -> int | None:
+        pp_stage_device_map = self.get_pp_stage_device_map()
+        if pp_stage_device_map is None:
+            return None
+
+        pp_rank = self.get_pp_rank(rank)
+        tp_rank = self.get_tp_rank(rank)
+        return pp_stage_device_map[pp_rank][tp_rank]
 
     @property
     def world_size_across_dp(self) -> int:
