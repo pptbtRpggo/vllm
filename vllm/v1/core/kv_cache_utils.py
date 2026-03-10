@@ -106,9 +106,23 @@ def estimate_decoder_layer_kv_cache_bytes(vllm_config: VllmConfig) -> int:
     kv_cache_dtype = get_kv_cache_torch_dtype(
         cache_config.cache_dtype, model_config.dtype
     )
-    return (
+    per_layer_kv_cache_bytes = (
         2 * aligned_tokens * num_kv_heads * head_size * get_dtype_size(kv_cache_dtype)
     )
+    if (
+        vllm_config.parallel_config.uses_heterogeneous_pp
+        and vllm_config.parallel_config.pp_auto_partition_log_details
+    ):
+        logger.info(
+            ">>>AUTO_PP<<< estimated decoder-layer KV cache bytes: aligned_tokens=%d "
+            "num_kv_heads=%d head_size=%d kv_cache_dtype=%s per_layer=%s",
+            aligned_tokens,
+            num_kv_heads,
+            head_size,
+            kv_cache_dtype,
+            format_gib(per_layer_kv_cache_bytes),
+        )
+    return per_layer_kv_cache_bytes
 
 
 def init_none_hash(hash_fn: Callable[[Any], bytes]):
@@ -1294,6 +1308,13 @@ def generate_scheduler_kv_cache_config(
     min_num_blocks = min(
         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
     )
+    if len({kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs}) > 1:
+        logger.info(
+            ">>>AUTO_PP<<< scheduler KV cache config uses global min num_blocks=%d across "
+            "workers=%s.",
+            min_num_blocks,
+            [kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs],
+        )
     _shrink_kv_cache_config_num_blocks(cfg, min_num_blocks)
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
@@ -1640,6 +1661,25 @@ def get_kv_cache_configs(
             min_num_blocks_by_pp_stage[pp_rank] = min(
                 min_num_blocks_by_pp_stage[pp_rank], kv_cache_config.num_blocks
             )
+
+    if (
+        vllm_config.parallel_config.uses_heterogeneous_pp
+        and vllm_config.parallel_config.pp_auto_partition_log_details
+    ):
+        logger.info(
+            ">>>AUTO_PP<<< stage-local KV cache num_blocks before shrink: %s",
+            {
+                rank: {
+                    "pp_rank": vllm_config.parallel_config.get_pp_rank(rank),
+                    "num_blocks": kv_cache_config.num_blocks,
+                }
+                for rank, kv_cache_config in enumerate(kv_cache_configs)
+            },
+        )
+        logger.info(
+            ">>>AUTO_PP<<< stage-local KV cache min num_blocks by PP stage: %s",
+            min_num_blocks_by_pp_stage,
+        )
 
     for rank, kv_cache_config in enumerate(kv_cache_configs):
         _shrink_kv_cache_config_num_blocks(

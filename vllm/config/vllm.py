@@ -1636,8 +1636,26 @@ class VllmConfig:
 
         from vllm.distributed.pp_partition import resolve_auto_pp_layer_partition
 
+        if self.parallel_config.pp_auto_partition_log_details:
+            logger.info(
+                ">>>AUTO_PP<<< resolving auto PP partition: strategy=%s stage_device_map=%s "
+                "tp_size=%d pp_size=%d max_model_len=%d block_size=%s "
+                "gpu_memory_utilization=%.3f",
+                self.parallel_config.pp_partition_strategy,
+                self.parallel_config.get_pp_stage_device_map(),
+                self.parallel_config.tensor_parallel_size,
+                self.parallel_config.pipeline_parallel_size,
+                self.model_config.max_model_len,
+                self.cache_config.block_size,
+                self.cache_config.gpu_memory_utilization,
+            )
+
         partitions = resolve_auto_pp_layer_partition(self)
         self.parallel_config.set_pp_layer_partition(partitions)
+        logger.info(
+            ">>>AUTO_PP<<< resolved explicit layer partition: %s",
+            self.parallel_config.pp_layer_partition,
+        )
 
     def compile_debug_dump_path(self) -> Path | None:
         """Returns a rank-aware path for dumping
