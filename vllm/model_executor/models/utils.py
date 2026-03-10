@@ -631,6 +631,17 @@ def make_layers(
     start_layer, end_layer = get_pp_indices(
         num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
     )
+    logger.info(
+        ">>>AUTO_PP<<< make_layers resolved: pp_rank=%d pp_size=%d "
+        "total_layers=%d start=%d end=%d local_layers=%d prefix=%s",
+        get_pp_group().rank_in_group,
+        get_pp_group().world_size,
+        num_hidden_layers,
+        start_layer,
+        end_layer,
+        end_layer - start_layer,
+        prefix,
+    )
 
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)]

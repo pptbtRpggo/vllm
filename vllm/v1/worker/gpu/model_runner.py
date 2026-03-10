@@ -249,6 +249,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.load_model(self.model)
         time_after_load = time.perf_counter()
 
+        model_start_layer = getattr(self.model, "start_layer", None)
+        model_end_layer = getattr(self.model, "end_layer", None)
+        if model_start_layer is not None and model_end_layer is not None:
+            logger.info(
+                ">>>AUTO_PP<<< model load resolved layer range: "
+                "pp_rank=%d is_first_pp_rank=%s is_last_pp_rank=%s "
+                "start=%d end=%d local_layers=%d model=%s",
+                get_pp_group().rank_in_group if self.use_pp else 0,
+                self.is_first_pp_rank,
+                self.is_last_pp_rank,
+                model_start_layer,
+                model_end_layer,
+                model_end_layer - model_start_layer,
+                type(self.model).__name__,
+            )
+
         self.model_memory_usage = m.consumed_memory
         logger.info(
             "Model loading took %s GiB and %.6f seconds",

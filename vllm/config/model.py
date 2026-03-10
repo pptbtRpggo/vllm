@@ -1178,6 +1178,18 @@ class ModelConfig:
         else:
             start = sum(partitions[:pp_rank])
             end = start + partitions[pp_rank]
+        if parallel_config.uses_heterogeneous_pp:
+            logger.info(
+                ">>>AUTO_PP<<< model config layer range resolved: rank=%d "
+                "pp_rank=%d pp_size=%d total_layers=%d partition=%s start=%d end=%d",
+                parallel_config.rank,
+                pp_rank,
+                pp_size,
+                total_num_hidden_layers,
+                partitions,
+                start,
+                end,
+            )
         return start, end
 
     def get_num_layers(self, parallel_config: ParallelConfig) -> int:

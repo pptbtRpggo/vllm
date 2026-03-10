@@ -149,6 +149,18 @@ def get_pp_indices(
     start_layer = sum(partitions[:pp_rank])
     end_layer = start_layer + partitions[pp_rank]
 
+    if vllm_config is not None and vllm_config.parallel_config.uses_heterogeneous_pp:
+        logger.info(
+            ">>>AUTO_PP<<< get_pp_indices resolved: pp_rank=%d pp_size=%d "
+            "total_layers=%d partition=%s start=%d end=%d",
+            pp_rank,
+            pp_size,
+            num_hidden_layers,
+            partitions,
+            start_layer,
+            end_layer,
+        )
+
     return (start_layer, end_layer)
 
 
