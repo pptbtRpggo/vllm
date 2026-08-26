@@ -1,79 +1,100 @@
-# vLLM Continuous Batching 流程图
+# vLLM V1 Continuous Batching 流程图
 
-V1 `Scheduler.schedule()` 如何把 `waiting` / `running` 里的请求填进一张工单（`SchedulerOutput`）。先扫 running，再收 waiting；一张工单里可以同时有 P 和 D，P 太长就切 chunk。
+当前 V1 `Scheduler.schedule()` 如何统一调度 prompt 与 output token：先扫描 `running`，再从 `waiting` / `skipped_waiting` 接纳请求，构造一个可混合 prefill 与 decode 的 `SchedulerOutput`。图中同时标出双预算、KV 抢占、prefix cache、chunked prefill、乐观推进以及批次级执行与逐请求结算。
 
 ```mermaid
 %%{init: {
   "theme": "base",
   "themeVariables": {
+    "background": "#FFFFFF",
     "primaryColor": "#E3F2FD",
     "primaryTextColor": "#102A43",
     "primaryBorderColor": "#1565C0",
-    "lineColor": "#546E7A",
+    "lineColor": "#455A64",
     "secondaryColor": "#FFF8E1",
     "tertiaryColor": "#E8F5E9",
-    "fontSize": "16px"
+    "fontSize": "15px"
   },
   "flowchart": {
-    "curve": "basis",
-    "nodeSpacing": 32,
-    "rankSpacing": 56,
-    "padding": 18,
+    "curve": "linear",
+    "nodeSpacing": 36,
+    "rankSpacing": 52,
+    "padding": 14,
     "htmlLabels": true
   }
 }}%%
 flowchart TB
-    classDef startend fill:#FFF8E1,stroke:#F9A825,color:#102A43
-    classDef proc fill:#E3F2FD,stroke:#1565C0,color:#102A43
-    classDef decision fill:#E8F5E9,stroke:#2E7D32,color:#102A43
-    classDef skip fill:#F5F5F5,stroke:#90A4AE,color:#546E7A
-    classDef out fill:#F3E5F5,stroke:#7B1FA2,color:#102A43
-    classDef bridge fill:#FFFFFF,stroke:#90A4AE,color:#102A43
+    classDef startend fill:#FFF8E1,stroke:#F9A825,color:#102A43,stroke-width:2px
+    classDef queue fill:#E8F5E9,stroke:#2E7D32,color:#102A43,stroke-width:2px
+    classDef proc fill:#E3F2FD,stroke:#1565C0,color:#102A43,stroke-width:2px
+    classDef decision fill:#FFFFFF,stroke:#2E7D32,color:#102A43,stroke-width:2px
+    classDef skip fill:#F5F5F5,stroke:#78909C,color:#455A64,stroke-width:2px
+    classDef preempt fill:#FFEBEE,stroke:#C62828,color:#102A43,stroke-width:2px
+    classDef out fill:#F3E5F5,stroke:#7B1FA2,color:#102A43,stroke-width:2px
 
-    arrive([新请求到达]):::startend --> waiting[进入 waiting<br/>FCFS 或 priority]:::proc
-    waiting --> more{还有未完成请求?}:::decision
-    more -->|否| idle([等待新请求]):::startend
-    more -->|是| budget[schedule：本步预算<br/>max_num_batched_tokens]:::proc
-    budget --> runQ
+    arrive(["新请求到达"]):::startend --> enqueue["按状态进入 waiting 或 skipped_waiting<br/>队列按 FCFS / priority 排序"]:::queue
+    enqueue --> hasWork{"还有未完成请求<br/>或在途批次?"}:::decision
+    hasWork -->|否| idle(["EngineCore 等待新请求"]):::startend
+    hasWork -->|是| initBudget["Scheduler.schedule<br/>token_budget = max_num_scheduled_tokens<br/>input_budget = max_num_batched_tokens"]:::proc
 
-    subgraph RUN ["第一段：扫 running（已有 KV）"]
-        direction TB
-        runQ{running 还有人<br/>且预算未用完?}:::decision
-        runQ -->|是| takeRun[取 running 下一条]:::proc
-        takeRun --> debt{还欠 token？<br/>已知 − 已算}:::decision
-        debt -->|欠 0| skipRun[跳过：常见是等采样]:::skip
-        skipRun --> runQ
-        debt -->|欠大于 0| chunk[本步给 min 欠量与预算<br/>P 太长就切 chunk]:::proc
-        chunk --> alloc[分配 KV block<br/>写入工单]:::proc
-        alloc --> runQ
+    subgraph RUNNING ["第一段：扫描 running"]
+        direction LR
+        runningGate{"running 未扫完<br/>且两类预算仍可用?"}:::decision
+        runningGate -->|是| planRunning["取下一条 running 请求<br/>need = num_tokens_with_spec + output placeholders − computed<br/>再按预算、长度、encoder 等约束截断"]:::proc
+        planRunning --> runningSchedulable{"最终 num_new_tokens<br/>大于 0?"}:::decision
+        runningSchedulable -->|否| skipRunning["跳过本请求<br/>继续扫描后面的 running"]:::skip
+        skipRunning --> runningGate
+        runningSchedulable -->|是| allocRunning{"allocate_slots<br/>成功?"}:::decision
+        allocRunning -->|是| recordRunning["记录请求与 token 数<br/>扣减两类预算"]:::proc
+        recordRunning --> runningGate
+        allocRunning -->|否| preempt["抢占 victim<br/>释放 KV、computed 清零、放回 waiting<br/>必要时恢复本批已占预算"]:::preempt
+        preempt --> currentPreempted{"当前请求<br/>也被抢占?"}:::decision
+        currentPreempted -->|否：重试| allocRunning
+        currentPreempted -->|是| runningDone["停止扫描 running"]:::skip
+        runningGate -->|否| runningDone
     end
 
-    runQ -->|否| bridge1[running 扫完]:::bridge
-    bridge1 --> waitGate
+    initBudget --> RUNNING
 
-    subgraph WAIT ["第二段：收 waiting（新请求 / 被抢占）"]
-        direction TB
-        waitGate{本步没抢占、预算还有<br/>且 running 未满?}:::decision
-        waitGate -->|是| takeWait[waiting 队头<br/>FCFS / priority]:::proc
-        takeWait --> canSched{这条现在能排?}:::decision
-        canSched -->|否：远程 KV / LoRA 上限等| skipW[跳过，看下一条]:::skip
-        skipW --> waitGate
-        canSched -->|是| cache[前缀缓存命中则跳过已算段]:::proc
-        cache --> fit{剩余 P 能一次塞进预算?}:::decision
-        fit -->|否| chunkW[切一块 P，请求进 running]:::proc
-        fit -->|是| admit[整段或剩余 P 进 running]:::proc
-        chunkW --> writeW[写入工单、扣预算]:::proc
-        admit --> writeW
-        writeW --> waitGate
+    subgraph WAITING ["第二段：接纳 waiting / skipped_waiting"]
+        direction LR
+        waitingGate{"本轮没有抢占<br/>队列非空、预算可用<br/>且 running slot 未满?"}:::decision
+        waitingGate -->|是| takeWaiting["按策略选择队头请求"]:::proc
+        takeWaiting --> skippableBlocker{"存在可暂时跳过的阻塞?<br/>远程 KV / grammar 未就绪<br/>LoRA 上限 / stale output 等"}:::decision
+        skippableBlocker -->|是| skipWaiting["放入本轮 skipped 集合<br/>继续看下一条"]:::skip
+        skipWaiting --> waitingGate
+        skippableBlocker -->|否| prefixPlan["必要时查询本地 / 外部 prefix cache<br/>确定 computed，并计算剩余已知 token<br/>按预算截断；允许时做 chunked prefill"]:::proc
+        prefixPlan --> asyncLoad{"需要异步加载<br/>远程 KV?"}:::decision
+        asyncLoad -->|是| waitRemote["预留 KV block<br/>设为 WAITING_FOR_REMOTE_KVS<br/>本轮不执行 forward"]:::skip
+        waitRemote --> waitingGate
+        asyncLoad -->|否| admitWaiting{"num_new_tokens 大于 0<br/>且 allocate_slots 成功?"}:::decision
+        admitWaiting -->|是| recordWaiting["移入 running<br/>记录请求与 token 数并扣预算"]:::proc
+        recordWaiting --> waitingGate
+        admitWaiting -->|否：资源不足或不可切分| stopWaiting["停止扫描 waiting<br/>本轮不再接纳新请求"]:::skip
+        waitingGate -->|否| waitingDone["结束接纳 waiting"]:::skip
+        stopWaiting --> waitingDone
     end
 
-    waitGate -->|否| ticket[工单 SchedulerOutput<br/>谁参加、每人几个 token、KV 格子<br/>一张工单里可以同时有 P 和 D]:::out
-    ticket --> advance[指针先加上本步 token<br/>同一条的下一块 P 可立刻再排]:::proc
-    advance --> gpu[GPU 执行这张工单]:::proc
-    gpu --> back[采样写回：接上新 token<br/>检查是否结束]:::proc
-    back --> done{这条说完了?}:::decision
-    done -->|是| leave[离开 running，释放 KV]:::proc
-    done -->|否| stay[留在 running<br/>下一拍按新的「已知 − 已算」再欠]:::proc
-    leave --> more
-    stay --> more
+    RUNNING --> WAITING
+    WAITING --> schedulerOutput
+    schedulerOutput["生成 SchedulerOutput<br/>请求集合、每请求 token 数、KV block 等<br/>同一批可混合不同请求的 prefill 与 decode"]:::out
+
+    subgraph EXECUTION ["批次执行与结果结算"]
+        direction LR
+        optimisticAdvance["_update_after_schedule<br/>乐观增加 computed / in-flight token 数<br/>PP 或异步 batch queue 可继续向前调度"]:::proc
+        optimisticAdvance --> executeBatch["Worker / GPU 执行整个 SchedulerOutput<br/>只在可采样位置 sampling<br/>未完成的 prefill chunk 不产生新 token"]:::proc
+        executeBatch --> updateOutput["update_from_output 按请求结算<br/>清 in-flight、处理 spec 回滚、接上采样 token"]:::proc
+        updateOutput --> requestFinished{"对每个已调度请求<br/>是否已经结束?"}:::decision
+        requestFinished -->|是| release["移出 running<br/>释放 KV / encoder cache"]:::proc
+        requestFinished -->|否| keepRunning["保留在 running<br/>等待下一轮补齐待计算 token"]:::queue
+        release --> nextIteration["本批全部结算后<br/>返回 EngineCore 主循环"]:::out
+        keepRunning --> nextIteration
+    end
+
+    schedulerOutput --> EXECUTION
+
+    style RUNNING fill:#F8FAFC,stroke:#90A4AE,stroke-width:2px
+    style WAITING fill:#F8FAFC,stroke:#90A4AE,stroke-width:2px
+    style EXECUTION fill:#FAFAFA,stroke:#90A4AE,stroke-width:2px
+    linkStyle default stroke:#455A64,stroke-width:2px
 ```
