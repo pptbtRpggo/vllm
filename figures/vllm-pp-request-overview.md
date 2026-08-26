@@ -1,0 +1,83 @@
+# vLLM Pipeline Parallel 请求处理总览（粗粒度时序）
+
+PP=2。Scheduler 每步开一张工单 Batch。Executor 把同一张工单广播给两卡：PP0 跑前半层，PP1 跑后半层；中间激活走 NCCL。只有最后一张卡 PP1 会采样；结果交回 EngineCore 后，Scheduler 给请求补上新 token、判断说完没有，再发给客户端。
+
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "actorBkg": "#E3F2FD",
+    "actorTextColor": "#102A43",
+    "actorBorder": "#1565C0",
+    "actorLineColor": "#90A4AE",
+    "signalColor": "#1F2937",
+    "signalTextColor": "#111827",
+    "noteBkgColor": "#FFF8E1",
+    "noteTextColor": "#102A43",
+    "noteBorderColor": "#F9A825",
+    "activationBkgColor": "#BBDEFB",
+    "activationBorderColor": "#1565C0",
+    "sequenceNumberColor": "#FFFFFF"
+  }
+}}%%
+sequenceDiagram
+    autonumber
+    box rgb(227,232,241) 客户端
+        participant User as HTTP 客户端
+    end
+    box rgb(227,242,253) API Server 进程：对外 HTTP、tokenize
+        participant API as API Server
+    end
+    box rgb(255,243,224) Engine Core 进程：调度与启动编排
+        participant Core as EngineCore
+        participant Exec as MultiprocExecutor
+    end
+    box rgb(232,245,233) GPU Worker 进程：真正跑模型
+        participant PP0 as Worker PP0 GPU0
+        participant PP1 as Worker PP1 GPU1
+    end
+
+    Note over User,API: ① 请求 A、B 进入
+    User->>API: 请求 A
+    User->>API: 请求 B
+    API->>API: tokenize
+    API->>Core: 交给 Engine Core
+
+    Note over Core: ② Batch0 = 本步工单<br/>写三件事：这次算哪些请求、每人算几个 token、KV 写到显存几号格子<br/>例：A 算 prompt 前 512 个、格子 3–4；B 算前 512 个、格子 7<br/>A 和 B 各用各的格子；两张 GPU 格子号相同，各自只存自己那几层
+    Core->>Core: 入队 A、B
+    Core->>Core: schedule → Batch0 工单
+
+    Note over PP0,PP1: ③ 连续两个 batch 做 2 段流水线<br/>PP0 | Batch0前半层 | Batch1前半层 |            |<br/>PP1 | 等待激活     | Batch0后半层 | Batch1后半层 |
+
+    Core->>Exec: 把同一张 Batch0 工单交给 Executor
+    Exec->>PP0: 广播工单：你算前半层（embedding + 本卡层）
+    Exec->>PP1: 广播同一张工单：你算后半层（先等激活）
+    PP0->>PP0: 前半层 forward，按格子号写本层 KV
+    PP1->>PP1: 等待前段送来的中间激活
+    PP0->>PP1: NCCL 把中间激活交给后半层
+
+    Core->>Core: schedule → Batch1
+    Core->>Exec: 把 Batch1 同样广播给两卡
+    Exec->>PP0: 同一份 Batch1：跑前半层
+    Exec->>PP1: 同一份 Batch1：跑后半层
+    par
+        PP0->>PP0: Batch1 前半层 forward + 按格子号写本层 KV
+        PP1->>PP1: Batch0 后半层 + lm_head + 采样
+    end
+    PP1-->>Exec: Batch0 采出的 token（只有最后一张卡 PP1 会采样）
+    Exec-->>Core: 把 PP1 的结果转交给 EngineCore
+
+    Note over Core: ④ Scheduler 给这条请求补上刚生成的 token，并判断说完没有<br/>说完就收工；没说完下次继续排。然后把新 token 发给客户端
+    Core->>Core: 补上新 token，看说完没有
+    Core->>API: 把新 token 发给客户端
+    API-->>User: SSE
+
+    PP0->>PP1: NCCL 把 Batch1 的中间激活交给后半层
+    PP1->>PP1: Batch1 后半层 + lm_head + 采样
+    PP1-->>Exec: Batch1 采出的 token（同样只有 PP1 会采样）
+    Exec-->>Core: 把 PP1 的结果转交给 EngineCore
+    Core->>Core: 同样补上新 token，看说完没有
+    Core->>API: 把新 token 发给客户端
+    API-->>User: SSE
+
+```

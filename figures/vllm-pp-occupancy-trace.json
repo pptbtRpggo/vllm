@@ -1,0 +1,1065 @@
+{
+  "mixed": {
+    "pp_size": 2,
+    "max_num_batched_tokens": 16,
+    "async_scheduling": false,
+    "arrivals": [
+      {
+        "after_n_issued_batches": 0,
+        "req_id": "A",
+        "prompt_len": 24,
+        "max_tokens": 2
+      },
+      {
+        "after_n_issued_batches": 0,
+        "req_id": "B",
+        "prompt_len": 8,
+        "max_tokens": 2
+      },
+      {
+        "after_n_issued_batches": 1,
+        "req_id": "C",
+        "prompt_len": 8,
+        "max_tokens": 2
+      }
+    ],
+    "batches": [
+      {
+        "batch_id": 0,
+        "pp0_tick": 0,
+        "pp1_tick": 1,
+        "items": [
+          {
+            "req_id": "A",
+            "num_tokens": 16,
+            "kind": "prefill",
+            "computed_after": 16,
+            "prompt_len": 24
+          }
+        ]
+      },
+      {
+        "batch_id": 1,
+        "pp0_tick": 1,
+        "pp1_tick": 2,
+        "items": [
+          {
+            "req_id": "A",
+            "num_tokens": 8,
+            "kind": "prefill",
+            "computed_after": 24,
+            "prompt_len": 24
+          },
+          {
+            "req_id": "B",
+            "num_tokens": 8,
+            "kind": "prefill",
+            "computed_after": 8,
+            "prompt_len": 8
+          }
+        ]
+      },
+      {
+        "batch_id": 2,
+        "pp0_tick": 2,
+        "pp1_tick": 3,
+        "items": [
+          {
+            "req_id": "C",
+            "num_tokens": 8,
+            "kind": "prefill",
+            "computed_after": 8,
+            "prompt_len": 8
+          }
+        ]
+      },
+      {
+        "batch_id": 3,
+        "pp0_tick": 3,
+        "pp1_tick": 4,
+        "items": [
+          {
+            "req_id": "A",
+            "num_tokens": 1,
+            "kind": "decode",
+            "computed_after": 25,
+            "prompt_len": 24
+          },
+          {
+            "req_id": "B",
+            "num_tokens": 1,
+            "kind": "decode",
+            "computed_after": 9,
+            "prompt_len": 8
+          }
+        ]
+      },
+      {
+        "batch_id": 4,
+        "pp0_tick": 4,
+        "pp1_tick": 5,
+        "items": [
+          {
+            "req_id": "C",
+            "num_tokens": 1,
+            "kind": "decode",
+            "computed_after": 9,
+            "prompt_len": 8
+          }
+        ]
+      }
+    ],
+    "last_tick": 6,
+    "devices": [
+      "GPU0 PP0",
+      "GPU1 PP1"
+    ],
+    "cells": [
+      {
+        "tick": 0,
+        "device": 0,
+        "batch_id": 0,
+        "label": "B0 A P16",
+        "bubble": false
+      },
+      {
+        "tick": 0,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 1,
+        "device": 0,
+        "batch_id": 1,
+        "label": "B1 A P8+B P8",
+        "bubble": false
+      },
+      {
+        "tick": 1,
+        "device": 1,
+        "batch_id": 0,
+        "label": "B0 A P16",
+        "bubble": false
+      },
+      {
+        "tick": 2,
+        "device": 0,
+        "batch_id": 2,
+        "label": "B2 C P8",
+        "bubble": false
+      },
+      {
+        "tick": 2,
+        "device": 1,
+        "batch_id": 1,
+        "label": "B1 A P8+B P8",
+        "bubble": false
+      },
+      {
+        "tick": 3,
+        "device": 0,
+        "batch_id": 3,
+        "label": "B3 A D1+B D1",
+        "bubble": false
+      },
+      {
+        "tick": 3,
+        "device": 1,
+        "batch_id": 2,
+        "label": "B2 C P8",
+        "bubble": false
+      },
+      {
+        "tick": 4,
+        "device": 0,
+        "batch_id": 4,
+        "label": "B4 C D1",
+        "bubble": false
+      },
+      {
+        "tick": 4,
+        "device": 1,
+        "batch_id": 3,
+        "label": "B3 A D1+B D1",
+        "bubble": false
+      },
+      {
+        "tick": 5,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 5,
+        "device": 1,
+        "batch_id": 4,
+        "label": "B4 C D1",
+        "bubble": false
+      }
+    ],
+    "num_bubbles": 2,
+    "num_busy": 10
+  },
+  "solo": {
+    "pp_size": 2,
+    "max_num_batched_tokens": 16,
+    "async_scheduling": false,
+    "arrivals": [
+      {
+        "after_n_issued_batches": 0,
+        "req_id": "A",
+        "prompt_len": 24,
+        "max_tokens": 2
+      }
+    ],
+    "batches": [
+      {
+        "batch_id": 0,
+        "pp0_tick": 0,
+        "pp1_tick": 1,
+        "items": [
+          {
+            "req_id": "A",
+            "num_tokens": 16,
+            "kind": "prefill",
+            "computed_after": 16,
+            "prompt_len": 24
+          }
+        ]
+      },
+      {
+        "batch_id": 1,
+        "pp0_tick": 1,
+        "pp1_tick": 2,
+        "items": [
+          {
+            "req_id": "A",
+            "num_tokens": 8,
+            "kind": "prefill",
+            "computed_after": 24,
+            "prompt_len": 24
+          }
+        ]
+      },
+      {
+        "batch_id": 2,
+        "pp0_tick": 3,
+        "pp1_tick": 4,
+        "items": [
+          {
+            "req_id": "A",
+            "num_tokens": 1,
+            "kind": "decode",
+            "computed_after": 25,
+            "prompt_len": 24
+          }
+        ]
+      }
+    ],
+    "last_tick": 5,
+    "devices": [
+      "GPU0 PP0",
+      "GPU1 PP1"
+    ],
+    "cells": [
+      {
+        "tick": 0,
+        "device": 0,
+        "batch_id": 0,
+        "label": "B0 A P16",
+        "bubble": false
+      },
+      {
+        "tick": 0,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 1,
+        "device": 0,
+        "batch_id": 1,
+        "label": "B1 A P8",
+        "bubble": false
+      },
+      {
+        "tick": 1,
+        "device": 1,
+        "batch_id": 0,
+        "label": "B0 A P16",
+        "bubble": false
+      },
+      {
+        "tick": 2,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 2,
+        "device": 1,
+        "batch_id": 1,
+        "label": "B1 A P8",
+        "bubble": false
+      },
+      {
+        "tick": 3,
+        "device": 0,
+        "batch_id": 2,
+        "label": "B2 A D1",
+        "bubble": false
+      },
+      {
+        "tick": 3,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 4,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 4,
+        "device": 1,
+        "batch_id": 2,
+        "label": "B2 A D1",
+        "bubble": false
+      }
+    ],
+    "num_bubbles": 4,
+    "num_busy": 6
+  },
+  "mixed_pp4": {
+    "pp_size": 4,
+    "max_num_batched_tokens": 16,
+    "async_scheduling": false,
+    "arrivals": [
+      {
+        "after_n_issued_batches": 0,
+        "req_id": "A",
+        "prompt_len": 24,
+        "max_tokens": 2
+      },
+      {
+        "after_n_issued_batches": 0,
+        "req_id": "B",
+        "prompt_len": 8,
+        "max_tokens": 2
+      },
+      {
+        "after_n_issued_batches": 1,
+        "req_id": "C",
+        "prompt_len": 8,
+        "max_tokens": 2
+      }
+    ],
+    "batches": [
+      {
+        "batch_id": 0,
+        "pp0_tick": 0,
+        "pp1_tick": 1,
+        "items": [
+          {
+            "req_id": "A",
+            "num_tokens": 16,
+            "kind": "prefill",
+            "computed_after": 16,
+            "prompt_len": 24
+          }
+        ]
+      },
+      {
+        "batch_id": 1,
+        "pp0_tick": 1,
+        "pp1_tick": 2,
+        "items": [
+          {
+            "req_id": "A",
+            "num_tokens": 8,
+            "kind": "prefill",
+            "computed_after": 24,
+            "prompt_len": 24
+          },
+          {
+            "req_id": "B",
+            "num_tokens": 8,
+            "kind": "prefill",
+            "computed_after": 8,
+            "prompt_len": 8
+          }
+        ]
+      },
+      {
+        "batch_id": 2,
+        "pp0_tick": 2,
+        "pp1_tick": 3,
+        "items": [
+          {
+            "req_id": "C",
+            "num_tokens": 8,
+            "kind": "prefill",
+            "computed_after": 8,
+            "prompt_len": 8
+          }
+        ]
+      },
+      {
+        "batch_id": 3,
+        "pp0_tick": 5,
+        "pp1_tick": 6,
+        "items": [
+          {
+            "req_id": "A",
+            "num_tokens": 1,
+            "kind": "decode",
+            "computed_after": 25,
+            "prompt_len": 24
+          },
+          {
+            "req_id": "B",
+            "num_tokens": 1,
+            "kind": "decode",
+            "computed_after": 9,
+            "prompt_len": 8
+          }
+        ]
+      },
+      {
+        "batch_id": 4,
+        "pp0_tick": 6,
+        "pp1_tick": 7,
+        "items": [
+          {
+            "req_id": "C",
+            "num_tokens": 1,
+            "kind": "decode",
+            "computed_after": 9,
+            "prompt_len": 8
+          }
+        ]
+      }
+    ],
+    "last_tick": 10,
+    "devices": [
+      "GPU0 PP0",
+      "GPU1 PP1",
+      "GPU2 PP2",
+      "GPU3 PP3"
+    ],
+    "cells": [
+      {
+        "tick": 0,
+        "device": 0,
+        "batch_id": 0,
+        "label": "B0 A P16",
+        "bubble": false
+      },
+      {
+        "tick": 0,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 0,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 0,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 1,
+        "device": 0,
+        "batch_id": 1,
+        "label": "B1 A P8+B P8",
+        "bubble": false
+      },
+      {
+        "tick": 1,
+        "device": 1,
+        "batch_id": 0,
+        "label": "B0 A P16",
+        "bubble": false
+      },
+      {
+        "tick": 1,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 1,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 2,
+        "device": 0,
+        "batch_id": 2,
+        "label": "B2 C P8",
+        "bubble": false
+      },
+      {
+        "tick": 2,
+        "device": 1,
+        "batch_id": 1,
+        "label": "B1 A P8+B P8",
+        "bubble": false
+      },
+      {
+        "tick": 2,
+        "device": 2,
+        "batch_id": 0,
+        "label": "B0 A P16",
+        "bubble": false
+      },
+      {
+        "tick": 2,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 3,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 3,
+        "device": 1,
+        "batch_id": 2,
+        "label": "B2 C P8",
+        "bubble": false
+      },
+      {
+        "tick": 3,
+        "device": 2,
+        "batch_id": 1,
+        "label": "B1 A P8+B P8",
+        "bubble": false
+      },
+      {
+        "tick": 3,
+        "device": 3,
+        "batch_id": 0,
+        "label": "B0 A P16",
+        "bubble": false
+      },
+      {
+        "tick": 4,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 4,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 4,
+        "device": 2,
+        "batch_id": 2,
+        "label": "B2 C P8",
+        "bubble": false
+      },
+      {
+        "tick": 4,
+        "device": 3,
+        "batch_id": 1,
+        "label": "B1 A P8+B P8",
+        "bubble": false
+      },
+      {
+        "tick": 5,
+        "device": 0,
+        "batch_id": 3,
+        "label": "B3 A D1+B D1",
+        "bubble": false
+      },
+      {
+        "tick": 5,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 5,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 5,
+        "device": 3,
+        "batch_id": 2,
+        "label": "B2 C P8",
+        "bubble": false
+      },
+      {
+        "tick": 6,
+        "device": 0,
+        "batch_id": 4,
+        "label": "B4 C D1",
+        "bubble": false
+      },
+      {
+        "tick": 6,
+        "device": 1,
+        "batch_id": 3,
+        "label": "B3 A D1+B D1",
+        "bubble": false
+      },
+      {
+        "tick": 6,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 6,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 7,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 7,
+        "device": 1,
+        "batch_id": 4,
+        "label": "B4 C D1",
+        "bubble": false
+      },
+      {
+        "tick": 7,
+        "device": 2,
+        "batch_id": 3,
+        "label": "B3 A D1+B D1",
+        "bubble": false
+      },
+      {
+        "tick": 7,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 8,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 8,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 8,
+        "device": 2,
+        "batch_id": 4,
+        "label": "B4 C D1",
+        "bubble": false
+      },
+      {
+        "tick": 8,
+        "device": 3,
+        "batch_id": 3,
+        "label": "B3 A D1+B D1",
+        "bubble": false
+      },
+      {
+        "tick": 9,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 9,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 9,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 9,
+        "device": 3,
+        "batch_id": 4,
+        "label": "B4 C D1",
+        "bubble": false
+      }
+    ],
+    "num_bubbles": 20,
+    "num_busy": 20
+  },
+  "solo_pp4": {
+    "pp_size": 4,
+    "max_num_batched_tokens": 16,
+    "async_scheduling": false,
+    "arrivals": [
+      {
+        "after_n_issued_batches": 0,
+        "req_id": "A",
+        "prompt_len": 24,
+        "max_tokens": 2
+      }
+    ],
+    "batches": [
+      {
+        "batch_id": 0,
+        "pp0_tick": 0,
+        "pp1_tick": 1,
+        "items": [
+          {
+            "req_id": "A",
+            "num_tokens": 16,
+            "kind": "prefill",
+            "computed_after": 16,
+            "prompt_len": 24
+          }
+        ]
+      },
+      {
+        "batch_id": 1,
+        "pp0_tick": 1,
+        "pp1_tick": 2,
+        "items": [
+          {
+            "req_id": "A",
+            "num_tokens": 8,
+            "kind": "prefill",
+            "computed_after": 24,
+            "prompt_len": 24
+          }
+        ]
+      },
+      {
+        "batch_id": 2,
+        "pp0_tick": 5,
+        "pp1_tick": 6,
+        "items": [
+          {
+            "req_id": "A",
+            "num_tokens": 1,
+            "kind": "decode",
+            "computed_after": 25,
+            "prompt_len": 24
+          }
+        ]
+      }
+    ],
+    "last_tick": 9,
+    "devices": [
+      "GPU0 PP0",
+      "GPU1 PP1",
+      "GPU2 PP2",
+      "GPU3 PP3"
+    ],
+    "cells": [
+      {
+        "tick": 0,
+        "device": 0,
+        "batch_id": 0,
+        "label": "B0 A P16",
+        "bubble": false
+      },
+      {
+        "tick": 0,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 0,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 0,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 1,
+        "device": 0,
+        "batch_id": 1,
+        "label": "B1 A P8",
+        "bubble": false
+      },
+      {
+        "tick": 1,
+        "device": 1,
+        "batch_id": 0,
+        "label": "B0 A P16",
+        "bubble": false
+      },
+      {
+        "tick": 1,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 1,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 2,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 2,
+        "device": 1,
+        "batch_id": 1,
+        "label": "B1 A P8",
+        "bubble": false
+      },
+      {
+        "tick": 2,
+        "device": 2,
+        "batch_id": 0,
+        "label": "B0 A P16",
+        "bubble": false
+      },
+      {
+        "tick": 2,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 3,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 3,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 3,
+        "device": 2,
+        "batch_id": 1,
+        "label": "B1 A P8",
+        "bubble": false
+      },
+      {
+        "tick": 3,
+        "device": 3,
+        "batch_id": 0,
+        "label": "B0 A P16",
+        "bubble": false
+      },
+      {
+        "tick": 4,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 4,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 4,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 4,
+        "device": 3,
+        "batch_id": 1,
+        "label": "B1 A P8",
+        "bubble": false
+      },
+      {
+        "tick": 5,
+        "device": 0,
+        "batch_id": 2,
+        "label": "B2 A D1",
+        "bubble": false
+      },
+      {
+        "tick": 5,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 5,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 5,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 6,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 6,
+        "device": 1,
+        "batch_id": 2,
+        "label": "B2 A D1",
+        "bubble": false
+      },
+      {
+        "tick": 6,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 6,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 7,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 7,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 7,
+        "device": 2,
+        "batch_id": 2,
+        "label": "B2 A D1",
+        "bubble": false
+      },
+      {
+        "tick": 7,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 8,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 8,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 8,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 8,
+        "device": 3,
+        "batch_id": 2,
+        "label": "B2 A D1",
+        "bubble": false
+      }
+    ],
+    "num_bubbles": 24,
+    "num_busy": 12
+  },
+  "pp4_repeat_identical": true
+}

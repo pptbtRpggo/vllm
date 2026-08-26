@@ -1,0 +1,99 @@
+# vLLM PP 流水线占用（设备 × 时间）
+
+PP=2。横轴是时间槽，纵轴是 GPU。蓝色格子是这一拍谁在算；灰色虚线是 **bubble**（空转）。同一张工单沿对角线错开：t0 的 GPU0 和 t1 的 GPU1 是同一张工单。
+
+上图：混进请求 B，把 A 等采样的空档填上。下图：只有 A，decode 隔一格就空。
+
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "primaryColor": "#E3F2FD",
+    "primaryTextColor": "#102A43",
+    "primaryBorderColor": "#1565C0",
+    "lineColor": "#90A4AE",
+    "secondaryColor": "#FFF8E1",
+    "tertiaryColor": "#ECEFF1"
+  },
+  "flowchart": {
+    "htmlLabels": true,
+    "nodeSpacing": 24,
+    "rankSpacing": 28,
+    "padding": 8
+  }
+}}%%
+flowchart TB
+    classDef work fill:#E3F2FD,stroke:#1565C0,color:#102A43,stroke-width:1px
+    classDef bubble fill:#F5F5F5,stroke:#B0BEC5,color:#78909C,stroke-width:1px,stroke-dasharray: 4 3
+
+    subgraph mixed["vLLM：A 在等采样的格子，拿去算 B"]
+        direction LR
+        subgraph m0["t0"]
+            direction TB
+            m00["GPU0 PP0\nA 预1 + B 预"]:::work
+            m01["GPU1 PP1\n空"]:::bubble
+        end
+        subgraph m1["t1"]
+            direction TB
+            m10["GPU0 PP0\nA 预2"]:::work
+            m11["GPU1 PP1\nA 预1 + B 预"]:::work
+        end
+        subgraph m2["t2"]
+            direction TB
+            m20["GPU0 PP0\nB 解1"]:::work
+            m21["GPU1 PP1\nA 预2"]:::work
+        end
+        subgraph m3["t3"]
+            direction TB
+            m30["GPU0 PP0\nA 解1"]:::work
+            m31["GPU1 PP1\nB 解1"]:::work
+        end
+        subgraph m4["t4"]
+            direction TB
+            m40["GPU0 PP0\nB 解2"]:::work
+            m41["GPU1 PP1\nA 解1"]:::work
+        end
+        subgraph m5["t5"]
+            direction TB
+            m50["GPU0 PP0\nA 解2"]:::work
+            m51["GPU1 PP1\nB 解2"]:::work
+        end
+        m0 --> m1 --> m2 --> m3 --> m4 --> m5
+    end
+
+    subgraph naive["对照：只有 A。预切块能接着排；decode 等采样，隔一格就空"]
+        direction LR
+        subgraph n0["t0"]
+            direction TB
+            n00["GPU0 PP0\nA 预1"]:::work
+            n01["GPU1 PP1\n空"]:::bubble
+        end
+        subgraph n1["t1"]
+            direction TB
+            n10["GPU0 PP0\nA 预2"]:::work
+            n11["GPU1 PP1\nA 预1"]:::work
+        end
+        subgraph n2["t2"]
+            direction TB
+            n20["GPU0 PP0\n空"]:::bubble
+            n21["GPU1 PP1\nA 预2"]:::work
+        end
+        subgraph n3["t3"]
+            direction TB
+            n30["GPU0 PP0\nA 解1"]:::work
+            n31["GPU1 PP1\n空"]:::bubble
+        end
+        subgraph n4["t4"]
+            direction TB
+            n40["GPU0 PP0\n空"]:::bubble
+            n41["GPU1 PP1\nA 解1"]:::work
+        end
+        subgraph n5["t5"]
+            direction TB
+            n50["GPU0 PP0\nA 解2"]:::work
+            n51["GPU1 PP1\n空"]:::bubble
+        end
+        n0 --> n1 --> n2 --> n3 --> n4 --> n5
+    end
+
+```

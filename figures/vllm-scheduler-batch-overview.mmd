@@ -1,0 +1,53 @@
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "actorBkg": "#E3F2FD",
+    "actorTextColor": "#102A43",
+    "actorBorder": "#1565C0",
+    "actorLineColor": "#90A4AE",
+    "signalColor": "#1F2937",
+    "signalTextColor": "#111827",
+    "noteBkgColor": "#FFF8E1",
+    "noteTextColor": "#102A43",
+    "noteBorderColor": "#F9A825",
+    "activationBkgColor": "#BBDEFB",
+    "activationBorderColor": "#1565C0",
+    "sequenceNumberColor": "#FFFFFF"
+  }
+}}%%
+sequenceDiagram
+    autonumber
+    box rgb(227,232,241) 客户端
+        participant User as HTTP 客户端
+    end
+    box rgb(255,243,224) Engine Core：Scheduler 组 batch
+        participant Sch as Scheduler
+        participant Exec as MultiprocExecutor
+    end
+
+    Note over User,Sch: ① 请求随时入 waiting。这就是 continuous batching：<br/>新请求不必等上一批全部结束
+    User->>Sch: 请求 A 入 waiting
+    User->>Sch: 请求 B 入 waiting
+
+    Note over Sch: ② 每一步在 token 预算内拼一个 batch<br/>先 running，再 waiting；decode 优先，prefill 可切 chunk
+    Sch->>Sch: running 为空，从 waiting 拉 A、B
+    Sch->>Sch: Batch0 = A 的 prefill chunk + B 的 prefill chunk
+    Sch->>Sch: A、B 进入 running
+    Sch->>Exec: 执行 Batch0
+
+    Note over User,Sch: ③ 执行过程中新请求继续入队
+    User->>Sch: 请求 C 入 waiting
+    Exec-->>Sch: Batch0 算完，更新 A、B 进度
+
+    Sch->>Sch: 先给 running 里的 A、B 排下一步（decode 或剩余 prefill）
+    Sch->>Sch: 预算还有剩余，从 waiting 拉 C
+    Sch->>Sch: Batch1 = A/B 本步 token + C 的 prefill chunk
+    Sch->>Sch: C 进入 running
+    Sch->>Exec: 执行 Batch1
+    Exec-->>Sch: Batch1 算完；A 达到结束条件
+    Sch->>Sch: A 离开 running
+
+    Sch->>Sch: Batch2 = 仍在 running 的 B、C
+    Sch->>Exec: 执行 Batch2
+
+    Note over User,Sch: 每一步产出一份 batch 送给执行器。<br/>PP=2 时连续两份 batch 可以同时在两段上。

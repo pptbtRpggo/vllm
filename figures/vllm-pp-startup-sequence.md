@@ -1,0 +1,137 @@
+# vLLM Pipeline Parallel 启动时序（PP=2，无 TP）— 细粒度
+
+从 `vllm serve --pipeline-parallel-size 2` 到 HTTP 开始监听。橙色框里的 EngineCore（调度编排）与 MultiprocExecutor（拉 GPU 进程）同进程。
+
+`--pipeline-parallel-size` 写入 `VllmConfig`。切层 env `VLLM_PP_LAYER_PARTITION` 随进程继承，各 worker 在 `make_layers` 时读取。
+
+两卡通过共享 FileStore 都登记后，WORLD 通信组成立，才能用 NCCL 在 GPU 间传张量；再划出 `_PP` 组给流水线传激活。`READY` 是 worker 向 Executor 报本卡模型已就绪。
+
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "actorBkg": "#E3F2FD",
+    "actorTextColor": "#102A43",
+    "actorBorder": "#1565C0",
+    "actorLineColor": "#90A4AE",
+    "signalColor": "#1F2937",
+    "signalTextColor": "#111827",
+    "labelBoxBkgColor": "#FFFFFF",
+    "labelBoxBorderColor": "#1565C0",
+    "labelTextColor": "#102A43",
+    "noteBkgColor": "#FFF8E1",
+    "noteTextColor": "#102A43",
+    "noteBorderColor": "#F9A825",
+    "activationBkgColor": "#BBDEFB",
+    "activationBorderColor": "#1565C0",
+    "sequenceNumberColor": "#FFFFFF"
+  }
+}}%%
+sequenceDiagram
+    autonumber
+    box rgb(227,242,253) API Server 进程：对外 HTTP、tokenize
+        participant CLI as vllm serve
+        participant API as API Server
+        participant Client as EngineCoreClient
+    end
+    box rgb(255,243,224) Engine Core 进程：调度与启动编排
+        participant Core as EngineCore
+        participant Exec as MultiprocExecutor
+    end
+    box rgb(232,245,233) GPU Worker 进程：真正跑模型 PP=2 TP=1
+        participant PP0 as Worker PP0 GPU0
+        participant PP1 as Worker PP1 GPU1
+    end
+
+    Note over CLI,API: 阶段0 CLI 参数写入 VllmConfig（整引擎配置对象）
+    CLI->>API: vllm serve MODEL --pipeline-parallel-size 2
+    API->>API: --pipeline-parallel-size 写入 VllmConfig
+    Note over API: VllmConfig 里是 PP 段数。<br/>切层用 env VLLM_PP_LAYER_PARTITION，例如 16,16<br/>随进程继承，make_layers 时读取；未设置则均分
+    API->>API: 按 VllmConfig 选定 MultiprocExecutor 类（拉 GPU 进程用）
+    API->>Client: 构造 EngineCoreClient（API 侧跟 Core 进程通信）
+    Client->>Client: bind ZMQ：API 与 Core 之间传请求/结果
+
+    Note over Client,Core: 阶段1 拉起 EngineCore。vllm_config 随 spawn 进子进程
+    Client->>Core: Process.start kwargs={vllm_config, executor_class, ...}
+    Core->>Client: HELLO via ZMQ DEALER
+    Client->>Core: INIT 下发 input/output socket 地址
+    Core->>Core: EngineCore.__init__(vllm_config, executor_class)
+
+    Note over Core,PP1: 阶段2 拉 GPU worker，并建立 NCCL 通信组。<br/>PP 前向时 PP0 要把中间激活发给 PP1，必须先有 GPU 通信组
+    Core->>Exec: 在本进程实例化 MultiprocExecutor（拉 worker、转发 RPC）
+    Exec->>Exec: 读 parallel_config.world_size / local_world_size
+    Exec->>Exec: 创建 rpc_broadcast_mq（Executor 向各 worker 广播指令）
+    Exec->>PP0: spawn WorkerProc kwargs={同一份 vllm_config, rank=0}
+    Exec->>PP1: spawn WorkerProc kwargs={同一份 vllm_config, rank=1}
+    Note over Exec,PP1: spawn 继承父进程环境变量，切层 env 随进程带入。
+
+    par 各 worker 占用本卡
+        PP0->>PP0: bind CUDA:0
+        PP1->>PP1: bind CUDA:1
+    end
+
+    par 各 worker 同时 init_process_group（建 NCCL 组）
+        PP0->>PP0: 向共享 FileStore 登记 rank=0
+        PP1->>PP1: 向共享 FileStore 登记 rank=1
+    end
+    Note over PP0,PP1: FileStore 是两卡的碰面处：两边都登记后凑齐 world_size=2，<br/>WORLD 通信组成立。之后才能用 NCCL 在 GPU 间传张量。
+
+    par 各 worker 同时 initialize_model_parallel
+        PP0->>PP0: 从 WORLD 划出 PP 通信组 _PP
+        PP1->>PP1: 从 WORLD 划出 PP 通信组 _PP
+    end
+    Note over PP0,PP1: _PP 专门给流水线传激活：PP0 发、PP1 收。<br/>PP0 is_first_rank 负责 embedding。<br/>PP1 is_last_rank 负责 lm_head+sampler。<br/>Executor.output_rank=1 只从最后一段收输出。
+
+    Note over PP0,PP1: 阶段3 本卡装模型，两边并行
+    par 各 worker 完成本地初始化
+        PP0->>PP0: snapshot 显存，构造 GPUModelRunner（本卡 forward）
+        PP1->>PP1: snapshot 显存，构造 GPUModelRunner（本卡 forward）
+    end
+    par 按 PP 角色构建 Module 并加载本段权重
+        PP0->>PP0: get_pp_indices 读 VLLM_PP_LAYER_PARTITION<br/>例如 16,16 → layers[0,16)；未设置则均分
+        PP1->>PP1: 同一 env → layers[16,32)+norm+lm_head<br/>其余用 PPMissingLayer 空壳占位，只加载本段权重
+    end
+    PP1->>PP1: last rank 创建 Sampler（logits→token）<br/>非 first rank 预留 IntermediateTensors（收前段激活）
+    Note over PP0,PP1: 权重已在 GPU 上，KV cache 尚未分配。
+
+    PP0->>Exec: READY + response MQ handle 给父进程
+    PP1->>Exec: READY + response MQ handle 给父进程
+    Note over Exec: READY：worker 向 Executor 报本卡模型已就绪。
+    Exec->>Exec: 收齐两个 READY，MQ 可通信
+
+    Note over Core,PP1: 阶段4 对齐 KV：两卡容量取最小，Scheduler 才能共用一套 block 编号
+    Core->>Exec: collective_rpc get_kv_cache_spec
+    Exec->>PP0: get_kv_cache_spec
+    Exec->>PP1: get_kv_cache_spec
+    PP0-->>Exec: 本段层 spec
+    PP1-->>Exec: 本段层 spec
+    Exec-->>Core: 两段 spec
+    Core->>Core: merge 成整模型 spec，再投影回各 worker
+
+    Core->>Exec: collective_rpc determine_available_memory
+    Exec->>PP0: dummy forward 测峰值激活显存
+    Exec->>PP1: dummy forward 测峰值激活显存
+    Note over PP0,PP1: dummy 前向是空跑一遍估显存：PP0 从 embedding 起算，<br/>PP1 用空 IntermediateTensors 估本段激活。
+    PP0-->>Exec: 本卡还能给 KV 的字节数
+    PP1-->>Exec: 本卡还能给 KV 的字节数
+    Exec-->>Core: 各 rank 可用 KV 显存
+    Core->>Core: 统一 num_blocks = min 各卡
+
+    Core->>Exec: initialize_from_config
+    Exec->>PP0: 只为本段 attention 层分配 KV
+    Exec->>PP1: 只为本段 attention 层分配 KV
+    Note over PP0,PP1: Scheduler（请求调度）只维护一套 block table。<br/>两卡共用相同 block id，各存不同层的 KV。
+
+    Core->>Exec: compile_or_warm_up_model
+    Exec->>PP0: compile / kernel warmup / CUDA Graph（录常用形状加速推理）
+    Exec->>PP1: compile / kernel warmup / CUDA Graph（录常用形状加速推理）
+
+    Note over Core: 阶段5 调度器就绪，对外宣告 READY
+    Core->>Core: 创建 Scheduler（决定每步跑哪些请求）<br/>batch_queue_size = pp_size，用来填满流水线
+    Core->>Core: 启动 ZMQ 线程，进入 busy loop
+    Core->>Client: READY via ZMQ
+    Client-->>API: AsyncLLM 构造完成
+    API->>API: FastAPI + uvicorn.listen
+    Note over CLI,PP1: 启动完成：HTTP 已监听，EngineCore 进入 busy loop。
+
+```

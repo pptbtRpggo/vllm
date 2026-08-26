@@ -1,0 +1,79 @@
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "actorBkg": "#E3F2FD",
+    "actorTextColor": "#102A43",
+    "actorBorder": "#1565C0",
+    "actorLineColor": "#90A4AE",
+    "signalColor": "#1F2937",
+    "signalTextColor": "#111827",
+    "noteBkgColor": "#FFF8E1",
+    "noteTextColor": "#102A43",
+    "noteBorderColor": "#F9A825",
+    "activationBkgColor": "#BBDEFB",
+    "activationBorderColor": "#1565C0",
+    "sequenceNumberColor": "#FFFFFF"
+  }
+}}%%
+sequenceDiagram
+    autonumber
+    box rgb(227,242,253) API Server 进程：对外 HTTP、tokenize
+        participant API as API Server
+    end
+    box rgb(255,243,224) Engine Core 进程：调度与启动编排
+        participant Core as EngineCore
+        participant Exec as MultiprocExecutor
+    end
+    box rgb(232,245,233) GPU Worker 进程：真正跑模型
+        participant PP0 as Worker PP0 GPU0
+        participant PP1 as Worker PP1 GPU1
+    end
+
+    Note over API: ① CLI 参数写入 VllmConfig（整引擎的配置对象）
+    API->>API: --pipeline-parallel-size 2 写入 VllmConfig
+    Note over API: 切层 env VLLM_PP_LAYER_PARTITION<br/>逗号分隔每段层数，默认均分
+
+    Note over API,PP1: ② 拉起进程。同一份 VllmConfig 往下传。<br/>MultiprocExecutor 负责按配置拉 GPU 进程、转发调用
+    API->>Core: 把 VllmConfig 交给 Engine Core 进程
+    Core->>Exec: 用 VllmConfig 构造 MultiprocExecutor
+    Exec->>PP0: 同一份 VllmConfig + rank=0
+    Exec->>PP1: 同一份 VllmConfig + rank=1
+
+    Note over PP0,PP1: ③ 建立 NCCL 通信组。<br/>PP 推理时前段要把中间激活传给后段，必须先组好 GPU 通信
+    par 占用本卡
+        PP0->>PP0: 绑定 GPU0
+        PP1->>PP1: 绑定 GPU1
+    end
+    par 加入 NCCL 通信组
+        PP0->>PP0: 作为 rank0 加入 WORLD 组
+        PP1->>PP1: 作为 rank1 加入 WORLD 组
+    end
+    Note over PP0,PP1: 两卡都加入后 WORLD 组成立，再划出 PP 组：<br/>PP0 第一段（embedding），PP1 最后一段（lm_head）
+
+    Note over PP0,PP1: ④ 按层装模型。切层读 VLLM_PP_LAYER_PARTITION
+    par 并行装模型
+        PP0->>PP0: 构建并加载本段层（含 embedding）
+        PP1->>PP1: 构建并加载本段层（含 lm_head）
+    end
+    Note over PP0,PP1: 其余层用空壳占位。权重已加载，KV 尚未分配
+    PP0->>Exec: 本卡模型已就绪
+    PP1->>Exec: 本卡模型已就绪
+
+    Note over Core,PP1: ⑤ 对齐 KV：两卡容量取最小，调度器才能共用一套 block 编号
+    Core->>Exec: 问两卡 KV 规格、估显存、分配
+    Exec->>PP0: 本段 KV
+    Exec->>PP1: 本段 KV
+    PP0-->>Exec: 规格 + 可支撑 block 数
+    PP1-->>Exec: 规格 + 可支撑 block 数
+    Exec-->>Core: 汇总两卡结果
+    Core->>Core: 合成整模型规格，num_blocks=min
+    Note over Core,PP1: Scheduler（请求调度）只维护一套 block table<br/>两卡共用相同 block id，各存不同层
+
+    Note over API,PP1: ⑥ 预热并开始对外服务
+    Core->>Exec: 编译 kernel、抓 CUDA Graph（录常用形状，正式推理更快）
+    Exec->>PP0: warmup
+    Exec->>PP1: warmup
+    Core->>Core: 创建 Scheduler<br/>预留 PP 段数个并发 batch 填满管道
+    Core->>API: 引擎就绪
+    API->>API: HTTP 开始监听
+    Note over API,PP1: 启动完成，HTTP 开始监听

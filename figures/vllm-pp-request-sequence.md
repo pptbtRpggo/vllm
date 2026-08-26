@@ -1,0 +1,86 @@
+# vLLM Pipeline Parallel 请求处理时序（PP=2，无 TP）— 细粒度
+
+`schedule()` 每步产出一份 `SchedulerOutput`（Batch0 / Batch1 工单）：谁参加、每人算几个 token、KV 写哪几个格子。`batch_queue=2` 时，PP0 跑 Batch1 第1段的同时，PP1 跑 Batch0 第2段。
+
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "actorBkg": "#E3F2FD",
+    "actorTextColor": "#102A43",
+    "actorBorder": "#1565C0",
+    "actorLineColor": "#90A4AE",
+    "signalColor": "#1F2937",
+    "signalTextColor": "#111827",
+    "labelBoxBkgColor": "#FFFFFF",
+    "labelBoxBorderColor": "#1565C0",
+    "labelTextColor": "#102A43",
+    "noteBkgColor": "#FFF8E1",
+    "noteTextColor": "#102A43",
+    "noteBorderColor": "#F9A825",
+    "activationBkgColor": "#BBDEFB",
+    "activationBorderColor": "#1565C0",
+    "sequenceNumberColor": "#FFFFFF"
+  }
+}}%%
+sequenceDiagram
+    autonumber
+    box rgb(227,232,241) 客户端
+        participant User as HTTP 客户端
+    end
+    box rgb(227,242,253) API Server 进程：对外 HTTP、tokenize
+        participant API as API Server
+        participant Client as EngineCoreClient
+    end
+    box rgb(255,243,224) Engine Core 进程：调度与启动编排
+        participant Core as EngineCore
+        participant Exec as MultiprocExecutor
+    end
+    box rgb(232,245,233) GPU Worker 进程：真正跑模型 PP=2 TP=1
+        participant PP0 as Worker PP0 GPU0
+        participant PP1 as Worker PP1 GPU1
+    end
+
+    Note over User,API: 阶段1 请求 A、B 进入
+    User->>API: POST 请求 A
+    User->>API: POST 请求 B
+    API->>API: 渲染模板、tokenize
+    API->>Client: AsyncLLM.generate(A)、generate(B)
+
+    Note over Client,Core: 阶段2 入队后由 Scheduler 组 batch
+    Client->>Core: ZMQ ADD A、ADD B
+    Core->>Core: Scheduler.add_request(A)、add_request(B)
+    Core->>Core: schedule() → Batch0 工单<br/>谁参加、每人算几个 token、KV 写哪几个格子
+
+    Note over PP0,PP1: 阶段3 连续两个 batch 做 2 段流水线<br/>PP0 | Batch0第1段 | Batch1第1段 |          |<br/>PP1 | 等待        | Batch0第2段 | Batch1第2段 |
+
+    Core->>Exec: execute_model(Batch0)
+    Exec->>PP0: 广播 Batch0
+    Exec->>PP1: 广播 Batch0
+    PP0->>PP0: Batch0 第1段，按工单格子号写本层 KV
+    PP1->>PP1: irecv 等 Batch0 激活
+    PP0->>PP1: NCCL 交接 Batch0 的 IntermediateTensors
+
+    Core->>Core: schedule() → Batch1
+    Core->>Exec: execute_model(Batch1)
+    Exec->>PP0: 广播 Batch1
+    Exec->>PP1: 广播 Batch1
+    par
+        PP0->>PP0: Batch1 第1段
+        PP1->>PP1: Batch0 第2段 + Sampler
+    end
+    PP1-->>Exec: Batch0 的 sampled tokens
+    Exec-->>Core: 把 PP1 的结果转交给 EngineCore
+    Core->>Client: ZMQ PUSH
+    Client->>API: detokenize
+    API-->>User: SSE
+
+    PP0->>PP1: NCCL 交接 Batch1 的 IntermediateTensors
+    PP1->>PP1: Batch1 第2段 + Sampler
+    PP1-->>Exec: Batch1 的 sampled tokens
+    Exec-->>Core: 把 PP1 的结果转交给 EngineCore
+    Core->>Client: ZMQ PUSH
+    Client->>API: detokenize
+    API-->>User: SSE
+
+```

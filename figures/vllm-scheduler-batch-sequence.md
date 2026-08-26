@@ -1,0 +1,72 @@
+# vLLM Scheduler 组 batch（细粒度时序）
+
+`add_request` 进 waiting。`schedule()` 先扫 running、再扫 waiting，产出 `SchedulerOutput`。`update_from_output` 推进进度，结束的请求离开 running。PP=2 时连续两份 batch 可同时在两段上。
+
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "actorBkg": "#E3F2FD",
+    "actorTextColor": "#102A43",
+    "actorBorder": "#1565C0",
+    "actorLineColor": "#90A4AE",
+    "signalColor": "#1F2937",
+    "signalTextColor": "#111827",
+    "labelBoxBkgColor": "#FFFFFF",
+    "labelBoxBorderColor": "#1565C0",
+    "labelTextColor": "#102A43",
+    "noteBkgColor": "#FFF8E1",
+    "noteTextColor": "#102A43",
+    "noteBorderColor": "#F9A825",
+    "activationBkgColor": "#BBDEFB",
+    "activationBorderColor": "#1565C0",
+    "sequenceNumberColor": "#FFFFFF"
+  }
+}}%%
+sequenceDiagram
+    autonumber
+    box rgb(227,232,241) 客户端
+        participant User as HTTP 客户端
+    end
+    box rgb(255,243,224) Engine Core 进程
+        participant Core as EngineCore
+        participant Sch as Scheduler
+        participant Exec as MultiprocExecutor
+    end
+
+    Note over User,Core: 阶段1 请求入队：add_request → waiting
+    User->>Core: 请求 A
+    User->>Core: 请求 B
+    Core->>Sch: add_request(A)、add_request(B)
+    Note over Sch: waiting=[A,B]  running=[]
+
+    Note over Sch: 阶段2 schedule()：token_budget = max_num_batched_tokens
+    Sch->>Sch: 先扫 running（当前为空）
+    Sch->>Sch: 再扫 waiting：拉 A，按预算切 prefill chunk
+    Sch->>Sch: 预算仍有剩余，再拉 B，同样切 chunk
+    Sch->>Sch: 产出 SchedulerOutput Batch0
+    Note over Sch: waiting=[]  running=[A,B]
+    Core->>Exec: execute_model(Batch0)
+    Exec-->>Core: ModelRunnerOutput
+    Core->>Sch: update_from_output：推进 A、B 的 num_computed_tokens
+
+    Note over User,Sch: 阶段3 下一步开始前，C 已入 waiting
+    User->>Core: 请求 C
+    Core->>Sch: add_request(C)
+    Note over Sch: waiting=[C]  running=[A,B]
+
+    Sch->>Sch: 先扫 running：A、B 本步各拿 decode 或剩余 prefill
+    Sch->>Sch: 再扫 waiting：预算剩余则拉 C 的 prefill chunk
+    Sch->>Sch: 产出 SchedulerOutput Batch1
+    Note over Sch: waiting=[]  running=[A,B,C]
+    Core->>Exec: execute_model(Batch1)
+    Exec-->>Core: A 结束
+    Core->>Sch: update_from_output：A 移出 running
+    Note over Sch: waiting=[]  running=[B,C]
+
+    Sch->>Sch: 再 schedule() → Batch2，只含 running 里的 B、C
+    Core->>Exec: execute_model(Batch2)
+
+    Note over Sch,Exec: PP=2 时 batch_queue=2，Batch0 还在 PP1 时 Batch1 可已在 PP0。
+
+```
