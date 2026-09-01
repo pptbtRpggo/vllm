@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Drive the real V1 Scheduler with mocked GPU output and record PP occupancy.
+"""Trace PP request dependencies using the real V1 Scheduler.
 
-Mimics EngineCore.step_with_batch_queue: keep up to ``pp_size`` in-flight
-SchedulerOutputs, then apply a fake ModelRunnerOutput in FIFO order.
+The Scheduler decides every non-empty batch. A deterministic runner completes
+those batches in FIFO order and returns unique sampled tokens. The PP grid is
+an explanatory unit-time model, not a GPU performance model.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ try:
 except ImportError:
     pytest = None  # type: ignore[assignment]
 
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
 try:
@@ -32,83 +34,188 @@ TRACE_PATH = (
     Path(__file__).resolve().parents[3] / "figures" / "vllm-pp-occupancy-trace.json"
 )
 
-_DUMMY_TOKEN = 1
+PARTIAL_PREFILL = "partial_prefill"
+FINAL_PREFILL = "final_prefill"
+DECODE = "decode"
+STAGE_ORDER = "stage_order"
+SAMPLE_TOKEN = "sample_token"
 
 
 @dataclass
 class BatchItem:
     req_id: str
     num_tokens: int
-    kind: str
-    computed_after: int
+    phase: str
+    token_start: int
+    token_end: int
     prompt_len: int
+    decode_step: int | None
+    consumed_token_id: int | None
+    dependency_kind: str | None
+    depends_on_batch_id: int | None
+    emitted_token_id: int | None = None
 
 
 @dataclass
 class IssuedBatch:
     batch_id: int
-    pp0_tick: int
-    pp1_tick: int
+    issue_tick: int
+    completion_tick: int
     items: list[BatchItem]
 
 
-def _describe_items(scheduler, scheduler_output) -> list[BatchItem]:
+@dataclass
+class RunnerRequestState:
+    sequence_length: int
+    num_completed_tokens: int = 0
+    last_emitted_token_id: int | None = None
+
+
+class MockPipelineRunner:
+    """Complete SchedulerOutputs from an independent runner-side view."""
+
+    def __init__(self) -> None:
+        self.requests: dict[str, RunnerRequestState] = {}
+        self.next_token_id = 1000
+
+    def add_request(self, req_id: str, prompt_len: int) -> None:
+        assert req_id not in self.requests
+        self.requests[req_id] = RunnerRequestState(sequence_length=prompt_len)
+
+    def complete(
+        self, batch: IssuedBatch, scheduler_output: SchedulerOutput
+    ) -> ModelRunnerOutput:
+        items_by_req_id = {item.req_id: item for item in batch.items}
+        req_ids = list(scheduler_output.num_scheduled_tokens)
+        sampled_token_ids: list[list[int]] = []
+
+        for req_id in req_ids:
+            item = items_by_req_id[req_id]
+            state = self.requests[req_id]
+            assert item.token_start == state.num_completed_tokens
+            assert item.token_end <= state.sequence_length
+            if item.phase == DECODE:
+                assert item.consumed_token_id == state.last_emitted_token_id
+            state.num_completed_tokens = item.token_end
+
+            if item.phase == PARTIAL_PREFILL:
+                sampled_token_ids.append([])
+                continue
+
+            token_id = self.next_token_id
+            self.next_token_id += 1
+            item.emitted_token_id = token_id
+            state.last_emitted_token_id = token_id
+            state.sequence_length += 1
+            sampled_token_ids.append([token_id])
+
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+            sampled_token_ids=sampled_token_ids,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+
+
+def _snapshot_items(
+    scheduler,
+    scheduler_output: SchedulerOutput,
+    batch_id: int,
+    last_compute_batch: dict[str, int],
+    last_sample_batch: dict[str, int],
+) -> list[BatchItem]:
     items: list[BatchItem] = []
     for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
         request = scheduler.requests[req_id]
-        start = request.num_computed_tokens - num_tokens
-        kind = "prefill" if start < request.num_prompt_tokens else "decode"
+        token_end = request.num_computed_tokens
+        token_start = token_end - num_tokens
+        prompt_len = request.num_prompt_tokens
+
+        if token_start < prompt_len:
+            phase = (
+                PARTIAL_PREFILL if token_end < prompt_len else FINAL_PREFILL
+            )
+            dependency_kind = (
+                STAGE_ORDER if req_id in last_compute_batch else None
+            )
+            depends_on_batch_id = last_compute_batch.get(req_id)
+            decode_step = None
+            consumed_token_id = None
+        else:
+            phase = DECODE
+            dependency_kind = SAMPLE_TOKEN
+            depends_on_batch_id = last_sample_batch.get(req_id)
+            assert depends_on_batch_id is not None
+            decode_step = token_start - prompt_len + 1
+            consumed_token_id = request.all_token_ids[token_start]
+
         items.append(
             BatchItem(
                 req_id=req_id,
                 num_tokens=num_tokens,
-                kind=kind,
-                computed_after=request.num_computed_tokens,
-                prompt_len=request.num_prompt_tokens,
+                phase=phase,
+                token_start=token_start,
+                token_end=token_end,
+                prompt_len=prompt_len,
+                decode_step=decode_step,
+                consumed_token_id=consumed_token_id,
+                dependency_kind=dependency_kind,
+                depends_on_batch_id=depends_on_batch_id,
             )
         )
+        if phase != DECODE:
+            last_compute_batch[req_id] = batch_id
+
     return items
 
 
-def _fake_model_output(
-    scheduler_output, sample_on_complete: dict[str, bool]
-) -> ModelRunnerOutput:
-    req_ids = [
-        req_id
-        for req_id in scheduler_output.num_scheduled_tokens
-        if req_id in sample_on_complete
-    ]
-    sampled = [
-        [_DUMMY_TOKEN] if sample_on_complete[req_id] else [] for req_id in req_ids
-    ]
-    return ModelRunnerOutput(
-        req_ids=req_ids,
-        req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
-        sampled_token_ids=sampled,
-        logprobs=None,
-        prompt_logprobs_dict={},
-        pooler_output=[],
-    )
+def _build_dependencies(batches: list[IssuedBatch]) -> list[dict]:
+    batches_by_id = {batch.batch_id: batch for batch in batches}
+    dependencies = []
+    for target_batch in batches:
+        for target_item in target_batch.items:
+            source_batch_id = target_item.depends_on_batch_id
+            if source_batch_id is None:
+                continue
+            source_batch = batches_by_id[source_batch_id]
+            source_item = next(
+                item
+                for item in source_batch.items
+                if item.req_id == target_item.req_id
+            )
+            dependencies.append(
+                {
+                    "req_id": target_item.req_id,
+                    "kind": target_item.dependency_kind,
+                    "from_batch_id": source_batch_id,
+                    "to_batch_id": target_batch.batch_id,
+                    "token_id": (
+                        source_item.emitted_token_id
+                        if target_item.dependency_kind == SAMPLE_TOKEN
+                        else None
+                    ),
+                }
+            )
+    return dependencies
 
 
-def simulate_pp_occupancy(
+def simulate_pp_schedule_trace(
     *,
     pp_size: int,
     max_num_batched_tokens: int,
-    async_scheduling: bool,
     arrivals: list[tuple[int, str, int, int]],
 ) -> dict:
-    """Run a discrete-event PP occupancy simulation.
+    """Run a dependency-aware synchronous PP scheduling trace.
 
     Args:
-        pp_size: Pipeline parallel size / in-flight batch depth.
-        max_num_batched_tokens: Scheduler token budget per step.
-        async_scheduling: Whether to use AsyncScheduler.
-        arrivals: (after_n_issued_batches, req_id, prompt_len, max_tokens).
-            ``after_n_issued_batches=0`` means present before the first schedule.
+        pp_size: Number of PP stages and synchronous in-flight batch slots.
+        max_num_batched_tokens: Scheduler token budget per batch.
+        arrivals: ``(after_n_issued_batches, req_id, prompt_len, max_tokens)``.
 
     Returns:
-        JSON-serializable occupancy trace.
+        A JSON-serializable trace of Scheduler decisions and PP stage slots.
     """
     scheduler = create_scheduler(
         max_num_seqs=8,
@@ -118,14 +225,13 @@ def simulate_pp_occupancy(
         pipeline_parallel_size=pp_size,
         block_size=16,
         num_blocks=10000,
-        async_scheduling=async_scheduling,
+        async_scheduling=False,
         use_v2_model_runner=False,
     )
-
+    runner = MockPipelineRunner()
     pending_arrivals = deque(sorted(arrivals, key=lambda row: row[0]))
 
-    def admit_ready(issued_count: int) -> list[str]:
-        admitted: list[str] = []
+    def admit_ready(issued_count: int) -> None:
         while pending_arrivals and pending_arrivals[0][0] <= issued_count:
             _, req_id, prompt_len, max_tokens = pending_arrivals.popleft()
             (request,) = create_requests(
@@ -136,59 +242,76 @@ def simulate_pp_occupancy(
                 req_ids=[req_id],
             )
             scheduler.add_request(request)
-            admitted.append(req_id)
-        return admitted
+            runner.add_request(req_id, prompt_len)
 
     admit_ready(0)
 
-    pending: deque[tuple[IssuedBatch, object, dict[str, bool]]] = deque()
-    issued: list[IssuedBatch] = []
-    next_pp0_tick = 0
-    max_steps = 64
+    pending: deque[tuple[IssuedBatch, SchedulerOutput]] = deque()
+    batches: list[IssuedBatch] = []
+    scheduler_waits: list[dict] = []
+    last_compute_batch: dict[str, int] = {}
+    last_sample_batch: dict[str, int] = {}
+    next_issue_tick = 0
+    max_in_flight_batches = 0
 
-    for _ in range(max_steps):
-        while len(pending) < pp_size:
-            if not scheduler.has_unfinished_requests() and not pending_arrivals:
+    for _ in range(128):
+        while len(pending) < pp_size and scheduler.has_requests():
+            scheduler_output = scheduler.schedule()
+            if scheduler_output.total_num_scheduled_tokens == 0:
+                if pending:
+                    scheduler_waits.append(
+                        {
+                            "tick": next_issue_tick,
+                            "waiting_for_batch_ids": [
+                                batch.batch_id for batch, _ in pending
+                            ],
+                        }
+                    )
                 break
-            output = scheduler.schedule()
-            if output.total_num_scheduled_tokens == 0:
-                break
-            sample_on_complete = {
-                req_id: not scheduler.requests[req_id].is_prefill_chunk
-                for req_id in output.num_scheduled_tokens
-                if req_id in scheduler.requests
-            }
+
+            batch_id = len(batches)
             batch = IssuedBatch(
-                batch_id=len(issued),
-                pp0_tick=next_pp0_tick,
-                pp1_tick=next_pp0_tick + 1 if pp_size > 1 else next_pp0_tick,
-                items=_describe_items(scheduler, output),
+                batch_id=batch_id,
+                issue_tick=next_issue_tick,
+                completion_tick=next_issue_tick + pp_size,
+                items=_snapshot_items(
+                    scheduler,
+                    scheduler_output,
+                    batch_id,
+                    last_compute_batch,
+                    last_sample_batch,
+                ),
             )
-            issued.append(batch)
-            pending.append((batch, output, sample_on_complete))
-            next_pp0_tick += 1
-            admit_ready(len(issued))
+            batches.append(batch)
+            pending.append((batch, scheduler_output))
+            max_in_flight_batches = max(max_in_flight_batches, len(pending))
+            next_issue_tick += 1
+            admit_ready(len(batches))
 
         if not pending:
+            if scheduler.has_requests() or pending_arrivals:
+                raise AssertionError("simulation stalled before all requests arrived")
             break
 
-        batch, scheduler_output, sample_on_complete = pending.popleft()
-        scheduler.update_from_output(
-            scheduler_output,
-            _fake_model_output(scheduler_output, sample_on_complete),
-        )
-        complete_tick = batch.pp0_tick + pp_size
-        next_pp0_tick = max(next_pp0_tick, complete_tick)
-        admit_ready(len(issued))
+        batch, scheduler_output = pending.popleft()
+        model_runner_output = runner.complete(batch, scheduler_output)
+        for item in batch.items:
+            if item.emitted_token_id is not None:
+                last_sample_batch[item.req_id] = batch.batch_id
+        scheduler.update_from_output(scheduler_output, model_runner_output)
+        next_issue_tick = max(next_issue_tick, batch.completion_tick)
+        admit_ready(len(batches))
+    else:
+        raise AssertionError("simulation did not converge")
 
-    last_tick = 0
-    if issued:
-        last_tick = max(batch.pp0_tick + pp_size for batch in issued)
-    devices = [f"GPU{i} PP{i}" for i in range(pp_size)]
+    last_tick = max((batch.completion_tick for batch in batches), default=0)
+    devices = [f"GPU{stage} PP{stage}" for stage in range(pp_size)]
     occupied: dict[tuple[int, int], IssuedBatch] = {}
-    for batch in issued:
+    for batch in batches:
         for stage in range(pp_size):
-            occupied[(batch.pp0_tick + stage, stage)] = batch
+            position = (batch.issue_tick + stage, stage)
+            assert position not in occupied
+            occupied[position] = batch
 
     cells = []
     for tick in range(last_tick):
@@ -204,10 +327,25 @@ def simulate_pp_occupancy(
                 }
             )
 
+    completion_events = [
+        {
+            "tick": batch.completion_tick,
+            "batch_id": batch.batch_id,
+            "samples": [
+                {"req_id": item.req_id, "token_id": item.emitted_token_id}
+                for item in batch.items
+                if item.emitted_token_id is not None
+            ],
+        }
+        for batch in batches
+    ]
+
     return {
+        "model": "unit-time PP stage model",
+        "scheduler_mode": "sync",
         "pp_size": pp_size,
+        "queue_size": pp_size,
         "max_num_batched_tokens": max_num_batched_tokens,
-        "async_scheduling": async_scheduling,
         "arrivals": [
             {
                 "after_n_issued_batches": after,
@@ -217,7 +355,11 @@ def simulate_pp_occupancy(
             }
             for after, req_id, prompt_len, max_tokens in arrivals
         ],
-        "batches": [asdict(batch) for batch in issued],
+        "batches": [asdict(batch) for batch in batches],
+        "dependencies": _build_dependencies(batches),
+        "scheduler_waits": scheduler_waits,
+        "completion_events": completion_events,
+        "max_in_flight_batches": max_in_flight_batches,
         "last_tick": last_tick,
         "devices": devices,
         "cells": cells,
@@ -226,108 +368,150 @@ def simulate_pp_occupancy(
     }
 
 
+def _item_label(item: BatchItem) -> str:
+    if item.phase == PARTIAL_PREFILL:
+        return f"{item.req_id} P[{item.token_start}:{item.token_end}]"
+    if item.phase == FINAL_PREFILL:
+        return f"{item.req_id} PF[{item.token_start}:{item.token_end}]"
+    return f"{item.req_id} D{item.decode_step}(y{item.consumed_token_id})"
+
+
 def _cell_label(batch: IssuedBatch) -> str:
-    parts = []
-    for item in batch.items:
-        tag = "P" if item.kind == "prefill" else "D"
-        parts.append(f"{item.req_id} {tag}{item.num_tokens}")
-    return f"B{batch.batch_id} " + "+".join(parts)
+    return f"B{batch.batch_id} " + "+".join(
+        _item_label(item) for item in batch.items
+    )
 
 
 def _text_grid(trace: dict) -> str:
     last_tick = trace["last_tick"]
     pp_size = trace["pp_size"]
-    by_pos = {(c["tick"], c["device"]): c for c in trace["cells"]}
-    header = "      " + " | ".join(f"t{t:<14}" for t in range(last_tick))
+    by_pos = {(cell["tick"], cell["device"]): cell for cell in trace["cells"]}
+    header = "      " + " | ".join(f"t{tick:<24}" for tick in range(last_tick))
     rows = [header]
     for device, name in enumerate(trace["devices"]):
         cells = []
         for tick in range(last_tick):
             cell = by_pos[(tick, device)]
             text = "空" if cell["bubble"] else cell["label"]
-            cells.append(f"{text:<16}")
-        rows.append(f"{name:<5} " + " | ".join(cells))
+            cells.append(f"{text:<26}")
+        rows.append(f"{name:<8} " + " | ".join(cells))
     return "\n".join(rows)
 
 
-def run_occupancy_trace() -> dict:
-    """A (24-token prompt, 2 decode) + B (8, 2); C joins after the first batch."""
-    arrivals = [
-        (0, "A", 24, 2),
-        (0, "B", 8, 2),
-        (1, "C", 8, 2),
+def build_dependency_traces() -> dict:
+    single_arrivals = [(0, "A", 24, 3)]
+    mixed_arrivals = [
+        (0, "A", 24, 3),
+        (0, "B", 8, 3),
+        (1, "C", 8, 3),
     ]
-    kwargs = dict(
-        max_num_batched_tokens=16,
-        async_scheduling=False,
-    )
-    mixed = simulate_pp_occupancy(pp_size=2, arrivals=arrivals, **kwargs)
-    solo = simulate_pp_occupancy(
-        pp_size=2, arrivals=[(0, "A", 24, 2)], **kwargs
-    )
-    mixed4 = simulate_pp_occupancy(pp_size=4, arrivals=arrivals, **kwargs)
-    solo4 = simulate_pp_occupancy(
-        pp_size=4, arrivals=[(0, "A", 24, 2)], **kwargs
-    )
-    mixed4_again = simulate_pp_occupancy(pp_size=4, arrivals=arrivals, **kwargs)
-    TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "mixed": mixed,
-        "solo": solo,
-        "mixed_pp4": mixed4,
-        "solo_pp4": solo4,
-        "pp4_repeat_identical": mixed4 == mixed4_again,
+    kwargs = {"pp_size": 2, "max_num_batched_tokens": 16}
+    return {
+        "single_request": simulate_pp_schedule_trace(
+            arrivals=single_arrivals, **kwargs
+        ),
+        "mixed_requests": simulate_pp_schedule_trace(
+            arrivals=mixed_arrivals, **kwargs
+        ),
     }
-    TRACE_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def write_dependency_trace(path: Path = TRACE_PATH) -> dict:
+    payload = build_dependency_traces()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
     return payload
 
 
-def test_pp_occupancy_mixed_requests_sync_scheduler():
-    payload = run_occupancy_trace()
-    mixed = payload["mixed"]
-    solo = payload["solo"]
-
-    print("\n=== mixed PP=2 ===")
-    print(_text_grid(mixed))
-    print("\n=== solo PP=2 ===")
-    print(_text_grid(solo))
-    print("\n=== mixed PP=4 ===")
-    print(_text_grid(payload["mixed_pp4"]))
-    print("\n=== solo PP=4 ===")
-    print(_text_grid(payload["solo_pp4"]))
-    print(f"\nPP=4 second run identical: {payload['pp4_repeat_identical']}")
-    print(f"\ntrace written to {TRACE_PATH}")
-
-    assert mixed["batches"], "scheduler issued no batches"
-    first = mixed["batches"][0]
-    assert first["items"][0]["req_id"] == "A"
-    assert first["items"][0]["kind"] == "prefill"
-    assert first["items"][0]["num_tokens"] == 16
-
-    # Running-first: A's leftover prefill is scheduled before waiting B.
-    second_ids = [item["req_id"] for item in mixed["batches"][1]["items"]]
-    assert "A" in second_ids
-
-    # GPU1 is idle on the first tick (pipeline fill).
-    assert any(
-        c["tick"] == 0 and c["device"] == 1 and c["bubble"] for c in mixed["cells"]
+def test_pp_schedule_trace_models_request_dependencies():
+    trace = simulate_pp_schedule_trace(
+        pp_size=2,
+        max_num_batched_tokens=16,
+        arrivals=[(0, "A", 24, 3)],
     )
+    batches = trace["batches"]
 
-    # Mixed serving keeps the GPUs busier over the run.
-    assert mixed["num_busy"] > solo["num_busy"]
-    mixed_rate = mixed["num_bubbles"] / max(len(mixed["cells"]), 1)
-    solo_rate = solo["num_bubbles"] / max(len(solo["cells"]), 1)
-    assert mixed_rate <= solo_rate
+    assert [batch["items"][0]["phase"] for batch in batches] == [
+        PARTIAL_PREFILL,
+        FINAL_PREFILL,
+        DECODE,
+        DECODE,
+    ]
+    assert batches[1]["issue_tick"] < batches[0]["completion_tick"]
 
-    mixed4 = payload["mixed_pp4"]
-    assert mixed4["pp_size"] == 4
-    assert mixed4["devices"] == ["GPU0 PP0", "GPU1 PP1", "GPU2 PP2", "GPU3 PP3"]
-    assert any(
-        c["tick"] == 0 and c["device"] == 3 and c["bubble"] for c in mixed4["cells"]
+    stage_dependency = batches[1]["items"][0]
+    assert stage_dependency["dependency_kind"] == STAGE_ORDER
+    assert stage_dependency["depends_on_batch_id"] == 0
+    for stage in range(trace["pp_size"]):
+        source_end = batches[0]["issue_tick"] + stage + 1
+        target_start = batches[1]["issue_tick"] + stage
+        assert source_end <= target_start
+
+    first_decode = batches[2]["items"][0]
+    second_decode = batches[3]["items"][0]
+    assert first_decode["dependency_kind"] == SAMPLE_TOKEN
+    assert first_decode["depends_on_batch_id"] == 1
+    assert first_decode["consumed_token_id"] == batches[1]["items"][0][
+        "emitted_token_id"
+    ]
+    assert batches[2]["issue_tick"] >= batches[1]["completion_tick"]
+    assert second_decode["depends_on_batch_id"] == 2
+    assert second_decode["consumed_token_id"] == batches[2]["items"][0][
+        "emitted_token_id"
+    ]
+    assert batches[3]["issue_tick"] >= batches[2]["completion_tick"]
+    assert [wait["tick"] for wait in trace["scheduler_waits"]] == [2, 4, 6]
+
+
+def test_pp_schedule_trace_batches_other_requests_during_decode_waits():
+    trace = simulate_pp_schedule_trace(
+        pp_size=2,
+        max_num_batched_tokens=16,
+        arrivals=[
+            (0, "A", 24, 3),
+            (0, "B", 8, 3),
+            (1, "C", 8, 3),
+        ],
     )
-    assert payload["pp4_repeat_identical"] is True
+    actual_batches = [
+        [(item["req_id"], item["phase"]) for item in batch["items"]]
+        for batch in trace["batches"]
+    ]
+    assert actual_batches == [
+        [("A", PARTIAL_PREFILL)],
+        [("A", FINAL_PREFILL), ("B", FINAL_PREFILL)],
+        [("C", FINAL_PREFILL)],
+        [("A", DECODE), ("B", DECODE)],
+        [("C", DECODE)],
+        [("A", DECODE), ("B", DECODE)],
+        [("C", DECODE)],
+    ]
+    assert trace["max_in_flight_batches"] == trace["queue_size"] == 2
+    assert [wait["tick"] for wait in trace["scheduler_waits"]] == [7]
+
+    pp0_by_tick = {
+        cell["tick"]: cell
+        for cell in trace["cells"]
+        if cell["device"] == 0
+    }
+    assert all(not pp0_by_tick[tick]["bubble"] for tick in range(7))
+    assert pp0_by_tick[2]["label"].startswith("B2 C PF")
+
+    batches = {batch["batch_id"]: batch for batch in trace["batches"]}
+    for dependency in trace["dependencies"]:
+        if dependency["kind"] != SAMPLE_TOKEN:
+            continue
+        source = batches[dependency["from_batch_id"]]
+        target = batches[dependency["to_batch_id"]]
+        assert target["issue_tick"] >= source["completion_tick"]
 
 
 if __name__ == "__main__":
-    test_pp_occupancy_mixed_requests_sync_scheduler()
-    print("ok")
+    test_pp_schedule_trace_models_request_dependencies()
+    test_pp_schedule_trace_batches_other_requests_during_decode_waits()
+    traces = write_dependency_trace()
+    print("\n=== single request, PP=2 ===")
+    print(_text_grid(traces["single_request"]))
+    print("\n=== mixed requests, PP=2 ===")
+    print(_text_grid(traces["mixed_requests"]))
+    print(f"\ntrace written to {TRACE_PATH}")

@@ -1,9 +1,12 @@
 {
-  "single_request": {
+  "pp_size": 4,
+  "max_num_batched_tokens": 16,
+  "async_scheduling": false,
+  "single": {
     "model": "unit-time PP stage model",
     "scheduler_mode": "sync",
-    "pp_size": 2,
-    "queue_size": 2,
+    "pp_size": 4,
+    "queue_size": 4,
     "max_num_batched_tokens": 16,
     "arrivals": [
       {
@@ -17,7 +20,7 @@
       {
         "batch_id": 0,
         "issue_tick": 0,
-        "completion_tick": 2,
+        "completion_tick": 4,
         "items": [
           {
             "req_id": "A",
@@ -37,7 +40,7 @@
       {
         "batch_id": 1,
         "issue_tick": 1,
-        "completion_tick": 3,
+        "completion_tick": 5,
         "items": [
           {
             "req_id": "A",
@@ -56,8 +59,8 @@
       },
       {
         "batch_id": 2,
-        "issue_tick": 3,
-        "completion_tick": 5,
+        "issue_tick": 5,
+        "completion_tick": 9,
         "items": [
           {
             "req_id": "A",
@@ -76,8 +79,8 @@
       },
       {
         "batch_id": 3,
-        "issue_tick": 5,
-        "completion_tick": 7,
+        "issue_tick": 9,
+        "completion_tick": 13,
         "items": [
           {
             "req_id": "A",
@@ -122,17 +125,24 @@
       {
         "tick": 2,
         "waiting_for_batch_ids": [
+          0,
           1
         ]
       },
       {
         "tick": 4,
         "waiting_for_batch_ids": [
-          2
+          1
         ]
       },
       {
         "tick": 6,
+        "waiting_for_batch_ids": [
+          2
+        ]
+      },
+      {
+        "tick": 10,
         "waiting_for_batch_ids": [
           3
         ]
@@ -140,12 +150,12 @@
     ],
     "completion_events": [
       {
-        "tick": 2,
+        "tick": 4,
         "batch_id": 0,
         "samples": []
       },
       {
-        "tick": 3,
+        "tick": 5,
         "batch_id": 1,
         "samples": [
           {
@@ -155,7 +165,7 @@
         ]
       },
       {
-        "tick": 5,
+        "tick": 9,
         "batch_id": 2,
         "samples": [
           {
@@ -165,7 +175,7 @@
         ]
       },
       {
-        "tick": 7,
+        "tick": 13,
         "batch_id": 3,
         "samples": [
           {
@@ -176,10 +186,12 @@
       }
     ],
     "max_in_flight_batches": 2,
-    "last_tick": 7,
+    "last_tick": 13,
     "devices": [
       "GPU0 PP0",
-      "GPU1 PP1"
+      "GPU1 PP1",
+      "GPU2 PP2",
+      "GPU3 PP3"
     ],
     "cells": [
       {
@@ -197,6 +209,20 @@
         "bubble": true
       },
       {
+        "tick": 0,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 0,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
         "tick": 1,
         "device": 0,
         "batch_id": 1,
@@ -211,6 +237,20 @@
         "bubble": false
       },
       {
+        "tick": 1,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 1,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
         "tick": 2,
         "device": 0,
         "batch_id": null,
@@ -225,18 +265,46 @@
         "bubble": false
       },
       {
+        "tick": 2,
+        "device": 2,
+        "batch_id": 0,
+        "label": "B0 A P[0:16]",
+        "bubble": false
+      },
+      {
+        "tick": 2,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
         "tick": 3,
         "device": 0,
-        "batch_id": 2,
-        "label": "B2 A D1(y1000)",
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 3,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 3,
+        "device": 2,
+        "batch_id": 1,
+        "label": "B1 A PF[16:24]",
         "bubble": false
       },
       {
         "tick": 3,
-        "device": 1,
-        "batch_id": null,
-        "label": "",
-        "bubble": true
+        "device": 3,
+        "batch_id": 0,
+        "label": "B0 A P[0:16]",
+        "bubble": false
       },
       {
         "tick": 4,
@@ -248,47 +316,257 @@
       {
         "tick": 4,
         "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 4,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 4,
+        "device": 3,
+        "batch_id": 1,
+        "label": "B1 A PF[16:24]",
+        "bubble": false
+      },
+      {
+        "tick": 5,
+        "device": 0,
         "batch_id": 2,
         "label": "B2 A D1(y1000)",
         "bubble": false
       },
       {
         "tick": 5,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 5,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 5,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 6,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 6,
+        "device": 1,
+        "batch_id": 2,
+        "label": "B2 A D1(y1000)",
+        "bubble": false
+      },
+      {
+        "tick": 6,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 6,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 7,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 7,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 7,
+        "device": 2,
+        "batch_id": 2,
+        "label": "B2 A D1(y1000)",
+        "bubble": false
+      },
+      {
+        "tick": 7,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 8,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 8,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 8,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 8,
+        "device": 3,
+        "batch_id": 2,
+        "label": "B2 A D1(y1000)",
+        "bubble": false
+      },
+      {
+        "tick": 9,
         "device": 0,
         "batch_id": 3,
         "label": "B3 A D2(y1001)",
         "bubble": false
       },
       {
-        "tick": 5,
+        "tick": 9,
         "device": 1,
         "batch_id": null,
         "label": "",
         "bubble": true
       },
       {
-        "tick": 6,
+        "tick": 9,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 9,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 10,
         "device": 0,
         "batch_id": null,
         "label": "",
         "bubble": true
       },
       {
-        "tick": 6,
+        "tick": 10,
         "device": 1,
+        "batch_id": 3,
+        "label": "B3 A D2(y1001)",
+        "bubble": false
+      },
+      {
+        "tick": 10,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 10,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 11,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 11,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 11,
+        "device": 2,
+        "batch_id": 3,
+        "label": "B3 A D2(y1001)",
+        "bubble": false
+      },
+      {
+        "tick": 11,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 12,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 12,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 12,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 12,
+        "device": 3,
         "batch_id": 3,
         "label": "B3 A D2(y1001)",
         "bubble": false
       }
     ],
-    "num_bubbles": 6,
-    "num_busy": 8
+    "num_bubbles": 36,
+    "num_busy": 16
   },
-  "mixed_requests": {
+  "mixed": {
     "model": "unit-time PP stage model",
     "scheduler_mode": "sync",
-    "pp_size": 2,
-    "queue_size": 2,
+    "pp_size": 4,
+    "queue_size": 4,
     "max_num_batched_tokens": 16,
     "arrivals": [
       {
@@ -314,7 +592,7 @@
       {
         "batch_id": 0,
         "issue_tick": 0,
-        "completion_tick": 2,
+        "completion_tick": 4,
         "items": [
           {
             "req_id": "A",
@@ -334,7 +612,7 @@
       {
         "batch_id": 1,
         "issue_tick": 1,
-        "completion_tick": 3,
+        "completion_tick": 5,
         "items": [
           {
             "req_id": "A",
@@ -367,7 +645,7 @@
       {
         "batch_id": 2,
         "issue_tick": 2,
-        "completion_tick": 4,
+        "completion_tick": 6,
         "items": [
           {
             "req_id": "C",
@@ -386,8 +664,8 @@
       },
       {
         "batch_id": 3,
-        "issue_tick": 3,
-        "completion_tick": 5,
+        "issue_tick": 5,
+        "completion_tick": 9,
         "items": [
           {
             "req_id": "A",
@@ -419,8 +697,8 @@
       },
       {
         "batch_id": 4,
-        "issue_tick": 4,
-        "completion_tick": 6,
+        "issue_tick": 6,
+        "completion_tick": 10,
         "items": [
           {
             "req_id": "C",
@@ -439,8 +717,8 @@
       },
       {
         "batch_id": 5,
-        "issue_tick": 5,
-        "completion_tick": 7,
+        "issue_tick": 9,
+        "completion_tick": 13,
         "items": [
           {
             "req_id": "A",
@@ -472,8 +750,8 @@
       },
       {
         "batch_id": 6,
-        "issue_tick": 6,
-        "completion_tick": 8,
+        "issue_tick": 10,
+        "completion_tick": 14,
         "items": [
           {
             "req_id": "C",
@@ -544,7 +822,50 @@
     ],
     "scheduler_waits": [
       {
+        "tick": 3,
+        "waiting_for_batch_ids": [
+          0,
+          1,
+          2
+        ]
+      },
+      {
+        "tick": 4,
+        "waiting_for_batch_ids": [
+          1,
+          2
+        ]
+      },
+      {
+        "tick": 6,
+        "waiting_for_batch_ids": [
+          2,
+          3
+        ]
+      },
+      {
         "tick": 7,
+        "waiting_for_batch_ids": [
+          3,
+          4
+        ]
+      },
+      {
+        "tick": 10,
+        "waiting_for_batch_ids": [
+          4,
+          5
+        ]
+      },
+      {
+        "tick": 11,
+        "waiting_for_batch_ids": [
+          5,
+          6
+        ]
+      },
+      {
+        "tick": 13,
         "waiting_for_batch_ids": [
           6
         ]
@@ -552,12 +873,12 @@
     ],
     "completion_events": [
       {
-        "tick": 2,
+        "tick": 4,
         "batch_id": 0,
         "samples": []
       },
       {
-        "tick": 3,
+        "tick": 5,
         "batch_id": 1,
         "samples": [
           {
@@ -571,7 +892,7 @@
         ]
       },
       {
-        "tick": 4,
+        "tick": 6,
         "batch_id": 2,
         "samples": [
           {
@@ -581,7 +902,7 @@
         ]
       },
       {
-        "tick": 5,
+        "tick": 9,
         "batch_id": 3,
         "samples": [
           {
@@ -595,7 +916,7 @@
         ]
       },
       {
-        "tick": 6,
+        "tick": 10,
         "batch_id": 4,
         "samples": [
           {
@@ -605,7 +926,7 @@
         ]
       },
       {
-        "tick": 7,
+        "tick": 13,
         "batch_id": 5,
         "samples": [
           {
@@ -619,7 +940,7 @@
         ]
       },
       {
-        "tick": 8,
+        "tick": 14,
         "batch_id": 6,
         "samples": [
           {
@@ -629,11 +950,13 @@
         ]
       }
     ],
-    "max_in_flight_batches": 2,
-    "last_tick": 8,
+    "max_in_flight_batches": 3,
+    "last_tick": 14,
     "devices": [
       "GPU0 PP0",
-      "GPU1 PP1"
+      "GPU1 PP1",
+      "GPU2 PP2",
+      "GPU3 PP3"
     ],
     "cells": [
       {
@@ -651,6 +974,20 @@
         "bubble": true
       },
       {
+        "tick": 0,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 0,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
         "tick": 1,
         "device": 0,
         "batch_id": 1,
@@ -665,6 +1002,20 @@
         "bubble": false
       },
       {
+        "tick": 1,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 1,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
         "tick": 2,
         "device": 0,
         "batch_id": 2,
@@ -679,11 +1030,25 @@
         "bubble": false
       },
       {
+        "tick": 2,
+        "device": 2,
+        "batch_id": 0,
+        "label": "B0 A P[0:16]",
+        "bubble": false
+      },
+      {
+        "tick": 2,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
         "tick": 3,
         "device": 0,
-        "batch_id": 3,
-        "label": "B3 A D1(y1000)+B D1(y1001)",
-        "bubble": false
+        "batch_id": null,
+        "label": "",
+        "bubble": true
       },
       {
         "tick": 3,
@@ -693,46 +1058,102 @@
         "bubble": false
       },
       {
-        "tick": 4,
-        "device": 0,
-        "batch_id": 4,
-        "label": "B4 C D1(y1002)",
+        "tick": 3,
+        "device": 2,
+        "batch_id": 1,
+        "label": "B1 A PF[16:24]+B PF[0:8]",
+        "bubble": false
+      },
+      {
+        "tick": 3,
+        "device": 3,
+        "batch_id": 0,
+        "label": "B0 A P[0:16]",
         "bubble": false
       },
       {
         "tick": 4,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 4,
         "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 4,
+        "device": 2,
+        "batch_id": 2,
+        "label": "B2 C PF[0:8]",
+        "bubble": false
+      },
+      {
+        "tick": 4,
+        "device": 3,
+        "batch_id": 1,
+        "label": "B1 A PF[16:24]+B PF[0:8]",
+        "bubble": false
+      },
+      {
+        "tick": 5,
+        "device": 0,
         "batch_id": 3,
         "label": "B3 A D1(y1000)+B D1(y1001)",
         "bubble": false
       },
       {
         "tick": 5,
-        "device": 0,
-        "batch_id": 5,
-        "label": "B5 A D2(y1003)+B D2(y1004)",
-        "bubble": false
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
       },
       {
         "tick": 5,
-        "device": 1,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 5,
+        "device": 3,
+        "batch_id": 2,
+        "label": "B2 C PF[0:8]",
+        "bubble": false
+      },
+      {
+        "tick": 6,
+        "device": 0,
         "batch_id": 4,
         "label": "B4 C D1(y1002)",
         "bubble": false
       },
       {
         "tick": 6,
-        "device": 0,
-        "batch_id": 6,
-        "label": "B6 C D2(y1005)",
+        "device": 1,
+        "batch_id": 3,
+        "label": "B3 A D1(y1000)+B D1(y1001)",
         "bubble": false
       },
       {
         "tick": 6,
-        "device": 1,
-        "batch_id": 5,
-        "label": "B5 A D2(y1003)+B D2(y1004)",
-        "bubble": false
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 6,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
       },
       {
         "tick": 7,
@@ -744,12 +1165,194 @@
       {
         "tick": 7,
         "device": 1,
+        "batch_id": 4,
+        "label": "B4 C D1(y1002)",
+        "bubble": false
+      },
+      {
+        "tick": 7,
+        "device": 2,
+        "batch_id": 3,
+        "label": "B3 A D1(y1000)+B D1(y1001)",
+        "bubble": false
+      },
+      {
+        "tick": 7,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 8,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 8,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 8,
+        "device": 2,
+        "batch_id": 4,
+        "label": "B4 C D1(y1002)",
+        "bubble": false
+      },
+      {
+        "tick": 8,
+        "device": 3,
+        "batch_id": 3,
+        "label": "B3 A D1(y1000)+B D1(y1001)",
+        "bubble": false
+      },
+      {
+        "tick": 9,
+        "device": 0,
+        "batch_id": 5,
+        "label": "B5 A D2(y1003)+B D2(y1004)",
+        "bubble": false
+      },
+      {
+        "tick": 9,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 9,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 9,
+        "device": 3,
+        "batch_id": 4,
+        "label": "B4 C D1(y1002)",
+        "bubble": false
+      },
+      {
+        "tick": 10,
+        "device": 0,
+        "batch_id": 6,
+        "label": "B6 C D2(y1005)",
+        "bubble": false
+      },
+      {
+        "tick": 10,
+        "device": 1,
+        "batch_id": 5,
+        "label": "B5 A D2(y1003)+B D2(y1004)",
+        "bubble": false
+      },
+      {
+        "tick": 10,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 10,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 11,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 11,
+        "device": 1,
+        "batch_id": 6,
+        "label": "B6 C D2(y1005)",
+        "bubble": false
+      },
+      {
+        "tick": 11,
+        "device": 2,
+        "batch_id": 5,
+        "label": "B5 A D2(y1003)+B D2(y1004)",
+        "bubble": false
+      },
+      {
+        "tick": 11,
+        "device": 3,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 12,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 12,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 12,
+        "device": 2,
+        "batch_id": 6,
+        "label": "B6 C D2(y1005)",
+        "bubble": false
+      },
+      {
+        "tick": 12,
+        "device": 3,
+        "batch_id": 5,
+        "label": "B5 A D2(y1003)+B D2(y1004)",
+        "bubble": false
+      },
+      {
+        "tick": 13,
+        "device": 0,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 13,
+        "device": 1,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 13,
+        "device": 2,
+        "batch_id": null,
+        "label": "",
+        "bubble": true
+      },
+      {
+        "tick": 13,
+        "device": 3,
         "batch_id": 6,
         "label": "B6 C D2(y1005)",
         "bubble": false
       }
     ],
-    "num_bubbles": 2,
-    "num_busy": 14
+    "num_bubbles": 28,
+    "num_busy": 28
   }
 }

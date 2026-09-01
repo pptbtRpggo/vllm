@@ -1,0 +1,95 @@
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#FFFFFF",
+    "primaryColor": "#E3F2FD",
+    "primaryTextColor": "#102A43",
+    "primaryBorderColor": "#1565C0",
+    "lineColor": "#455A64",
+    "secondaryColor": "#FFF8E1",
+    "tertiaryColor": "#E8F5E9",
+    "fontSize": "15px"
+  },
+  "flowchart": {
+    "curve": "linear",
+    "nodeSpacing": 28,
+    "rankSpacing": 42,
+    "padding": 12,
+    "htmlLabels": true
+  }
+}}%%
+flowchart TB
+    classDef startend fill:#FFF8E1,stroke:#F9A825,color:#102A43,stroke-width:2px
+    classDef queue fill:#E8F5E9,stroke:#2E7D32,color:#102A43,stroke-width:2px
+    classDef proc fill:#E3F2FD,stroke:#1565C0,color:#102A43,stroke-width:2px
+    classDef decision fill:#FFFFFF,stroke:#2E7D32,color:#102A43,stroke-width:2px
+    classDef skip fill:#F5F5F5,stroke:#78909C,color:#455A64,stroke-width:2px
+    classDef preempt fill:#FFEBEE,stroke:#C62828,color:#102A43,stroke-width:2px
+    classDef out fill:#F3E5F5,stroke:#7B1FA2,color:#102A43,stroke-width:2px
+    classDef bridge fill:#FFFFFF,stroke:#90A4AE,color:#102A43,stroke-width:2px
+
+    arrive(["新请求到达"]):::startend --> waiting["进入 waiting<br/>FCFS 或 priority"]:::queue
+    waiting --> hasWork{"还有未完成的请求<br/>或在途 batch?"}:::decision
+    hasWork -->|否| idle(["空闲，等新请求"]):::startend
+    hasWork -->|是| cap["定这一步的上限<br/>token 预算：max_num_batched_tokens<br/>这一步 GPU 最多算这么多 token，也是这个 batch 最多装这么多<br/>running 条数不能超过 max_num_seqs"]:::proc
+    cap --> runGate
+
+    subgraph OLD ["① 先扫 running（已有 KV：Decode，或还没切完的 Prefill）"]
+        runGate{"running 还没看完<br/>且 token 预算还剩?"}:::decision
+        runGate -->|是| takeRun["取下一条 running 请求"]:::proc
+        takeRun --> skipNow{"这一步先跳过这条?<br/>欠 0：上一段已排出，采样还没回来<br/>（最后一块 Prefill 和普通 Decode 都是这个）<br/>仅 PP+async：即使能往前排，同一条 Decode 也要隔 pp_size 步"}:::decision
+        skipNow -->|是| skipRun["跳过，看 running 里下一条"]:::skip
+        skipRun --> runGate
+        skipNow -->|否| slice["按预算截断这一步要算的 token<br/>Decode 通常 1 个；Prefill 太长就 chunked prefill"]:::proc
+        slice --> kvOk{"KV cache 够不够?"}:::decision
+        kvOk -->|够| writeRun["写入这个 batch，扣掉 token 预算"]:::proc
+        writeRun --> runGate
+        kvOk -->|不够| preempt["抢占：踢回 waiting，KV 释放，从零重算<br/>FCFS 抢队尾；priority 抢优先级最低的"]:::preempt
+        preempt --> selfVictim{"被抢占的就是正在排的这条?<br/>已经没人可牺牲了"}:::decision
+        selfVictim -->|不是：格子腾出来了，再试一次| kvOk
+        selfVictim -->|是| runStop["停止扫 running"]:::skip
+        runGate -->|否| runStop
+    end
+
+    runStop --> phase2["running 扫完"]:::bridge
+    phase2 --> waitGate
+
+    subgraph NEW ["② 再从 waiting 拉新请求进 batch"]
+        waitGate{"这一步没有发生抢占<br/>token 预算还剩、running 未满<br/>waiting 里还有人?"}:::decision
+        waitGate -->|是| pick["取 waiting 队头"]:::proc
+        pick --> blocked{"现在进不了 batch?"}:::decision
+        blocked -->|LoRA adapter 数量已到上限| skipWait["先放到一边，看下一条"]:::skip
+        blocked -->|structured output 的 grammar 还没就绪| skipWait
+        blocked -->|远端 KV 还在传输| skipWait
+        blocked -->|上一步输出还在路上，不能接着排| skipWait
+        skipWait --> waitGate
+        blocked -->|没卡住| prefix["查前缀缓存：本地 hit，以及 connector 上的远端 hit<br/>已经在 KV 里的那段不用再算"]:::proc
+        prefix --> remote{"这一步需要异步去拉远端 KV?"}:::decision
+        remote -->|是| allocRemote{"预留 KV block 成功?"}:::decision
+        allocRemote -->|是| waitKv["标成等待远端 KV，本步不做 forward<br/>传输完成后再进 running"]:::skip
+        waitKv --> waitGate
+        allocRemote -->|否| waitStop["KV 不够，停止收 waiting"]:::skip
+        remote -->|否| admit{"按预算截断后还有 token 可排<br/>且 KV 分配成功?"}:::decision
+        admit -->|是| join["进入 running，写入这个 batch，扣预算<br/>Prefill 塞不下就只切一块"]:::proc
+        join --> waitGate
+        admit -->|否：预算不够且不能 chunk，或 KV 不够| waitStop
+        waitGate -->|否| waitDone["结束收 waiting"]:::skip
+        waitStop --> waitDone
+    end
+
+    waitDone --> batchOut["发出这个 batch<br/>里面写了：哪些请求、各算多少 token、KV block<br/>可以同时包含 Prefill 和 Decode"]:::out
+    batchOut --> mark["schedule 返回前先推进「已经算到哪」<br/>同一条请求的下一块 Prefill 可以立刻再进下一个 batch<br/>Decode 必须等采样结果，才有下一个 token"]:::proc
+
+    mark --> gpu["GPU 跑这个 batch<br/>只在可采样位置 sampling；未完成的 Prefill chunk 不产出新 token"]:::proc
+    mark -.->|PP / async 且 batch queue 未满：立刻再 schedule 下一个 batch| cap
+
+    gpu --> sample["这个 batch 的 GPU 跑完后才写回，接上采样 token"]:::proc
+    sample --> fin{"这条请求结束了?"}:::decision
+    fin -->|是| leave["离开 running，释放 KV"]:::proc
+    fin -->|否| stay["留在 running，下一步再排"]:::queue
+    leave --> hasWork
+    stay --> hasWork
+
+    style OLD fill:#F8FAFC,stroke:#90A4AE,stroke-width:2px
+    style NEW fill:#F8FAFC,stroke:#90A4AE,stroke-width:2px
+    linkStyle default stroke:#455A64,stroke-width:2px
