@@ -491,7 +491,8 @@ class EngineCore:
         1. Try to schedule a new batch if the batch queue is not full.
         If a new batch is scheduled, directly return an empty engine core
         output. In other words, fulfilling the batch queue has a higher priority
-        than getting model outputs.
+        than getting model outputs. A 0-token schedule is not executed or
+        enqueued; if the queue is non-empty we wait on the in-flight batch.
         2. If there is no new scheduled batch, meaning that the batch queue
         is full or no other requests can be scheduled, we block until the first
         batch in the job queue is finished.
@@ -510,45 +511,48 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
-            with self.log_error_detail(scheduler_output):
-                exec_future = self.model_executor.execute_model(
-                    scheduler_output, non_block=True
-                )
-            if self.is_ec_consumer:
-                model_executed = scheduler_output.total_num_scheduled_tokens > 0
+            # 0-token schedule means wait for in-flight work (e.g. τ-Batch
+            # peek_slot is None). Do not execute or enqueue an empty batch.
+            if scheduler_output.total_num_scheduled_tokens > 0:
+                with self.log_error_detail(scheduler_output):
+                    exec_future = self.model_executor.execute_model(
+                        scheduler_output, non_block=True
+                    )
+                if self.is_ec_consumer:
+                    model_executed = True
 
-            if self.is_pooling_model or not model_executed:
-                # No sampling required (no requests scheduled).
-                future = cast(Future[ModelRunnerOutput], exec_future)
-            else:
-                if not scheduler_output.pending_structured_output_tokens:
-                    # We aren't waiting for any tokens, get any grammar output
-                    # and sample immediately.
-                    grammar_output = self.scheduler.get_grammar_bitmask(
-                        scheduler_output
-                    )
-                    future = self.model_executor.sample_tokens(
-                        grammar_output, non_block=True
-                    )
+                if self.is_pooling_model or not model_executed:
+                    # No sampling required (no requests scheduled).
+                    future = cast(Future[ModelRunnerOutput], exec_future)
                 else:
-                    # We need to defer sampling until we have processed the model output
-                    # from the prior step.
-                    deferred_scheduler_output = scheduler_output
+                    if not scheduler_output.pending_structured_output_tokens:
+                        # We aren't waiting for any tokens, get any grammar
+                        # output and sample immediately.
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
+                    else:
+                        # Defer sampling until the prior step's output is
+                        # processed.
+                        deferred_scheduler_output = scheduler_output
 
-            if not deferred_scheduler_output:
-                # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
-                if len(batch_queue) < self.batch_queue_size and (
-                    model_executed or self.scheduler.has_requests()
-                ):
-                    # Don't block on next worker response unless the queue is full
-                    # or there are no more requests to schedule.
-                    return None, model_executed
+                if not deferred_scheduler_output:
+                    # Add this step's future to the queue.
+                    batch_queue.appendleft(
+                        (future, scheduler_output, exec_future)
+                    )
+                    if len(batch_queue) < self.batch_queue_size and (
+                        model_executed or self.scheduler.has_requests()
+                    ):
+                        # Don't block on the next worker response unless the
+                        # queue is full or there are no more requests.
+                        return None, model_executed
 
-        elif not batch_queue:
-            # Queue is empty. We should not reach here since this method should
-            # only be called when the scheduler contains requests or the queue
-            # is non-empty.
+        if not batch_queue:
+            # Nothing scheduled and nothing in flight.
             return None, False
 
         # Block until the next result is available.

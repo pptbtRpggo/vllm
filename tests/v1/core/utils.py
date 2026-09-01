@@ -58,6 +58,7 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
+    scheduler_cls: type | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -162,7 +163,8 @@ def create_scheduler(
     )
     cache_config.num_gpu_blocks = num_blocks
     register_all_kvcache_specs(vllm_config)
-    scheduler_cls = AsyncScheduler if async_scheduling else Scheduler
+    if scheduler_cls is None:
+        scheduler_cls = AsyncScheduler if async_scheduling else Scheduler
     return scheduler_cls(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
