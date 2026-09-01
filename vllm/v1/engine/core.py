@@ -663,7 +663,7 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills()) # scheduling一个microbatch
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -694,15 +694,15 @@ class EngineCore:
                 batch_queue.appendleft((future, scheduler_output, exec_future))
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
-                ):
+                ): # 当batch queue未满，且有microbatch需要执行
                     # Don't block on next worker response unless the queue is full
-                    # or there are no more requests to schedule.
+                    # or there are no more requests to schedule. 不会阻塞，不会等待子线程返回，继续shceduling下一个micro batch
                     return None, model_executed
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
             # only be called when the scheduler contains requests or the queue
-            # is non-empty.
+            # is non-empty. 
             return None, False
 
         # Block until the next result is available.
