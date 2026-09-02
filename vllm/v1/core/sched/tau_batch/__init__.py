@@ -27,8 +27,27 @@ __all__ = [
     "PackContext",
     "TauBatchPlanner",
     "TauRequestSnapshot",
+    "TauScheduler",
     "WaveDispatcher",
     "WaveDispatchPolicy",
     "WavePackingStrategy",
     "WavePlan",
+    "snapshot_from_request",
 ]
+
+
+def __getattr__(name: str):
+    # TauScheduler imports the vLLM Request/Scheduler stack; keep that lazy so
+    # planner/dispatch unit tests do not pull optional runtime deps.
+    if name in {"TauScheduler", "snapshot_from_request"}:
+        from vllm.v1.core.sched.tau_batch.scheduler import (
+            TauScheduler,
+            snapshot_from_request,
+        )
+
+        exports = {
+            "TauScheduler": TauScheduler,
+            "snapshot_from_request": snapshot_from_request,
+        }
+        return exports[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
