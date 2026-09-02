@@ -73,6 +73,13 @@ class WaveDispatcher:
         self._prefill_done = set()
         self._decode_cursor = 0
 
+    def reset(self) -> None:
+        """Drop the active plan. peek_slot() is None until the next start()."""
+        self._plan = None
+        self._prefills_committed = 0
+        self._prefill_done = set()
+        self._decode_cursor = 0
+
     @property
     def plan(self) -> WavePlan | None:
         return self._plan

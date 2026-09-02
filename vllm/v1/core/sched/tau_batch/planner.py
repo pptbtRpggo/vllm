@@ -84,6 +84,16 @@ class TauBatchPlanner:
                 "max_reqs_per_microbatch must be >= 1, got "
                 f"{ctx.max_reqs_per_microbatch}"
             )
+        if ctx.kv_free_blocks is not None and ctx.kv_free_blocks < 0:
+            raise ValueError(
+                f"kv_free_blocks must be >= 0, got {ctx.kv_free_blocks}"
+            )
+        if ctx.kv_free_blocks is not None and (
+            ctx.block_size is None or ctx.block_size < 1
+        ):
+            raise ValueError(
+                "block_size must be >= 1 when kv_free_blocks is set"
+            )
 
     @staticmethod
     def _validate_requests(requests: Sequence[TauRequestSnapshot]) -> None:
@@ -108,6 +118,11 @@ class TauBatchPlanner:
                 raise ValueError(
                     f"tpot_slo_ms must be > 0 for {req.request_id}, "
                     f"got {req.tpot_slo_ms}"
+                )
+            if req.max_new_tokens < 0:
+                raise ValueError(
+                    f"max_new_tokens must be >= 0 for {req.request_id}, "
+                    f"got {req.max_new_tokens}"
                 )
 
     @staticmethod

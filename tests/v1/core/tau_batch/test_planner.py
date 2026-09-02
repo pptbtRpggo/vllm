@@ -9,6 +9,7 @@ from vllm.v1.core.sched.tau_batch import (
     TauBatchPlanner,
     TauRequestSnapshot,
     WavePlan,
+    estimate_kv_blocks,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -21,6 +22,7 @@ def _req(
     ttft_slo_ms: float = 200.0,
     arrival_time: float = 0.0,
     prompt_len: int = 128,
+    max_new_tokens: int = 16,
 ) -> TauRequestSnapshot:
     return TauRequestSnapshot(
         request_id=req_id,
@@ -28,6 +30,7 @@ def _req(
         prompt_len=prompt_len,
         ttft_slo_ms=ttft_slo_ms,
         tpot_slo_ms=tpot_slo_ms,
+        max_new_tokens=max_new_tokens,
     )
 
 
@@ -37,12 +40,18 @@ def _ctx(
     max_microbatches: int = 4,
     max_reqs_per_microbatch: int = 4,
     now: float = 0.0,
+    kv_free_blocks: int | None = None,
+    block_size: int | None = None,
+    max_num_batched_tokens: int | None = None,
 ) -> PackContext:
     return PackContext(
         now=now,
         max_num_seqs=max_num_seqs,
         max_microbatches=max_microbatches,
         max_reqs_per_microbatch=max_reqs_per_microbatch,
+        kv_free_blocks=kv_free_blocks,
+        block_size=block_size,
+        max_num_batched_tokens=max_num_batched_tokens,
     )
 
 
@@ -210,3 +219,60 @@ def test_custom_strategy_is_used():
 
     planner = TauBatchPlanner(strategy=AdmitNone())
     assert planner.plan_wave([_req("a"), _req("b")], _ctx()) is None
+
+
+def test_invalid_max_new_tokens_raises():
+    planner = TauBatchPlanner()
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        planner.plan_wave([_req("a", max_new_tokens=-1)], _ctx())
+
+
+def test_kv_context_requires_block_size():
+    planner = TauBatchPlanner()
+    with pytest.raises(ValueError, match="block_size"):
+        planner.plan_wave([_req("a")], _ctx(kv_free_blocks=8))
+
+
+def test_greedy_defers_when_kv_blocks_exhausted():
+    planner = TauBatchPlanner()
+    # 16+16 tokens / block 16 = 2 blocks each.
+    requests = [
+        _req("r0", tpot_slo_ms=10.0, prompt_len=16, max_new_tokens=16),
+        _req("r1", tpot_slo_ms=11.0, prompt_len=16, max_new_tokens=16),
+        _req("r2", tpot_slo_ms=12.0, prompt_len=16, max_new_tokens=16),
+    ]
+    ctx = _ctx(
+        max_num_seqs=8,
+        max_microbatches=4,
+        max_reqs_per_microbatch=4,
+        kv_free_blocks=4,
+        block_size=16,
+    )
+    plan = planner.plan_wave(requests, ctx)
+    assert plan is not None
+    _assert_invariants(plan, requests, ctx)
+    assert plan.admitted_ids == {"r0", "r1"}
+    assert plan.deferred_ids == {"r2"}
+    assert estimate_kv_blocks(16, 16, 16) == 2
+
+
+def test_greedy_skips_unfittable_and_takes_next():
+    planner = TauBatchPlanner()
+    requests = [
+        _req("big", tpot_slo_ms=1.0, prompt_len=64, max_new_tokens=64),
+        _req("small", tpot_slo_ms=10.0, prompt_len=16, max_new_tokens=16),
+    ]
+    ctx = _ctx(
+        max_num_seqs=8,
+        max_microbatches=2,
+        max_reqs_per_microbatch=2,
+        kv_free_blocks=3,
+        block_size=16,
+    )
+    plan = planner.plan_wave(requests, ctx)
+    assert plan is not None
+    _assert_invariants(plan, requests, ctx)
+    assert plan.admitted_ids == {"small"}
+    assert plan.deferred_ids == {"big"}
+
+

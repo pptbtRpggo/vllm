@@ -4,8 +4,10 @@
 import time
 from typing import Any
 
-from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.sched.tau_batch.dispatch import (
     DispatchPhase,
@@ -18,14 +20,57 @@ from vllm.v1.core.sched.tau_batch.types import (
     PackContext,
     TauRequestSnapshot,
     WavePlan,
+    estimate_kv_blocks,
 )
-from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
+
+logger = init_logger(__name__)
 
 # Prototype defaults when sampling_params.extra_args has no SLO.
 _DEFAULT_TTFT_SLO_MS = 10_000.0
 _DEFAULT_TPOT_SLO_MS = 100.0
+
+
+def _enforce_wave_runtime_contract(vllm_config: VllmConfig) -> None:
+    """Turn off features that split one Prefill slot across forwards.
+
+    Tau-batch treats one ``schedule()`` as one complete Prefill or Decode
+    slot. Chunked prefill, prefix-cache hits, long-prefill caps,
+    speculative decode, and async scheduling break that contract. This
+    mutates ``vllm_config`` before ``Scheduler.__init__`` so the parent
+    KV manager and token budget see the disabled flags.
+    """
+    disabled: list[str] = []
+    sched = vllm_config.scheduler_config
+    cache = vllm_config.cache_config
+
+    if sched.enable_chunked_prefill:
+        sched.enable_chunked_prefill = False
+        disabled.append("enable_chunked_prefill")
+    if sched.long_prefill_token_threshold != 0:
+        sched.long_prefill_token_threshold = 0
+        disabled.append("long_prefill_token_threshold")
+    if sched.max_num_partial_prefills > 1:
+        sched.max_num_partial_prefills = 1
+        disabled.append("max_num_partial_prefills")
+    if sched.async_scheduling:
+        sched.async_scheduling = False
+        disabled.append("async_scheduling")
+    if cache.enable_prefix_caching:
+        cache.enable_prefix_caching = False
+        disabled.append("enable_prefix_caching")
+    if vllm_config.speculative_config is not None:
+        vllm_config.speculative_config = None
+        disabled.append("speculative_config")
+
+    if disabled:
+        logger.warning(
+            "TauScheduler disabled unsupported features: %s. "
+            "These would split a micro-batch Prefill across forwards.",
+            ", ".join(disabled),
+        )
 
 
 def snapshot_from_request(request: Request) -> TauRequestSnapshot:
@@ -48,107 +93,49 @@ def snapshot_from_request(request: Request) -> TauRequestSnapshot:
         prompt_len=request.num_prompt_tokens,
         ttft_slo_ms=float(extra.get("ttft_slo_ms", _DEFAULT_TTFT_SLO_MS)),
         tpot_slo_ms=float(extra.get("tpot_slo_ms", _DEFAULT_TPOT_SLO_MS)),
+        max_new_tokens=request.max_tokens,
     )
-
-
-class _Holdback:
-    """Hide non-allowed requests from waiting and running.
-
-    v0.13 keeps skipped waiting in a per-schedule() local queue and
-    prepends it back to ``waiting``. There is no persistent
-    ``skipped_waiting`` attribute.
-    """
-
-    def __init__(self, scheduler: Scheduler, allowed: set[str]) -> None:
-        self._scheduler = scheduler
-        self._allowed = allowed
-        self._waiting = list(scheduler.waiting)
-        self._running = list(scheduler.running)
-
-    def apply(self) -> None:
-        s = self._scheduler
-        s.waiting = self._filter_queue(self._waiting)
-        s.running = [r for r in self._running if r.request_id in self._allowed]
-
-    def restore(self) -> None:
-        s = self._scheduler
-        running_after = list(s.running)
-        waiting_after = list(s.waiting)
-        running_ids = {r.request_id for r in running_after}
-        s.running = self._restore_running(running_after)
-        s.waiting = self._restore_queue(self._waiting, waiting_after, running_ids)
-
-    def _filter_queue(self, reqs: list[Request]) -> RequestQueue:
-        q = create_request_queue(self._scheduler.policy)
-        for req in reqs:
-            if req.request_id in self._allowed:
-                q.add_request(req)
-        return q
-
-    def _restore_running(self, running_after: list[Request]) -> list[Request]:
-        after_by_id = {r.request_id: r for r in running_after}
-        seen: set[str] = set()
-        restored: list[Request] = []
-        for req in self._running:
-            rid = req.request_id
-            if rid in self._allowed:
-                if rid in after_by_id:
-                    restored.append(after_by_id[rid])
-                    seen.add(rid)
-            else:
-                restored.append(req)
-                seen.add(rid)
-        for req in running_after:
-            if req.request_id not in seen:
-                restored.append(req)
-        return restored
-
-    def _restore_queue(
-        self,
-        original: list[Request],
-        after: list[Request],
-        running_ids: set[str],
-    ) -> RequestQueue:
-        after_ids = {r.request_id for r in after}
-        q = create_request_queue(self._scheduler.policy)
-        seen: set[str] = set()
-        for req in original:
-            rid = req.request_id
-            if rid in running_ids:
-                continue
-            if rid in self._allowed:
-                if rid in after_ids:
-                    q.add_request(req)
-                    seen.add(rid)
-            else:
-                q.add_request(req)
-                seen.add(rid)
-        for req in after:
-            if req.request_id not in seen and req.request_id not in running_ids:
-                q.add_request(req)
-        return q
 
 
 class TauScheduler(Scheduler):
     """Wave-aware scheduler: one DispatchSlot per schedule() call.
 
-    Holdback makes only the current micro-batch visible, then reuses
-    Scheduler.schedule() for KV allocation and request lifecycle.
-    commit_slot runs only when the parent scheduled the full allowed set.
-    on_prefill_complete is recorded in update_from_output, not schedule().
+    plan_wave reserves KV for prompt plus max generate length. This
+    class allocates that exact micro-batch and builds SchedulerOutput
+    itself; it does not call Scheduler.schedule(). If allocate_slots
+    fails for one request, that request is finished with ERROR and the
+    next request in the slot is tried.
 
+    on_prefill_complete is recorded in update_from_output, not schedule().
     New arrivals stay in waiting until the active wave has no unfinished
-    admitted requests. The next plan_wave uses a fresh waiting snapshot.
+    admitted requests.
+
+    ``__init__`` disables chunked prefill, prefix caching, long-prefill
+    caps, speculative decode, and async scheduling so a Prefill slot is
+    not split across forwards.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        vllm_config = kwargs.get("vllm_config")
+        if vllm_config is None and args:
+            vllm_config = args[0]
+        if vllm_config is None:
+            raise TypeError("TauScheduler requires vllm_config")
+        _enforce_wave_runtime_contract(vllm_config)
         super().__init__(*args, **kwargs)
         self.planner = TauBatchPlanner()
         self.dispatcher = WaveDispatcher(WaveDispatchPolicy.OVERLAP)
         self.max_microbatches: int | None = None
         self.max_reqs_per_microbatch: int | None = None
+        self.min_waiting_to_plan = self.scheduler_config.tau_batch_min_waiting
         self._wave: WavePlan | None = None
         self._slot_by_output: dict[int, DispatchSlot] = {}
+        if self.min_waiting_to_plan > 0:
+            logger.warning(
+                "TauScheduler: plan_wave waits for %d waiting requests "
+                "(--tau-batch-min-waiting). Set 0 to plan immediately.",
+                self.min_waiting_to_plan,
+            )
 
     def schedule(self) -> SchedulerOutput:
         for _ in range(2):
@@ -158,7 +145,7 @@ class TauScheduler(Scheduler):
             slot, allowed = self._next_slot()
             if slot is None:
                 if not self._admitted_unfinished():
-                    self._wave = None
+                    self._clear_wave()
                     continue
                 return SchedulerOutput.make_empty()
             return self._schedule_slot(slot, allowed)
@@ -174,15 +161,25 @@ class TauScheduler(Scheduler):
         if slot is not None and slot.phase is DispatchPhase.PREFILL:
             self.dispatcher.on_prefill_complete(slot.microbatch_index)
         if self._wave is not None and not self._admitted_unfinished():
-            self._wave = None
+            self._clear_wave()
         return result
+
+    def _clear_wave(self) -> None:
+        self._wave = None
+        self.dispatcher.reset()
 
     def _maybe_start_wave(self) -> None:
         if self._wave is not None and self._admitted_unfinished():
             return
-        self._wave = None
+        self._clear_wave()
+        self._drop_unfittable_waiting()
         snapshots = self._waiting_snapshot()
         if not snapshots:
+            return
+        if (
+            self.min_waiting_to_plan > 0
+            and len(snapshots) < self.min_waiting_to_plan
+        ):
             return
         plan = self.planner.plan_wave(snapshots, self._pack_context())
         if plan is None:
@@ -208,17 +205,189 @@ class TauScheduler(Scheduler):
     def _schedule_slot(
         self, slot: DispatchSlot, allowed: set[str]
     ) -> SchedulerOutput:
-        hold = _Holdback(self, allowed)
-        hold.apply()
-        try:
-            out = super().schedule()
-        finally:
-            hold.restore()
-        scheduled = set(out.num_scheduled_tokens)
-        if scheduled == allowed and out.total_num_scheduled_tokens > 0:
-            self.dispatcher.commit_slot(slot)
-            self._slot_by_output[id(out)] = slot
+        assert self._wave is not None
+        reqs = [
+            self.requests[rid]
+            for rid in self._wave.microbatches[slot.microbatch_index].req_ids
+            if rid in allowed
+        ]
+        scheduled_new: list[Request] = []
+        scheduled_running: list[Request] = []
+        scheduled_resumed: list[Request] = []
+        req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+        num_scheduled_tokens: dict[str, int] = {}
+
+        for req in reqs:
+            num_new = self._num_new_tokens(req)
+            if num_new <= 0:
+                continue
+            if (
+                req.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                and len(self.running) >= self.max_num_running_reqs
+            ):
+                self._drop_request(req, "max_num_seqs is full")
+                continue
+
+            kind = "running"
+            if req.status == RequestStatus.WAITING:
+                kind = "new"
+            elif req.status == RequestStatus.PREEMPTED:
+                kind = "resumed"
+
+            new_blocks = self._allocate_request(req, num_new)
+            if new_blocks is None:
+                self._drop_request(req, "KV allocate_slots failed")
+                continue
+
+            self._accept_allocated(req)
+            req_to_new_blocks[req.request_id] = self.kv_cache_manager.get_blocks(
+                req.request_id
+            )
+            num_scheduled_tokens[req.request_id] = num_new
+            if kind == "new":
+                scheduled_new.append(req)
+            elif kind == "resumed":
+                scheduled_resumed.append(req)
+            else:
+                scheduled_running.append(req)
+
+        if not num_scheduled_tokens:
+            return SchedulerOutput.make_empty()
+
+        out = self._emit_output(
+            scheduled_new,
+            scheduled_running,
+            scheduled_resumed,
+            req_to_new_blocks,
+            num_scheduled_tokens,
+        )
+        self.dispatcher.commit_slot(slot)
+        self._slot_by_output[id(out)] = slot
         return out
+
+    def _num_new_tokens(self, request: Request) -> int:
+        return (
+            request.num_tokens
+            + request.num_output_placeholders
+            - request.num_computed_tokens
+        )
+
+    def _allocate_request(
+        self, request: Request, num_new_tokens: int
+    ) -> KVCacheBlocks | None:
+        if request.has_encoder_inputs or self.connector is not None:
+            return None
+        if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+            computed_blocks, num_local = self.kv_cache_manager.get_computed_blocks(
+                request
+            )
+            return self.kv_cache_manager.allocate_slots(
+                request,
+                num_new_tokens,
+                num_local,
+                computed_blocks,
+                num_lookahead_tokens=0,
+            )
+        return self.kv_cache_manager.allocate_slots(
+            request,
+            num_new_tokens,
+            num_lookahead_tokens=self.num_lookahead_tokens,
+        )
+
+    def _accept_allocated(self, request: Request) -> None:
+        if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+            if request.status == RequestStatus.WAITING:
+                request.num_computed_tokens = 0
+            if request.num_cached_tokens < 0:
+                request.num_cached_tokens = request.num_computed_tokens
+            self.waiting.remove_request(request)
+            self.running.append(request)
+            request.status = RequestStatus.RUNNING
+            if self.log_stats:
+                request.record_event(EngineCoreEventType.SCHEDULED, time.monotonic())
+
+    def _drop_request(self, request: Request, reason: str) -> None:
+        logger.error(
+            "TauScheduler dropping request %s: %s",
+            request.request_id,
+            reason,
+        )
+        self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
+
+    def _drop_unfittable_waiting(self) -> None:
+        free = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        drop_ids: list[str] = []
+        for req in list(self.waiting):
+            need = estimate_kv_blocks(
+                req.num_prompt_tokens, req.max_tokens, self.block_size
+            )
+            if need > free:
+                logger.error(
+                    "TauScheduler dropping %s: reserved %d KV blocks "
+                    "exceeds free %d",
+                    req.request_id,
+                    need,
+                    free,
+                )
+                drop_ids.append(req.request_id)
+        if drop_ids:
+            self.finish_requests(drop_ids, RequestStatus.FINISHED_ERROR)
+
+    def _emit_output(
+        self,
+        scheduled_new: list[Request],
+        scheduled_running: list[Request],
+        scheduled_resumed: list[Request],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+        num_scheduled_tokens: dict[str, int],
+    ) -> SchedulerOutput:
+        if self.use_v2_model_runner:
+            scheduled_new = scheduled_new + scheduled_resumed
+            scheduled_resumed = []
+            new_reqs_data = [
+                NewRequestData.from_request(
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    req._all_token_ids,
+                )
+                for req in scheduled_new
+            ]
+        else:
+            new_reqs_data = [
+                NewRequestData.from_request(
+                    req, req_to_new_blocks[req.request_id].get_block_ids()
+                )
+                for req in scheduled_new
+            ]
+        cached_reqs_data = self._make_cached_request_data(
+            scheduled_running,
+            scheduled_resumed,
+            num_scheduled_tokens,
+            {},
+            req_to_new_blocks,
+        )
+        self.prev_step_scheduled_req_ids.clear()
+        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+        num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
+        if self.running:
+            num_common_prefix_blocks = (
+                self.kv_cache_manager.get_num_common_prefix_blocks(
+                    self.running[0].request_id
+                )
+            )
+        scheduler_output = SchedulerOutput(
+            scheduled_new_reqs=new_reqs_data,
+            scheduled_cached_reqs=cached_reqs_data,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=num_common_prefix_blocks,
+            finished_req_ids=self.finished_req_ids,
+            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+        )
+        self._update_after_schedule(scheduler_output)
+        return scheduler_output
 
     def _waiting_snapshot(self) -> list[TauRequestSnapshot]:
         return [snapshot_from_request(req) for req in self.waiting]
@@ -235,6 +404,8 @@ class TauScheduler(Scheduler):
             max_microbatches=p,
             max_reqs_per_microbatch=batch,
             pp_size=pp,
+            kv_free_blocks=self.kv_cache_manager.block_pool.get_num_free_blocks(),
+            block_size=self.block_size,
         )
 
     def _alive_ids(self, slot: DispatchSlot) -> set[str]:

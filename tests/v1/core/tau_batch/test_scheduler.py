@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -16,8 +17,6 @@ from vllm.config import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
-from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.sched.tau_batch.dispatch import (
     DispatchPhase,
     WaveDispatcher,
@@ -44,6 +43,12 @@ def _tau_scheduler(
     max_microbatches: int = 2,
     max_reqs_per_microbatch: int = 2,
     pipeline_parallel_size: int = 2,
+    enable_chunked_prefill: bool = False,
+    enable_prefix_caching: bool = False,
+    async_scheduling: bool = False,
+    long_prefill_token_threshold: int = 0,
+    speculative_config: object | None = None,
+    tau_batch_min_waiting: int = 0,
 ) -> TauScheduler:
     model_config = ModelConfig(
         model="facebook/opt-125m",
@@ -56,17 +61,18 @@ def _tau_scheduler(
         max_num_seqs=16,
         max_num_batched_tokens=8192,
         max_model_len=8192,
-        long_prefill_token_threshold=0,
-        enable_chunked_prefill=False,
-        async_scheduling=False,
+        long_prefill_token_threshold=long_prefill_token_threshold,
+        enable_chunked_prefill=enable_chunked_prefill,
+        async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
+        tau_batch_min_waiting=tau_batch_min_waiting,
     )
     cache_config = CacheConfig(
         block_size=16,
         gpu_memory_utilization=0.9,
         swap_space=0,
         cache_dtype="auto",
-        enable_prefix_caching=False,
+        enable_prefix_caching=enable_prefix_caching,
     )
     vllm_config = VllmConfig(
         scheduler_config=scheduler_config,
@@ -76,6 +82,8 @@ def _tau_scheduler(
             pipeline_parallel_size=pipeline_parallel_size
         ),
     )
+    if speculative_config is not None:
+        vllm_config.speculative_config = speculative_config
     kv_cache_config = KVCacheConfig(
         num_blocks=10000,
         kv_cache_tensors=[],
@@ -243,18 +251,102 @@ def test_new_arrival_does_not_join_active_wave():
     assert set(nxt.num_scheduled_tokens) == {"late"}
 
 
-def test_failed_schedule_does_not_commit():
+def test_allocate_fail_drops_request_and_continues():
     sched = _tau_scheduler()
-    _add_wave(sched)
-    empty_out = SchedulerOutput.make_empty()
-    with patch.object(Scheduler, "schedule", return_value=empty_out):
+    _add_wave(sched, n=2)
+    real = sched.kv_cache_manager.allocate_slots
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return real(*args, **kwargs)
+
+    with patch.object(sched.kv_cache_manager, "allocate_slots", side_effect=flaky):
+        out = sched.schedule()
+    assert "r0" not in out.num_scheduled_tokens
+    assert set(out.num_scheduled_tokens) == {"r1"}
+    assert "r0" not in sched.requests
+    assert {r.request_id for r in sched.running} == {"r1"}
+
+
+def test_allocate_fail_all_returns_empty():
+    sched = _tau_scheduler()
+    _add_wave(sched, n=2)
+    with patch.object(sched.kv_cache_manager, "allocate_slots", return_value=None):
         empty = sched.schedule()
     assert empty.total_num_scheduled_tokens == 0
     assert len(sched.running) == 0
-    assert len(sched.waiting) == 4
-    slot = sched.dispatcher.peek_slot()
-    assert slot is not None
-    assert slot.microbatch_index == 0
-    assert slot.phase is DispatchPhase.PREFILL
+    assert "r0" not in sched.requests
+    assert "r1" not in sched.requests
+
+
+def test_init_disables_features_that_split_prefill():
+    spec = SimpleNamespace(num_speculative_tokens=4, use_eagle=lambda: False)
+    sched = _tau_scheduler(
+        enable_chunked_prefill=True,
+        enable_prefix_caching=True,
+        long_prefill_token_threshold=4,
+        speculative_config=spec,
+    )
+    assert sched.scheduler_config.enable_chunked_prefill is False
+    assert sched.scheduler_config.long_prefill_token_threshold == 0
+    assert sched.cache_config.enable_prefix_caching is False
+    assert sched.kv_cache_manager.enable_caching is False
+    assert sched.vllm_config.speculative_config is None
+    assert sched.num_spec_tokens == 0
+
+
+def test_init_disables_async_scheduling():
+    # VllmConfig rejects async scheduling when PP > 1.
+    sched = _tau_scheduler(
+        pipeline_parallel_size=1,
+        async_scheduling=True,
+    )
+    assert sched.scheduler_config.async_scheduling is False
+
+
+def test_disabled_long_prefill_does_not_cap_tokens():
+    sched = _tau_scheduler(
+        enable_chunked_prefill=True,
+        long_prefill_token_threshold=4,
+    )
+    _add_wave(sched, n=2)
     out = sched.schedule()
     assert set(out.num_scheduled_tokens) == {"r0", "r1"}
+    assert all(n == 8 for n in out.num_scheduled_tokens.values())
+    assert out.total_num_scheduled_tokens == 16
+
+
+def test_wave_end_resets_dispatcher():
+    sched = _tau_scheduler()
+    _add_wave(sched, n=2)
+    out = sched.schedule()
+    assert sched._wave is not None
+    for rid in out.num_scheduled_tokens:
+        sched.finish_requests(rid, RequestStatus.FINISHED_ABORTED)
+    empty = sched.schedule()
+    assert empty.total_num_scheduled_tokens == 0
+    assert sched._wave is None
+    assert sched.dispatcher.plan is None
+    assert sched.dispatcher.peek_slot() is None
+
+
+def test_min_waiting_to_plan_holds_until_threshold():
+    sched = _tau_scheduler(tau_batch_min_waiting=8)
+    _add_wave(sched, n=4)
+    empty = sched.schedule()
+    assert empty.total_num_scheduled_tokens == 0
+    assert sched._wave is None
+    assert len(sched.waiting) == 4
+    extra = [
+        _req(f"r{i}", tpot_slo_ms=10.0 * (i + 1), arrival_time=float(i))
+        for i in range(4, 8)
+    ]
+    for req in extra:
+        sched.add_request(req)
+    out = sched.schedule()
+    assert out.total_num_scheduled_tokens > 0
+    assert sched._wave is not None
+    assert len(sched._wave.admitted_ids) + len(sched._wave.deferred_ids) == 8

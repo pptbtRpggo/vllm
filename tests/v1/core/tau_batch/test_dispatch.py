@@ -129,3 +129,12 @@ def test_on_prefill_complete_before_start_is_ignored():
     disp.start(_plan())
     _commit_prefills(disp, 3)
     assert disp.peek_slot() is None
+
+
+def test_reset_clears_plan_and_peek():
+    disp = WaveDispatcher()
+    disp.start(_plan())
+    _commit_prefills(disp, 1)
+    disp.reset()
+    assert disp.plan is None
+    assert disp.peek_slot() is None

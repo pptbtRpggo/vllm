@@ -17,6 +17,7 @@ from vllm.v1.core.sched.tau_batch.types import (
     PackContext,
     TauRequestSnapshot,
     WavePlan,
+    estimate_kv_blocks,
 )
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "PackContext",
     "TauBatchPlanner",
     "TauRequestSnapshot",
+    "estimate_kv_blocks",
     "TauScheduler",
     "WaveDispatcher",
     "WaveDispatchPolicy",

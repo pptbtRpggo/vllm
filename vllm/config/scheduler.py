@@ -143,6 +143,10 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
+    tau_batch_min_waiting: int = Field(default=0, ge=0)
+    """TauScheduler only. Wait until this many requests are in waiting
+    before plan_wave. 0 plans as soon as waiting is non-empty."""
+
     @staticmethod
     def default_factory(**kwargs):
         """
