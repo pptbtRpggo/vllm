@@ -220,6 +220,39 @@ def test_overlap_decode_after_own_prefill_complete():
     _ = pre1
 
 
+def _assert_running_sends_block_delta(sched: TauScheduler, out, req_id: str) -> None:
+    cached = out.scheduled_cached_reqs
+    assert req_id in cached.req_ids
+    new_ids = cached.new_block_ids[cached.req_ids.index(req_id)]
+    full = list(sched.kv_cache_manager.get_block_ids(req_id)[0])
+    new_list = [] if new_ids is None else list(new_ids[0])
+    # Worker appends these ids, then re-adds the row when B0/B1 alternate.
+    # Resending the full table grows it until add_row overflows (33 into 32).
+    assert len(new_list) <= 1
+    if len(full) > 1:
+        assert new_list != full
+    if new_list:
+        assert full[-len(new_list) :] == new_list
+
+
+def test_cached_decode_sends_only_new_kv_blocks():
+    sched = _tau_scheduler()
+    _add_wave(sched, max_tokens=32)
+    pre0 = sched.schedule()
+    pre1 = sched.schedule()
+    sched.update_from_output(pre0, _sampled(pre0))
+    dec0 = sched.schedule()
+    assert set(dec0.num_scheduled_tokens) == {"r0", "r1"}
+    _assert_running_sends_block_delta(sched, dec0, "r0")
+    sched.update_from_output(pre1, _sampled(pre1))
+    sched.update_from_output(dec0, _sampled(dec0))
+    dec1 = sched.schedule()
+    sched.update_from_output(dec1, _sampled(dec1))
+    dec0_again = sched.schedule()
+    assert "r0" in dec0_again.num_scheduled_tokens
+    _assert_running_sends_block_delta(sched, dec0_again, "r0")
+
+
 def test_drain_waits_for_all_prefill_completes():
     sched = _tau_scheduler()
     sched.dispatcher = WaveDispatcher(WaveDispatchPolicy.DRAIN)

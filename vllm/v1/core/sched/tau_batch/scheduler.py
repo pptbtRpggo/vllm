@@ -287,9 +287,15 @@ class TauScheduler(Scheduler):
                 continue
 
             self._accept_allocated(req)
-            req_to_new_blocks[req.request_id] = self.kv_cache_manager.get_blocks(
-                req.request_id
-            )
+            # New/resumed: replace the worker table (all ids). Running: append
+            # only this step's new slots. Alternating B0/B1 re-adds the row;
+            # resending the full table grows it until add_row overflows.
+            if kind == "running":
+                req_to_new_blocks[req.request_id] = new_blocks
+            else:
+                req_to_new_blocks[req.request_id] = (
+                    self.kv_cache_manager.get_blocks(req.request_id)
+                )
             num_scheduled_tokens[req.request_id] = num_new
             if kind == "new":
                 scheduled_new.append(req)
@@ -326,10 +332,13 @@ class TauScheduler(Scheduler):
         return out
 
     def _num_new_tokens(self, request: Request) -> int:
-        return (
+        num_new = (
             request.num_tokens
             + request.num_output_placeholders
             - request.num_computed_tokens
+        )
+        return min(
+            num_new, self.max_model_len - 1 - request.num_computed_tokens
         )
 
     def _allocate_request(
