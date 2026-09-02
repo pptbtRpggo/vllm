@@ -3,10 +3,10 @@
 
 """Host-side JSONL trace for τ-Batch PP occupancy.
 
-Each emit→done pair is one micro-batch traversing the whole pipeline.
-The driver Future completes when the last PP stage finishes, so this
-file cannot split per-stage widths. Overlapping emit/done bars are the
-real in-flight occupancy on the machine.
+Driver events (emit/done) span the whole pipeline Future. Worker
+``stage`` events add per-PP-rank execute_model wall times. Plotting
+places stage k after stage k-1 ends (recv unblocks on the previous
+send). Cross-process alignment uses ``time.time_ns()``, not monotonic.
 
 Enable with ``--tau-batch-trace PATH`` or env ``TAU_BATCH_TRACE``.
 """
@@ -26,7 +26,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ENV_TRACE_PATH = "TAU_BATCH_TRACE"
 
 
@@ -50,14 +50,15 @@ def resolve_trace_path(config_path: str | None) -> str | None:
 class JsonlTracer:
     """Append-only JSONL writer. One event per line, flushed immediately."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *, write_meta: bool = True) -> None:
         self.path = path
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._fp: TextIO = open(path, "a", encoding="utf-8")
         self._lock = threading.Lock()
         self._fwd_id = 0
-        logger.warning("TauScheduler JSONL trace: %s", path)
-        self.record("meta", schema=SCHEMA_VERSION)
+        if write_meta:
+            logger.warning("TauScheduler JSONL trace: %s", path)
+            self.record("meta", schema=SCHEMA_VERSION)
 
     def close(self) -> None:
         with self._lock:
@@ -77,13 +78,27 @@ class JsonlTracer:
             "event": event,
         }
         rec.update(fields)
-        line = json.dumps(rec, ensure_ascii=False, default=str)
+        line = json.dumps(rec, ensure_ascii=False, default=str) + "\n"
         with self._lock:
             if self._fp.closed:
                 return
-            self._fp.write(line)
-            self._fp.write("\n")
-            self._fp.flush()
+            flock = None
+            try:
+                import fcntl
+
+                fcntl.flock(self._fp.fileno(), fcntl.LOCK_EX)
+                flock = fcntl
+            except OSError:
+                pass
+            try:
+                self._fp.write(line)
+                self._fp.flush()
+            finally:
+                if flock is not None:
+                    try:
+                        flock.flock(self._fp.fileno(), flock.LOCK_UN)
+                    except OSError:
+                        pass
 
 
 def load_events(path: str | Path) -> list[dict[str, Any]]:
@@ -182,3 +197,131 @@ def _opt_int(value: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+_worker_tracer: JsonlTracer | None = None
+_worker_tracer_ready = False
+
+
+def _sync_compute_device() -> None:
+    """Wait for queued GPU/NPU kernels so stage end is compute, not dispatch."""
+    try:
+        import torch
+    except ImportError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    npu = getattr(torch, "npu", None)
+    if npu is not None and callable(getattr(npu, "is_available", None)):
+        try:
+            if npu.is_available():
+                npu.synchronize()
+        except Exception:
+            return
+
+
+def record_worker_stage(
+    vllm_config: Any,
+    *,
+    fwd_id: int,
+    start_ts_ns: int,
+    req_ids: list[str],
+) -> None:
+    """Append one per-rank stage event. Safe to call from PP workers."""
+    global _worker_tracer, _worker_tracer_ready
+    if not _worker_tracer_ready:
+        _worker_tracer_ready = True
+        cfg_path = ""
+        if vllm_config is not None:
+            cfg_path = getattr(
+                getattr(vllm_config, "scheduler_config", None),
+                "tau_batch_trace",
+                "",
+            ) or ""
+        path = resolve_trace_path(cfg_path)
+        if path:
+            try:
+                _worker_tracer = JsonlTracer(path, write_meta=False)
+            except OSError:
+                logger.exception("PP worker failed to open JSONL trace")
+                _worker_tracer = None
+    if _worker_tracer is None:
+        return
+    _sync_compute_device()
+    end_ts_ns = time.time_ns()
+    pp_rank = -1
+    try:
+        from vllm.distributed.parallel_state import get_pp_group
+
+        pp_rank = int(get_pp_group().rank_in_group)
+    except Exception:
+        pp_rank = -1
+    _worker_tracer.record(
+        "stage",
+        fwd_id=fwd_id,
+        pp_rank=pp_rank,
+        start_ts_ns=start_ts_ns,
+        end_ts_ns=end_ts_ns,
+        req_ids=req_ids,
+    )
+
+
+@dataclass(frozen=True)
+class StageCell:
+    """One micro-batch on one PP stage, placed for a pipeline Gantt."""
+
+    fwd_id: int
+    pp_rank: int
+    job: str
+    phase: str
+    start_ts_ns: int
+    end_ts_ns: int
+
+    @property
+    def duration_ms(self) -> float:
+        return (self.end_ts_ns - self.start_ts_ns) / 1e6
+
+
+def pipeline_cells(events: Iterable[Mapping[str, Any]]) -> list[StageCell]:
+    """Build per-stage bars from ``stage`` events.
+
+    Rank 0 uses its execute_model window. Rank k starts when rank k-1
+    ended (recv unblocks after the previous send).
+    """
+    forwards = {span.fwd_id: span for span in pair_forwards(events)}
+    by_fwd: dict[int, dict[int, Mapping[str, Any]]] = {}
+    for ev in events:
+        if ev.get("event") != "stage":
+            continue
+        fwd_id = ev.get("fwd_id")
+        rank = ev.get("pp_rank")
+        if fwd_id is None or rank is None:
+            continue
+        by_fwd.setdefault(int(fwd_id), {})[int(rank)] = ev
+    cells: list[StageCell] = []
+    for fwd_id, ranks in by_fwd.items():
+        span = forwards.get(fwd_id)
+        job = span.job if span is not None else f"fwd{fwd_id}"
+        phase = span.phase if span is not None else ""
+        prev_end: int | None = None
+        for rank in sorted(ranks):
+            ev = ranks[rank]
+            raw_start = int(ev.get("start_ts_ns") or ev["ts_ns"])
+            raw_end = int(ev.get("end_ts_ns") or ev["ts_ns"])
+            start = raw_start if prev_end is None else prev_end
+            end = raw_end
+            if end < start:
+                start = raw_start
+            cells.append(
+                StageCell(
+                    fwd_id=fwd_id,
+                    pp_rank=rank,
+                    job=job,
+                    phase=phase,
+                    start_ts_ns=start,
+                    end_ts_ns=end,
+                )
+            )
+            prev_end = end
+    cells.sort(key=lambda c: (c.start_ts_ns, c.pp_rank, c.fwd_id))
+    return cells

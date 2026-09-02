@@ -12,8 +12,12 @@ from tests.v1.core.tau_batch.test_scheduler import (
     _sampled,
     _tau_scheduler,
 )
-from vllm.v1.core.sched.tau_batch.plot_trace import spans_to_html
-from vllm.v1.core.sched.tau_batch.trace import load_events, pair_forwards
+from vllm.v1.core.sched.tau_batch.plot_trace import pipeline_to_html, spans_to_html
+from vllm.v1.core.sched.tau_batch.trace import (
+    load_events,
+    pair_forwards,
+    pipeline_cells,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -28,6 +32,8 @@ def test_trace_writes_wave_emit_done(tmp_path: Path) -> None:
     _add_wave(sched)
     pre0 = sched.schedule()
     pre1 = sched.schedule()
+    assert pre0.tau_fwd_id == 1
+    assert pre1.tau_fwd_id == 2
     sched.update_from_output(pre0, _sampled(pre0))
     sched.update_from_output(pre1, _sampled(pre1))
     events = _events(path)
@@ -68,3 +74,53 @@ def test_trace_queue_events_from_batch_queue(tmp_path: Path) -> None:
     assert spans
     html = spans_to_html(spans)
     assert "B0_pre" in html
+
+
+def test_pipeline_cells_place_rank1_after_rank0() -> None:
+    events = [
+        {
+            "event": "emit",
+            "fwd_id": 1,
+            "wave_id": 0,
+            "batch_idx": 0,
+            "phase": "prefill",
+            "req_ids": ["r0"],
+            "mono_ns": 0,
+            "ts_ns": 1000,
+        },
+        {
+            "event": "done",
+            "fwd_id": 1,
+            "wave_id": 0,
+            "batch_idx": 0,
+            "phase": "prefill",
+            "req_ids": ["r0"],
+            "mono_ns": 50,
+            "ts_ns": 1050,
+        },
+        {
+            "event": "stage",
+            "fwd_id": 1,
+            "pp_rank": 0,
+            "start_ts_ns": 10,
+            "end_ts_ns": 30,
+            "ts_ns": 30,
+        },
+        {
+            "event": "stage",
+            "fwd_id": 1,
+            "pp_rank": 1,
+            "start_ts_ns": 11,
+            "end_ts_ns": 45,
+            "ts_ns": 45,
+        },
+    ]
+    cells = pipeline_cells(events)
+    assert [(c.pp_rank, c.start_ts_ns, c.end_ts_ns) for c in cells] == [
+        (0, 10, 30),
+        (1, 30, 45),
+    ]
+    assert cells[0].job.endswith("B0_pre")
+    html = pipeline_to_html(cells)
+    assert "PP0" in html
+    assert "PP1" in html

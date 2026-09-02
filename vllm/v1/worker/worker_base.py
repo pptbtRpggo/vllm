@@ -366,7 +366,23 @@ class WorkerWrapperBase:
         self._apply_mm_cache(scheduler_output)
 
         assert self.worker is not None
-        return self.worker.execute_model(scheduler_output, *args, **kwargs)
+        fwd_id = getattr(scheduler_output, "tau_fwd_id", None)
+        if fwd_id is None:
+            return self.worker.execute_model(scheduler_output, *args, **kwargs)
+        import time
+
+        start_ts_ns = time.time_ns()
+        try:
+            return self.worker.execute_model(scheduler_output, *args, **kwargs)
+        finally:
+            from vllm.v1.core.sched.tau_batch.trace import record_worker_stage
+
+            record_worker_stage(
+                self.vllm_config,
+                fwd_id=int(fwd_id),
+                start_ts_ns=start_ts_ns,
+                req_ids=list(scheduler_output.num_scheduled_tokens),
+            )
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache

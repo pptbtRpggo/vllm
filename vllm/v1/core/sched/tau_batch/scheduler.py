@@ -309,7 +309,10 @@ class TauScheduler(Scheduler):
             num_scheduled_tokens,
         )
         self.dispatcher.commit_slot(slot)
-        fwd_id = self._tracer.next_fwd_id() if self._tracer is not None else 0
+        fwd_id = 0
+        if self._tracer is not None:
+            fwd_id = self._tracer.next_fwd_id()
+            out.tau_fwd_id = fwd_id
         self._inflight[id(out)] = (slot, fwd_id)
         self._trace(
             "emit",

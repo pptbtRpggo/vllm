@@ -14,7 +14,11 @@ import argparse
 import html
 from pathlib import Path
 
-from vllm.v1.core.sched.tau_batch.trace import load_events, pair_forwards
+from vllm.v1.core.sched.tau_batch.trace import (
+    load_events,
+    pair_forwards,
+    pipeline_cells,
+)
 
 
 def spans_to_html(spans, *, title: str = "τ-Batch PP occupancy") -> str:
@@ -70,7 +74,8 @@ def spans_to_html(spans, *, title: str = "τ-Batch PP occupancy") -> str:
         "<code>schedule()</code> emit until the PP Future completes. "
         "This is real wall time on the machine, not mock FLOPs. "
         "Bars overlap when the pipeline is filled. "
-        "Per-stage widths are not in this trace."
+        "If the JSONL has <code>stage</code> events, use the pipeline plot "
+        "(default when those events exist)."
         "</p>"
     )
     body = "\n".join(bars)
@@ -85,9 +90,79 @@ def spans_to_html(spans, *, title: str = "τ-Batch PP occupancy") -> str:
     )
 
 
+def pipeline_to_html(cells, *, title: str = "τ-Batch PP pipeline") -> str:
+    """Build a PP Gantt: one row per stage, bars along wall-clock time."""
+    if not cells:
+        return (
+            "<!DOCTYPE html><html><body><p>No stage events in trace. "
+            "Re-run with the worker stage tracer, then plot again."
+            "</p></body></html>"
+        )
+    t0 = min(c.start_ts_ns for c in cells)
+    t1 = max(c.end_ts_ns for c in cells)
+    span_ns = max(t1 - t0, 1)
+    n_stages = max(c.pp_rank for c in cells) + 1
+    row_h = 52
+    top = 44
+    left = 72
+    width = 1100
+    height = top + row_h * n_stages + 36
+    bars: list[str] = []
+    for rank in range(n_stages):
+        y = top + rank * row_h
+        bars.append(
+            f'<text x="8" y="{y + 22:.1f}" font-size="13" '
+            f'font-family="ui-monospace,monospace">PP{rank}</text>'
+        )
+        for c in cells:
+            if c.pp_rank != rank:
+                continue
+            x = left + (c.start_ts_ns - t0) / span_ns * width
+            w = max((c.end_ts_ns - c.start_ts_ns) / span_ns * width, 2.0)
+            color = "#3b82f6" if c.phase == "prefill" else "#f59e0b"
+            label = html.escape(c.job)
+            dur = f"{c.duration_ms:.2f} ms"
+            bars.append(
+                f'<rect x="{x:.1f}" y="{y + 6:.1f}" width="{w:.1f}" '
+                f'height="{row_h - 14}" fill="{color}" opacity="0.9" rx="2">'
+                f"<title>{label} PP{rank} {dur}</title></rect>"
+            )
+    axis = (
+        f'<line x1="{left}" y1="{top - 8}" x2="{left + width}" '
+        f'y2="{top - 8}" stroke="#999"/>'
+        f'<text x="{left}" y="18" font-size="12" fill="#666">0 ms</text>'
+        f'<text x="{left + width - 80}" y="18" font-size="12" fill="#666">'
+        f"{span_ns / 1e6:.1f} ms</text>"
+    )
+    legend = (
+        '<rect x="72" y="8" width="12" height="12" fill="#3b82f6"/>'
+        '<text x="88" y="18" font-size="12">prefill</text>'
+        '<rect x="160" y="8" width="12" height="12" fill="#f59e0b"/>'
+        '<text x="176" y="18" font-size="12">decode</text>'
+    )
+    note = (
+        "<p style='font:13px/1.4 system-ui;max-width:72rem'>"
+        "Each row is one PP rank. A bar is that rank's "
+        "<code>execute_model</code> (rank 0) or the interval after the "
+        "previous rank finished (recv unblocks, then this rank computes). "
+        "Wall clock is <code>time.time_ns()</code> across worker processes."
+        "</p>"
+    )
+    body = "\n".join(bars)
+    return (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<title>{html.escape(title)}</title></head><body>"
+        f"<h1 style='font:18px system-ui'>{html.escape(title)}</h1>"
+        f"{note}"
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{left + width + 40}" '
+        f'height="{height}" style="background:#fff">'
+        f"{legend}{axis}{body}</svg></body></html>"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Plot τ-Batch JSONL occupancy Gantt to HTML."
+        description="Plot τ-Batch JSONL Gantt to HTML."
     )
     parser.add_argument("trace", type=Path, help="JSONL from --tau-batch-trace")
     parser.add_argument(
@@ -99,10 +174,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     events = load_events(args.trace)
+    cells = pipeline_cells(events)
     spans = pair_forwards(events)
     out = args.output or args.trace.with_suffix(".html")
-    out.write_text(spans_to_html(spans, title=str(args.trace)), encoding="utf-8")
-    print(f"wrote {out} ({len(spans)} forwards, {len(events)} events)")
+    if cells:
+        out.write_text(
+            pipeline_to_html(cells, title=str(args.trace)), encoding="utf-8"
+        )
+        print(
+            f"wrote {out} ({len(cells)} stage cells, "
+            f"{len(spans)} forwards, {len(events)} events)"
+        )
+    else:
+        out.write_text(
+            spans_to_html(spans, title=str(args.trace)), encoding="utf-8"
+        )
+        print(f"wrote {out} occupancy only ({len(spans)} forwards; no stage events)")
     return 0
 
 

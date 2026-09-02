@@ -207,6 +207,10 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
+    # τ-Batch JSONL: correlator for per-PP-rank stage timestamps.
+    # None means workers skip stage tracing.
+    tau_fwd_id: int | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
