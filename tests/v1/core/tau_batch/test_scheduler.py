@@ -49,6 +49,7 @@ def _tau_scheduler(
     long_prefill_token_threshold: int = 0,
     speculative_config: object | None = None,
     tau_batch_min_waiting: int = 0,
+    tau_batch_trace: str = "",
 ) -> TauScheduler:
     model_config = ModelConfig(
         model="facebook/opt-125m",
@@ -66,6 +67,7 @@ def _tau_scheduler(
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
         tau_batch_min_waiting=tau_batch_min_waiting,
+        tau_batch_trace=tau_batch_trace,
     )
     cache_config = CacheConfig(
         block_size=16,

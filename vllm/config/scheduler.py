@@ -147,6 +147,10 @@ class SchedulerConfig:
     """TauScheduler only. Wait until this many requests are in waiting
     before plan_wave. 0 plans as soon as waiting is non-empty."""
 
+    tau_batch_trace: str = Field(default="")
+    """TauScheduler only. JSONL path for host PP occupancy traces.
+    Empty disables tracing. Env TAU_BATCH_TRACE is used if this is empty."""
+
     @staticmethod
     def default_factory(**kwargs):
         """

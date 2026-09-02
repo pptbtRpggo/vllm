@@ -434,6 +434,11 @@ class EngineCore:
                 if not deferred_scheduler_output:
                     # Add this step's future to the queue.
                     batch_queue.appendleft((future, scheduler_output))
+                    _tau_trace_queue = getattr(self.scheduler, "trace_queue", None)
+                    if _tau_trace_queue is not None:
+                        _tau_trace_queue(
+                            "enqueue", scheduler_output, len(batch_queue)
+                        )
                     if (
                         model_executed
                         and len(batch_queue) < self.batch_queue_size
@@ -451,6 +456,9 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output = batch_queue.pop()
+        _tau_trace_queue = getattr(self.scheduler, "trace_queue", None)
+        if _tau_trace_queue is not None:
+            _tau_trace_queue("dequeue", scheduler_output, len(batch_queue))
         with self.log_error_detail(scheduler_output):
             model_output = future.result()
 
@@ -472,6 +480,11 @@ class EngineCore:
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output))
+            _tau_trace_queue = getattr(self.scheduler, "trace_queue", None)
+            if _tau_trace_queue is not None:
+                _tau_trace_queue(
+                    "enqueue", deferred_scheduler_output, len(batch_queue)
+                )
 
         return engine_core_outputs, model_executed
 

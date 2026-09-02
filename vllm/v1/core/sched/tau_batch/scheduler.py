@@ -16,6 +16,7 @@ from vllm.v1.core.sched.tau_batch.dispatch import (
     WaveDispatchPolicy,
 )
 from vllm.v1.core.sched.tau_batch.planner import TauBatchPlanner
+from vllm.v1.core.sched.tau_batch.trace import JsonlTracer, resolve_trace_path
 from vllm.v1.core.sched.tau_batch.types import (
     PackContext,
     TauRequestSnapshot,
@@ -129,13 +130,35 @@ class TauScheduler(Scheduler):
         self.max_reqs_per_microbatch: int | None = None
         self.min_waiting_to_plan = self.scheduler_config.tau_batch_min_waiting
         self._wave: WavePlan | None = None
-        self._slot_by_output: dict[int, DispatchSlot] = {}
+        self._inflight: dict[int, tuple[DispatchSlot, int]] = {}
+        trace_path = resolve_trace_path(self.scheduler_config.tau_batch_trace)
+        self._tracer: JsonlTracer | None = None
+        if trace_path:
+            try:
+                self._tracer = JsonlTracer(trace_path)
+            except OSError:
+                logger.exception("TauScheduler failed to open JSONL trace")
         if self.min_waiting_to_plan > 0:
             logger.warning(
                 "TauScheduler: plan_wave waits for %d waiting requests "
                 "(--tau-batch-min-waiting). Set 0 to plan immediately.",
                 self.min_waiting_to_plan,
             )
+
+    def _trace(self, event: str, **fields: Any) -> None:
+        if self._tracer is None:
+            return
+        self._tracer.record(event, **fields)
+
+    def trace_queue(
+        self, action: str, scheduler_output: SchedulerOutput, depth: int
+    ) -> None:
+        """Record batch_queue push/pop. Called from EngineCore."""
+        fwd_id = None
+        inflight = self._inflight.get(id(scheduler_output))
+        if inflight is not None:
+            fwd_id = inflight[1]
+        self._trace(action, fwd_id=fwd_id, queue_depth=depth)
 
     def schedule(self) -> SchedulerOutput:
         for _ in range(2):
@@ -156,15 +179,30 @@ class TauScheduler(Scheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        slot = self._slot_by_output.pop(id(scheduler_output), None)
+        slot = None
+        fwd_id = None
+        inflight = self._inflight.pop(id(scheduler_output), None)
+        if inflight is not None:
+            slot, fwd_id = inflight
         result = super().update_from_output(scheduler_output, model_runner_output)
         if slot is not None and slot.phase is DispatchPhase.PREFILL:
             self.dispatcher.on_prefill_complete(slot.microbatch_index)
+        if slot is not None:
+            self._trace(
+                "done",
+                fwd_id=fwd_id,
+                wave_id=self._wave.wave_id if self._wave is not None else None,
+                batch_idx=slot.microbatch_index,
+                phase=slot.phase.value,
+                req_ids=list(scheduler_output.num_scheduled_tokens),
+            )
         if self._wave is not None and not self._admitted_unfinished():
             self._clear_wave()
         return result
 
     def _clear_wave(self) -> None:
+        if self._wave is not None:
+            self._trace("wave_end", wave_id=self._wave.wave_id)
         self._wave = None
         self.dispatcher.reset()
 
@@ -186,6 +224,15 @@ class TauScheduler(Scheduler):
             return
         self._wave = plan
         self.dispatcher.start(plan)
+        self._trace(
+            "wave_plan",
+            wave_id=plan.wave_id,
+            batches=[list(mb.req_ids) for mb in plan.microbatches],
+            deferred_ids=sorted(plan.deferred_ids),
+            waiting=len(snapshots),
+            pp_size=self.parallel_config.pipeline_parallel_size,
+            policy=self.dispatcher.policy.value,
+        )
 
     def _next_slot(self) -> tuple[DispatchSlot | None, set[str]]:
         assert self._wave is not None
@@ -262,7 +309,17 @@ class TauScheduler(Scheduler):
             num_scheduled_tokens,
         )
         self.dispatcher.commit_slot(slot)
-        self._slot_by_output[id(out)] = slot
+        fwd_id = self._tracer.next_fwd_id() if self._tracer is not None else 0
+        self._inflight[id(out)] = (slot, fwd_id)
+        self._trace(
+            "emit",
+            fwd_id=fwd_id,
+            wave_id=self._wave.wave_id,
+            batch_idx=slot.microbatch_index,
+            phase=slot.phase.value,
+            req_ids=list(num_scheduled_tokens),
+            num_tokens=int(out.total_num_scheduled_tokens),
+        )
         return out
 
     def _num_new_tokens(self, request: Request) -> int:
@@ -312,6 +369,7 @@ class TauScheduler(Scheduler):
             request.request_id,
             reason,
         )
+        self._trace("drop", req_id=request.request_id, reason=reason)
         self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
 
     def _drop_unfittable_waiting(self) -> None:
@@ -328,6 +386,13 @@ class TauScheduler(Scheduler):
                     req.request_id,
                     need,
                     free,
+                )
+                self._trace(
+                    "drop",
+                    req_id=req.request_id,
+                    reason="reserved KV exceeds free blocks",
+                    need_blocks=need,
+                    free_blocks=free,
                 )
                 drop_ids.append(req.request_id)
         if drop_ids:
