@@ -42,6 +42,10 @@ def _tau_scheduler(
     *,
     max_microbatches: int = 2,
     max_reqs_per_microbatch: int = 2,
+    max_num_seqs: int = 16,
+    tau_batch_max_reqs_per_microbatch: int = 4,
+    tau_batch_max_microbatches: int = 0,
+    override_pack_limits: bool = True,
     pipeline_parallel_size: int = 2,
     enable_chunked_prefill: bool = False,
     enable_prefix_caching: bool = False,
@@ -59,7 +63,7 @@ def _tau_scheduler(
         skip_tokenizer_init=True,
     )
     scheduler_config = SchedulerConfig(
-        max_num_seqs=16,
+        max_num_seqs=max_num_seqs,
         max_num_batched_tokens=8192,
         max_model_len=8192,
         long_prefill_token_threshold=long_prefill_token_threshold,
@@ -67,6 +71,8 @@ def _tau_scheduler(
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
         tau_batch_min_waiting=tau_batch_min_waiting,
+        tau_batch_max_reqs_per_microbatch=tau_batch_max_reqs_per_microbatch,
+        tau_batch_max_microbatches=tau_batch_max_microbatches,
         tau_batch_trace=tau_batch_trace,
     )
     cache_config = CacheConfig(
@@ -103,8 +109,9 @@ def _tau_scheduler(
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
     )
-    sched.max_microbatches = max_microbatches
-    sched.max_reqs_per_microbatch = max_reqs_per_microbatch
+    if override_pack_limits:
+        sched.max_microbatches = max_microbatches
+        sched.max_reqs_per_microbatch = max_reqs_per_microbatch
     return sched
 
 
@@ -385,3 +392,28 @@ def test_min_waiting_to_plan_holds_until_threshold():
     assert out.total_num_scheduled_tokens > 0
     assert sched._wave is not None
     assert len(sched._wave.admitted_ids) + len(sched._wave.deferred_ids) == 8
+
+
+def test_pack_context_does_not_derive_size_from_p():
+    sched = _tau_scheduler(
+        max_num_seqs=32,
+        tau_batch_max_reqs_per_microbatch=4,
+        tau_batch_max_microbatches=0,
+        override_pack_limits=False,
+    )
+    ctx = sched._pack_context()
+    assert ctx.max_num_seqs == 32
+    assert ctx.max_reqs_per_microbatch == 4
+    assert ctx.max_microbatches == 8
+
+
+def test_pack_context_honors_explicit_p():
+    sched = _tau_scheduler(
+        max_num_seqs=32,
+        tau_batch_max_reqs_per_microbatch=4,
+        tau_batch_max_microbatches=2,
+        override_pack_limits=False,
+    )
+    ctx = sched._pack_context()
+    assert ctx.max_reqs_per_microbatch == 4
+    assert ctx.max_microbatches == 2

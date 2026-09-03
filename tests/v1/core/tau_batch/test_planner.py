@@ -256,6 +256,44 @@ def test_greedy_defers_when_kv_blocks_exhausted():
     assert estimate_kv_blocks(16, 16, 16) == 2
 
 
+def test_take_then_pack_makes_eight_microbatches():
+    planner = TauBatchPlanner()
+    requests = [_req(f"r{i}", tpot_slo_ms=float(i + 1)) for i in range(64)]
+    ctx = _ctx(max_num_seqs=32, max_microbatches=8, max_reqs_per_microbatch=4)
+    plan = planner.plan_wave(requests, ctx)
+    assert plan is not None
+    _assert_invariants(plan, requests, ctx)
+    assert len(plan.admitted_ids) == 32
+    assert len(plan.deferred_ids) == 32
+    assert len(plan.microbatches) == 8
+    assert [len(b.req_ids) for b in plan.microbatches] == [4] * 8
+    assert [b.index for b in plan.microbatches] == list(range(8))
+
+
+def test_take_then_pack_defers_when_p_is_tight():
+    planner = TauBatchPlanner()
+    requests = [_req(f"r{i}", tpot_slo_ms=float(i + 1)) for i in range(32)]
+    ctx = _ctx(max_num_seqs=32, max_microbatches=2, max_reqs_per_microbatch=4)
+    plan = planner.plan_wave(requests, ctx)
+    assert plan is not None
+    _assert_invariants(plan, requests, ctx)
+    assert len(plan.admitted_ids) == 8
+    assert len(plan.deferred_ids) == 24
+    assert len(plan.microbatches) == 2
+
+
+def test_short_take_is_packed_without_padding():
+    planner = TauBatchPlanner()
+    requests = [_req(f"r{i}", tpot_slo_ms=float(i + 1)) for i in range(10)]
+    ctx = _ctx(max_num_seqs=32, max_microbatches=8, max_reqs_per_microbatch=4)
+    plan = planner.plan_wave(requests, ctx)
+    assert plan is not None
+    _assert_invariants(plan, requests, ctx)
+    assert len(plan.admitted_ids) == 10
+    assert plan.deferred_ids == frozenset()
+    assert [len(b.req_ids) for b in plan.microbatches] == [4, 4, 2]
+
+
 def test_greedy_skips_unfittable_and_takes_next():
     planner = TauBatchPlanner()
     requests = [

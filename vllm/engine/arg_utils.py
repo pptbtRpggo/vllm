@@ -564,6 +564,10 @@ class EngineArgs:
 
     stream_interval: int = SchedulerConfig.stream_interval
     tau_batch_min_waiting: int = SchedulerConfig.tau_batch_min_waiting
+    tau_batch_max_reqs_per_microbatch: int = (
+        SchedulerConfig.tau_batch_max_reqs_per_microbatch
+    )
+    tau_batch_max_microbatches: int = SchedulerConfig.tau_batch_max_microbatches
     tau_batch_trace: str = SchedulerConfig.tau_batch_trace
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
@@ -1102,6 +1106,14 @@ class EngineArgs:
             **scheduler_kwargs["tau_batch_min_waiting"],
         )
         scheduler_group.add_argument(
+            "--tau-batch-max-reqs-per-microbatch",
+            **scheduler_kwargs["tau_batch_max_reqs_per_microbatch"],
+        )
+        scheduler_group.add_argument(
+            "--tau-batch-max-microbatches",
+            **scheduler_kwargs["tau_batch_max_microbatches"],
+        )
+        scheduler_group.add_argument(
             "--tau-batch-trace",
             **scheduler_kwargs["tau_batch_trace"],
         )
@@ -1611,6 +1623,8 @@ class EngineArgs:
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
             tau_batch_min_waiting=self.tau_batch_min_waiting,
+            tau_batch_max_reqs_per_microbatch=self.tau_batch_max_reqs_per_microbatch,
+            tau_batch_max_microbatches=self.tau_batch_max_microbatches,
             tau_batch_trace=self.tau_batch_trace,
         )
 

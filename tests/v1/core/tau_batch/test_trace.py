@@ -51,6 +51,32 @@ def test_trace_writes_wave_emit_done(tmp_path: Path) -> None:
     assert spans[0].done_mono_ns >= spans[0].emit_mono_ns
 
 
+def test_trace_not_created_until_first_write(tmp_path: Path) -> None:
+    path = tmp_path / "lazy.jsonl"
+    sched = _tau_scheduler(tau_batch_trace=str(path))
+    assert sched._tracer is not None
+    assert not path.exists()
+    _add_wave(sched)
+    assert not path.exists()
+    sched.schedule()
+    assert path.exists()
+    assert _events(path)[0]["event"] == "meta"
+
+
+def test_trace_recreates_after_delete(tmp_path: Path) -> None:
+    path = tmp_path / "rotate.jsonl"
+    sched = _tau_scheduler(tau_batch_trace=str(path))
+    _add_wave(sched)
+    first = sched.schedule()
+    assert path.exists()
+    path.unlink()
+    sched.update_from_output(first, _sampled(first))
+    assert path.exists()
+    kinds = [e["event"] for e in _events(path)]
+    assert kinds[0] == "meta"
+    assert "done" in kinds
+
+
 def test_trace_off_writes_nothing(tmp_path: Path) -> None:
     sched = _tau_scheduler()
     _add_wave(sched)

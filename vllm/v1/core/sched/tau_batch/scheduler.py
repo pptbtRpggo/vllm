@@ -6,6 +6,7 @@ from typing import Any
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -32,6 +33,17 @@ logger = init_logger(__name__)
 # Prototype defaults when sampling_params.extra_args has no SLO.
 _DEFAULT_TTFT_SLO_MS = 10_000.0
 _DEFAULT_TPOT_SLO_MS = 100.0
+
+
+def _resolve_max_microbatches(
+    configured: int, max_num_seqs: int, max_reqs_per_microbatch: int
+) -> int:
+    """Return P. 0 means enough batches to hold one full wave at the
+    per-micro-batch size. Per-batch size is never derived from P.
+    """
+    if configured >= 1:
+        return configured
+    return max(1, cdiv(max_num_seqs, max_reqs_per_microbatch))
 
 
 def _enforce_wave_runtime_contract(vllm_config: VllmConfig) -> None:
@@ -126,18 +138,32 @@ class TauScheduler(Scheduler):
         super().__init__(*args, **kwargs)
         self.planner = TauBatchPlanner()
         self.dispatcher = WaveDispatcher(WaveDispatchPolicy.OVERLAP)
-        self.max_microbatches: int | None = None
-        self.max_reqs_per_microbatch: int | None = None
+        self.max_reqs_per_microbatch = (
+            self.scheduler_config.tau_batch_max_reqs_per_microbatch
+        )
+        self.max_microbatches = _resolve_max_microbatches(
+            self.scheduler_config.tau_batch_max_microbatches,
+            self.max_num_running_reqs,
+            self.max_reqs_per_microbatch,
+        )
         self.min_waiting_to_plan = self.scheduler_config.tau_batch_min_waiting
         self._wave: WavePlan | None = None
         self._inflight: dict[int, tuple[DispatchSlot, int]] = {}
         trace_path = resolve_trace_path(self.scheduler_config.tau_batch_trace)
         self._tracer: JsonlTracer | None = None
         if trace_path:
-            try:
-                self._tracer = JsonlTracer(trace_path)
-            except OSError:
-                logger.exception("TauScheduler failed to open JSONL trace")
+            self._tracer = JsonlTracer(trace_path)
+            logger.warning(
+                "TauScheduler JSONL trace: %s (created on first write)",
+                trace_path,
+            )
+        logger.warning(
+            "TauScheduler: take at most %d waiting, pack size <= %d, "
+            "at most %d micro-batches (overflow deferred, no padding).",
+            self.max_num_running_reqs,
+            self.max_reqs_per_microbatch,
+            self.max_microbatches,
+        )
         if self.min_waiting_to_plan > 0:
             logger.warning(
                 "TauScheduler: plan_wave waits for %d waiting requests "
@@ -471,15 +497,11 @@ class TauScheduler(Scheduler):
 
     def _pack_context(self) -> PackContext:
         pp = max(1, self.parallel_config.pipeline_parallel_size)
-        p = self.max_microbatches if self.max_microbatches is not None else pp
-        batch = self.max_reqs_per_microbatch
-        if batch is None:
-            batch = max(1, self.max_num_running_reqs // p)
         return PackContext(
             now=time.time(),
             max_num_seqs=self.max_num_running_reqs,
-            max_microbatches=p,
-            max_reqs_per_microbatch=batch,
+            max_microbatches=self.max_microbatches,
+            max_reqs_per_microbatch=self.max_reqs_per_microbatch,
             pp_size=pp,
             kv_free_blocks=self.kv_cache_manager.block_pool.get_num_free_blocks(),
             block_size=self.block_size,

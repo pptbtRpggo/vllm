@@ -81,9 +81,11 @@ class PackContext:
 
     Attributes:
         now: Current timestamp in seconds (same clock as arrival_time).
-        max_num_seqs: Max admitted requests in this wave.
-        max_microbatches: Max number of micro-batches P.
-        max_reqs_per_microbatch: Max requests in one micro-batch.
+        max_num_seqs: Take at most this many from the waiting snapshot.
+        max_microbatches: Then pack at most this many micro-batches.
+        max_reqs_per_microbatch: Max requests in one micro-batch. Not
+            derived from max_num_seqs or max_microbatches. Overflow is
+            deferred; a short take is packed as-is.
         pp_size: Pipeline-parallel size. Reserved for later strategies.
         kv_free_blocks: Free KV blocks at plan time. None disables the
             KV filter.

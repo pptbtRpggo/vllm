@@ -48,25 +48,28 @@ def resolve_trace_path(config_path: str | None) -> str | None:
 
 
 class JsonlTracer:
-    """Append-only JSONL writer. One event per line, flushed immediately."""
+    """Append-only JSONL writer. The file is created on the first write.
+
+    If the path is removed later, the next write creates it again so a new
+    run can start without restarting the server.
+    """
 
     def __init__(self, path: str, *, write_meta: bool = True) -> None:
         self.path = path
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._fp: TextIO = open(path, "a", encoding="utf-8")
-        self._lock = threading.Lock()
+        self._write_meta = write_meta
+        self._fp: TextIO | None = None
+        self._lock = threading.RLock()
         self._fwd_id = 0
-        if write_meta:
-            logger.warning("TauScheduler JSONL trace: %s", path)
-            self.record("meta", schema=SCHEMA_VERSION)
 
     def close(self) -> None:
         with self._lock:
-            if not self._fp.closed:
+            if self._fp is not None and not self._fp.closed:
                 self._fp.close()
+            self._fp = None
 
     def next_fwd_id(self) -> int:
         with self._lock:
+            self._ensure_open()
             self._fwd_id += 1
             return self._fwd_id
 
@@ -80,8 +83,9 @@ class JsonlTracer:
         rec.update(fields)
         line = json.dumps(rec, ensure_ascii=False, default=str) + "\n"
         with self._lock:
-            if self._fp.closed:
+            if not self._ensure_open():
                 return
+            assert self._fp is not None
             flock = None
             try:
                 import fcntl
@@ -99,6 +103,43 @@ class JsonlTracer:
                         flock.flock(self._fp.fileno(), flock.LOCK_UN)
                     except OSError:
                         pass
+
+    def _ensure_open(self) -> bool:
+        """Open or recreate the JSONL file. Caller holds ``_lock``."""
+        path = Path(self.path)
+        missing = not path.exists()
+        if self._fp is not None and not self._fp.closed and not missing:
+            return True
+        if self._fp is not None and not self._fp.closed:
+            try:
+                self._fp.close()
+            except OSError:
+                pass
+            self._fp = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            created = not path.exists()
+            self._fp = open(path, "a", encoding="utf-8")
+            if created or self._fp.tell() == 0:
+                self._fwd_id = 0
+                if self._write_meta:
+                    self._write_meta_line()
+        except OSError:
+            logger.exception("Failed to open JSONL trace %s", self.path)
+            self._fp = None
+            return False
+        return True
+
+    def _write_meta_line(self) -> None:
+        rec = {
+            "ts_ns": time.time_ns(),
+            "mono_ns": time.monotonic_ns(),
+            "event": "meta",
+            "schema": SCHEMA_VERSION,
+        }
+        assert self._fp is not None
+        self._fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self._fp.flush()
 
 
 def load_events(path: str | Path) -> list[dict[str, Any]]:

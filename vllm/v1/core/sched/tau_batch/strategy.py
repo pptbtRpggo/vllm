@@ -39,12 +39,13 @@ class WavePackingStrategy(Protocol):
 
 
 class GreedyWaveStrategy:
-    """Placeholder packer: tight TPOT first, skip what does not fit.
+    """Take up to ``max_num_seqs``, then pack; overflow deferred, never pad.
 
-    Sort by ``(tpot_slo_ms, arrival_time, request_id)``. Admit a request
-    only if its reserved KV (prompt + max generate) fits the remaining
-    free blocks. Split only by ``max_reqs_per_microbatch``. A request
-    that does not fit is deferred; the next request is tried.
+    Sort by ``(tpot_slo_ms, arrival_time, request_id)``. First take at most
+    ``max_num_seqs`` requests whose reserved KV fits. Then split that take
+    by ``max_reqs_per_microbatch``, at most ``max_microbatches`` batches.
+    Requests that do not fit KV, exceed the take, or do not fit the remaining
+    batches are deferred. A short take is packed as-is.
     This is not the paper algorithm.
     """
 
@@ -61,34 +62,8 @@ class GreedyWaveStrategy:
             requests,
             key=lambda r: (r.tpot_slo_ms, r.arrival_time, r.request_id),
         )
-        remaining_kv = ctx.kv_free_blocks
-        batches: list[list[TauRequestSnapshot]] = []
-        current: list[TauRequestSnapshot] = []
-        admitted_count = 0
-
-        for req in ordered:
-            if admitted_count >= ctx.max_num_seqs:
-                break
-
-            need = _kv_blocks_if_fits(req, remaining_kv, ctx.block_size)
-            if need is None:
-                continue
-            if _needs_new_batch(current, ctx):
-                if len(batches) >= ctx.max_microbatches:
-                    continue
-                batches.append(current)
-                current = []
-            if not current and len(batches) >= ctx.max_microbatches:
-                continue
-
-            current.append(req)
-            admitted_count += 1
-            if remaining_kv is not None:
-                remaining_kv -= need
-
-        if current and len(batches) < ctx.max_microbatches:
-            batches.append(current)
-
+        taken = _take_wave(ordered, ctx)
+        batches = _pack_taken(taken, ctx)
         if not batches:
             return _empty_plan(input_ids)
 
@@ -109,6 +84,46 @@ class GreedyWaveStrategy:
             deferred_ids=input_ids - admitted_ids,
             extra={"strategy": "greedy"},
         )
+
+
+def _take_wave(
+    ordered: Sequence[TauRequestSnapshot],
+    ctx: PackContext,
+) -> list[TauRequestSnapshot]:
+    """Select at most ``max_num_seqs`` requests that fit remaining KV."""
+    taken: list[TauRequestSnapshot] = []
+    remaining_kv = ctx.kv_free_blocks
+    for req in ordered:
+        if len(taken) >= ctx.max_num_seqs:
+            break
+        need = _kv_blocks_if_fits(req, remaining_kv, ctx.block_size)
+        if need is None:
+            continue
+        taken.append(req)
+        if remaining_kv is not None:
+            remaining_kv -= need
+    return taken
+
+
+def _pack_taken(
+    taken: Sequence[TauRequestSnapshot],
+    ctx: PackContext,
+) -> list[list[TauRequestSnapshot]]:
+    """Split the take into micro-batches. Overflow is dropped (deferred)."""
+    batches: list[list[TauRequestSnapshot]] = []
+    current: list[TauRequestSnapshot] = []
+    for req in taken:
+        if _needs_new_batch(current, ctx):
+            if len(batches) >= ctx.max_microbatches:
+                break
+            batches.append(current)
+            current = []
+        if not current and len(batches) >= ctx.max_microbatches:
+            break
+        current.append(req)
+    if current and len(batches) < ctx.max_microbatches:
+        batches.append(current)
+    return batches
 
 
 def _kv_blocks_if_fits(
