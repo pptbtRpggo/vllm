@@ -87,9 +87,7 @@ def _tau_scheduler(
         scheduler_config=scheduler_config,
         model_config=model_config,
         cache_config=cache_config,
-        parallel_config=ParallelConfig(
-            pipeline_parallel_size=pipeline_parallel_size
-        ),
+        parallel_config=ParallelConfig(pipeline_parallel_size=pipeline_parallel_size),
     )
     if speculative_config is not None:
         vllm_config.speculative_config = speculative_config
@@ -408,10 +406,7 @@ def test_min_waiting_to_plan_holds_until_threshold():
     assert sched._list is None
     assert sched._wave_id is None
     assert len(sched.waiting) == 4
-    extra = [
-        _req(f"r{i}", tpot_slo_ms=10.0 * (i + 1))
-        for i in range(4, 8)
-    ]
+    extra = [_req(f"r{i}", tpot_slo_ms=10.0 * (i + 1)) for i in range(4, 8)]
     for req in extra:
         sched.add_request(req)
     out = sched.schedule()
@@ -421,7 +416,7 @@ def test_min_waiting_to_plan_holds_until_threshold():
     assert len(sched._list.admitted_ids) + len(sched._list.deferred_ids) == 8
 
 
-def test_pack_context_does_not_derive_size_from_p():
+def test_pack_context_zero_list_cap_is_unlimited():
     sched = _tau_scheduler(
         max_num_seqs=32,
         tau_batch_max_reqs_per_microbatch=4,
@@ -431,7 +426,7 @@ def test_pack_context_does_not_derive_size_from_p():
     ctx = sched._pack_context()
     assert ctx.max_num_seqs == 32
     assert ctx.max_reqs_per_microbatch == 4
-    assert ctx.max_microbatches == 8
+    assert ctx.max_microbatches == 0
 
 
 def test_pack_context_honors_explicit_p():

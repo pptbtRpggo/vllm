@@ -15,10 +15,11 @@ from vllm.v1.core.sched.tau_batch.types import (
 
 
 class ListPackingStrategy(Protocol):
-    """Packs a waiting snapshot into a micro-batch-task list.
+    """Packs the waiting pool into a micro-batch-task list.
 
-    The returned list order is the dispatch order. The scheduler stamps a
-    wave id when it starts dispatching this list.
+    The strategy sees the whole snapshot and must not first cut it down to
+    ``max_num_seqs``. The returned list order is the dispatch order. The
+    scheduler stamps a wave id when it starts dispatching this list.
     """
 
     def pack(
@@ -42,7 +43,7 @@ class EosStrategy(Protocol):
     """Runs when admitted requests finish (EOS or length cap).
 
     The current implementation is a no-op. A later strategy can refill
-    the leftover list from waiting without exceeding the wave ceiling.
+    the leftover list from waiting without exceeding the list ceiling.
     """
 
     def on_eos(self, event: EosEvent) -> None:
@@ -62,13 +63,12 @@ class NoOpEosStrategy:
 
 
 class GreedyListStrategy:
-    """Take up to ``max_num_seqs``, then split; overflow deferred, never pad.
+    """Walk the whole waiting pool, fill micro-batch tasks, and never pad.
 
-    Sort by ``(tpot_slo_ms, arrival_time, request_id)``. First take at most
-    ``max_num_seqs`` requests whose reserved KV fits. Then split that take
-    by ``max_reqs_per_microbatch``, at most ``max_microbatches`` tasks.
-    Requests that do not fit KV, exceed the take, or do not fit the remaining
-    tasks are deferred. A short take is packed as-is.
+    Sort by ``(tpot_slo_ms, arrival_time, request_id)``. Walk that order and
+    append into the current task while reserved KV fits. A full task starts
+    the next one until ``max_microbatches``; 0 means no list-length cap.
+    KV-unfit requests are skipped so a later request can still enter.
 
     This is the current default. Snapshots carry wait/slack; this strategy
     does not use them. The paper dual-ceiling packer is not here yet.
@@ -87,8 +87,7 @@ class GreedyListStrategy:
             requests,
             key=lambda r: (r.tpot_slo_ms, r.arrival_time, r.request_id),
         )
-        taken = _take_requests(ordered, ctx)
-        batches = _split_taken(taken, ctx)
+        batches = _pack_pool(ordered, ctx)
         if not batches:
             return _empty_list(input_ids)
 
@@ -99,9 +98,7 @@ class GreedyListStrategy:
             )
             for i, batch in enumerate(batches)
         )
-        admitted_ids = frozenset(
-            req_id for task in tasks for req_id in task.req_ids
-        )
+        admitted_ids = frozenset(req_id for task in tasks for req_id in task.req_ids)
         return MicroBatchList(
             tasks=tasks,
             admitted_ids=admitted_ids,
@@ -110,42 +107,31 @@ class GreedyListStrategy:
         )
 
 
-def _take_requests(
+def _pack_pool(
     ordered: Sequence[TauRequestSnapshot],
     ctx: PackContext,
-) -> list[TauRequestSnapshot]:
-    """Select at most ``max_num_seqs`` requests that fit remaining KV."""
-    taken: list[TauRequestSnapshot] = []
+) -> list[list[TauRequestSnapshot]]:
+    """Fill micro-batch tasks from the full ordered waiting pool."""
+    batches: list[list[TauRequestSnapshot]] = []
+    current: list[TauRequestSnapshot] = []
     remaining_kv = ctx.kv_free_blocks
+    cap = ctx.max_microbatches
+
     for req in ordered:
-        if len(taken) >= ctx.max_num_seqs:
-            break
         need = _kv_blocks_if_fits(req, remaining_kv, ctx.block_size)
         if need is None:
             continue
-        taken.append(req)
-        if remaining_kv is not None:
-            remaining_kv -= need
-    return taken
-
-
-def _split_taken(
-    taken: Sequence[TauRequestSnapshot],
-    ctx: PackContext,
-) -> list[list[TauRequestSnapshot]]:
-    """Split the take into micro-batch tasks. Overflow is deferred."""
-    batches: list[list[TauRequestSnapshot]] = []
-    current: list[TauRequestSnapshot] = []
-    for req in taken:
         if current and len(current) >= ctx.max_reqs_per_microbatch:
-            if len(batches) >= ctx.max_microbatches:
-                break
             batches.append(current)
             current = []
-        if not current and len(batches) >= ctx.max_microbatches:
+            if cap >= 1 and len(batches) >= cap:
+                break
+        if cap >= 1 and not current and len(batches) >= cap:
             break
         current.append(req)
-    if current and len(batches) < ctx.max_microbatches:
+        if remaining_kv is not None:
+            remaining_kv -= need
+    if current:
         batches.append(current)
     return batches
 

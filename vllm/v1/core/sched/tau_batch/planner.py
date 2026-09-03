@@ -19,7 +19,7 @@ from vllm.v1.core.sched.tau_batch.types import (
 
 
 class TauBatchPlanner:
-    """Packs a waiting snapshot into a micro-batch-task list.
+    """Packs the waiting pool into a micro-batch-task list.
 
     The planner is stateless with respect to previous deferred ids: each call
     takes the current snapshot plus PackContext. admitted/deferred on the
@@ -87,9 +87,9 @@ class TauBatchPlanner:
     def _validate_context(ctx: PackContext) -> None:
         if ctx.max_num_seqs < 1:
             raise ValueError(f"max_num_seqs must be >= 1, got {ctx.max_num_seqs}")
-        if ctx.max_microbatches < 1:
+        if ctx.max_microbatches < 0:
             raise ValueError(
-                f"max_microbatches must be >= 1, got {ctx.max_microbatches}"
+                f"max_microbatches must be >= 0, got {ctx.max_microbatches}"
             )
         if ctx.max_reqs_per_microbatch < 1:
             raise ValueError(
@@ -97,15 +97,11 @@ class TauBatchPlanner:
                 f"{ctx.max_reqs_per_microbatch}"
             )
         if ctx.kv_free_blocks is not None and ctx.kv_free_blocks < 0:
-            raise ValueError(
-                f"kv_free_blocks must be >= 0, got {ctx.kv_free_blocks}"
-            )
+            raise ValueError(f"kv_free_blocks must be >= 0, got {ctx.kv_free_blocks}")
         if ctx.kv_free_blocks is not None and (
             ctx.block_size is None or ctx.block_size < 1
         ):
-            raise ValueError(
-                "block_size must be >= 1 when kv_free_blocks is set"
-            )
+            raise ValueError("block_size must be >= 1 when kv_free_blocks is set")
 
     @staticmethod
     def _validate_requests(requests: Sequence[TauRequestSnapshot]) -> None:
@@ -163,9 +159,7 @@ class TauBatchPlanner:
         seen_set: set[str] = set()
         for i, task in enumerate(packed.tasks):
             if task.index != i:
-                raise ValueError(
-                    f"tasks[{i}].index must be {i}, got {task.index}"
-                )
+                raise ValueError(f"tasks[{i}].index must be {i}, got {task.index}")
             if not task.req_ids:
                 raise ValueError(f"tasks[{i}] must be non-empty")
             if len(task.req_ids) > ctx.max_reqs_per_microbatch:
@@ -181,11 +175,7 @@ class TauBatchPlanner:
 
         if frozenset(seen) != admitted:
             raise ValueError("union of task req_ids must equal admitted_ids")
-        if len(admitted) > ctx.max_num_seqs:
-            raise ValueError(
-                f"admitted {len(admitted)} requests, max_num_seqs is {ctx.max_num_seqs}"
-            )
-        if len(packed.tasks) > ctx.max_microbatches:
+        if ctx.max_microbatches >= 1 and len(packed.tasks) > ctx.max_microbatches:
             raise ValueError(
                 f"{len(packed.tasks)} tasks, max is {ctx.max_microbatches}"
             )

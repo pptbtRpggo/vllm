@@ -6,7 +6,6 @@ from typing import Any
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -40,15 +39,11 @@ _DEFAULT_TTFT_SLO_MS = 10_000.0
 _DEFAULT_TPOT_SLO_MS = 100.0
 
 
-def _resolve_max_microbatches(
-    configured: int, max_num_seqs: int, max_reqs_per_microbatch: int
-) -> int:
-    """Return P. 0 means enough tasks to hold one full take at the
-    per-task size. Per-task n is never derived from P.
-    """
-    if configured >= 1:
-        return configured
-    return max(1, cdiv(max_num_seqs, max_reqs_per_microbatch))
+def _resolve_max_microbatches(configured: int) -> int:
+    """Return the micro-batch list cap. 0 means pack the whole pool."""
+    if configured < 0:
+        raise ValueError(f"max_microbatches must be >= 0, got {configured}")
+    return configured
 
 
 def _enforce_slot_runtime_contract(vllm_config: VllmConfig) -> None:
@@ -141,12 +136,11 @@ def snapshot_from_request(
 class TauScheduler(Scheduler):
     """List-aware scheduler: one DispatchSlot per schedule() call.
 
-    The planner uses take-then-split to build a micro-batch-task list.
-    This class stamps a wave id when dispatch starts, then allocates that
-    exact task and builds SchedulerOutput itself; it does not call
-    Scheduler.schedule(). If allocate_slots fails for one request, that
-    request is finished with ERROR and the next request in the slot is
-    tried.
+    The planner walks the waiting pool to build a micro-batch-task list.
+    This class stamps a wave id when dispatch starts, then allocates that exact
+    task and builds SchedulerOutput itself; it does not call Scheduler.schedule().
+    If allocate_slots fails for one request, that request is finished with ERROR
+    and the next request in the slot is tried.
 
     on_prefill_complete is recorded in update_from_output, not schedule().
     New arrivals stay in waiting until the active list has no unfinished
@@ -172,8 +166,6 @@ class TauScheduler(Scheduler):
         )
         self.max_microbatches = _resolve_max_microbatches(
             self.scheduler_config.tau_batch_max_microbatches,
-            self.max_num_running_reqs,
-            self.max_reqs_per_microbatch,
         )
         self.min_waiting_to_plan = self.scheduler_config.tau_batch_min_waiting
         self._list: MicroBatchList | None = None
@@ -189,16 +181,17 @@ class TauScheduler(Scheduler):
                 trace_path,
             )
         logger.warning(
-            "TauScheduler: take at most %d waiting, pack size <= %d, "
-            "at most %d micro-batch tasks (overflow deferred, no padding).",
-            self.max_num_running_reqs,
+            "TauScheduler: pack the waiting pool into tasks of size <= %d, "
+            "list cap %s (0 = whole pool), KV-unfit skipped. "
+            "--max-num-seqs=%d is the running-slot cap, not a take cap.",
             self.max_reqs_per_microbatch,
             self.max_microbatches,
+            self.max_num_running_reqs,
         )
         if self.min_waiting_to_plan > 0:
             logger.warning(
-                "TauScheduler: plan waits for %d waiting requests "
-                "(--tau-batch-min-waiting). Set 0 to plan immediately.",
+                "TauScheduler: packing waits for %d waiting requests "
+                "(--tau-batch-min-waiting). Set 0 to pack immediately.",
                 self.min_waiting_to_plan,
             )
 
@@ -340,14 +333,19 @@ class TauScheduler(Scheduler):
         snapshots = self._waiting_snapshot(ctx.now, ctx.pp_size)
         if not snapshots:
             return
-        if (
-            self.min_waiting_to_plan > 0
-            and len(snapshots) < self.min_waiting_to_plan
-        ):
+        if self.min_waiting_to_plan > 0 and len(snapshots) < self.min_waiting_to_plan:
             return
         packed = self.planner.plan(snapshots, ctx)
         if packed is None:
             return
+        if len(packed.admitted_ids) > self.max_num_running_reqs:
+            logger.warning(
+                "TauScheduler packed %d requests but --max-num-seqs is %d. "
+                "Raise --max-num-seqs or extra requests are dropped when "
+                "they would enter running.",
+                len(packed.admitted_ids),
+                self.max_num_running_reqs,
+            )
         self._list = packed
         self._wave_id = self._next_wave_id
         self._next_wave_id += 1
@@ -378,9 +376,7 @@ class TauScheduler(Scheduler):
             skips += 1
         return None, set()
 
-    def _schedule_slot(
-        self, slot: DispatchSlot, allowed: set[str]
-    ) -> SchedulerOutput:
+    def _schedule_slot(self, slot: DispatchSlot, allowed: set[str]) -> SchedulerOutput:
         assert self._list is not None
         reqs = [
             self.requests[rid]
@@ -422,8 +418,8 @@ class TauScheduler(Scheduler):
             if kind == "running":
                 req_to_new_blocks[req.request_id] = new_blocks
             else:
-                req_to_new_blocks[req.request_id] = (
-                    self.kv_cache_manager.get_blocks(req.request_id)
+                req_to_new_blocks[req.request_id] = self.kv_cache_manager.get_blocks(
+                    req.request_id
                 )
             num_scheduled_tokens[req.request_id] = num_new
             if kind == "new":
@@ -485,9 +481,7 @@ class TauScheduler(Scheduler):
             + request.num_output_placeholders
             - request.num_computed_tokens
         )
-        return min(
-            num_new, self.max_model_len - 1 - request.num_computed_tokens
-        )
+        return min(num_new, self.max_model_len - 1 - request.num_computed_tokens)
 
     def _allocate_request(
         self, request: Request, num_new_tokens: int
@@ -541,8 +535,7 @@ class TauScheduler(Scheduler):
             )
             if need > free:
                 logger.error(
-                    "TauScheduler dropping %s: reserved %d KV blocks "
-                    "exceeds free %d",
+                    "TauScheduler dropping %s: reserved %d KV blocks exceeds free %d",
                     req.request_id,
                     need,
                     free,

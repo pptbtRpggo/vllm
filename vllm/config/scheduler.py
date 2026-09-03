@@ -145,17 +145,18 @@ class SchedulerConfig:
 
     tau_batch_min_waiting: int = Field(default=0, ge=0)
     """TauScheduler only. Wait until this many requests are in waiting
-    before planning a list. 0 plans as soon as waiting is non-empty."""
+    before packing a micro-batch list. 0 packs as soon as waiting is
+    non-empty."""
 
     tau_batch_max_reqs_per_microbatch: int = Field(default=4, ge=1)
     """TauScheduler only. Max n in one micro-batch task. Independent of
     --max-num-seqs and --tau-batch-max-microbatches."""
 
     tau_batch_max_microbatches: int = Field(default=0, ge=0)
-    """TauScheduler only. Max micro-batch tasks in one packed list. 0 means
-    enough tasks to hold one full take at tau_batch_max_reqs_per_microbatch
-    (ceil(max_num_seqs / per-task n)). Extra requests are deferred; a
-    short list is not padded. wave_id is stamped when dispatch starts."""
+    """TauScheduler only. Max micro-batch tasks in one packed list. 0 packs
+    the whole waiting pool (KV and per-task size still apply). Extra requests
+    are deferred; a short last task is not padded. wave_id is stamped when
+    dispatch starts."""
 
     tau_batch_trace: str = Field(default="")
     """TauScheduler only. JSONL path for host PP occupancy traces.

@@ -7,11 +7,11 @@ set -euo pipefail
 #   MODEL=~/models/CodeLlama-7b-Instruct/V1/model/ ./serve_tau.sh
 #   ./serve_tau.sh /path/or/hf-id
 #
-# Packing (take then split; overflow deferred, no padding):
-#   MAX_NUM_SEQS          take cap               default 32
-#   MAX_REQS_PER_MB       n cap per task         default 4
-#   MAX_MICROBATCHES      P; 0 = ceil(take/n)    default 0 → 8
-#   MIN_WAITING           plan threshold         default = MAX_NUM_SEQS
+# Packing (strategy walks the whole waiting pool; no take-N):
+#   MAX_NUM_SEQS          running-slot / worker table cap   default 32
+#   MAX_REQS_PER_MB       n cap per task                    default 4
+#   MAX_MICROBATCHES      list cap; 0 = whole pool          default 0
+#   MIN_WAITING           pack threshold                    default = MAX_NUM_SEQS
 #
 # Trace is created on the first write. Delete the JSONL to start a new run
 # without restarting serve.
@@ -45,7 +45,7 @@ TRACE="${TRACE:-${ROOT}/tau_batch_trace.jsonl}"
 echo "vllm: $(python -c 'import vllm,inspect; print(vllm.__version__, inspect.getfile(vllm))')"
 echo "TauScheduler: $(python -c 'from vllm.v1.core.sched.tau_batch import TauScheduler; print(TauScheduler)')"
 echo "MODEL=${MODEL}  devices=${ASCEND_RT_VISIBLE_DEVICES}  TP=${TP} PP=${PP}  port=${PORT}"
-echo "take=${MAX_NUM_SEQS}  per_mb=${MAX_REQS_PER_MB}  P=${MAX_MICROBATCHES}  min_waiting=${MIN_WAITING}"
+echo "pack pool  per_mb=${MAX_REQS_PER_MB}  list_cap=${MAX_MICROBATCHES} (0=all)  min_waiting=${MIN_WAITING}  max_num_seqs=${MAX_NUM_SEQS}"
 echo "trace=${TRACE}  (created on first write; rm it to start a new run)"
 
 exec vllm serve "${MODEL}" \
