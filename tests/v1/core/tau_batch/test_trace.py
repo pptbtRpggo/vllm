@@ -14,6 +14,7 @@ from tests.v1.core.tau_batch.test_scheduler import (
 )
 from vllm.v1.core.sched.tau_batch.plot_trace import pipeline_to_html, spans_to_html
 from vllm.v1.core.sched.tau_batch.trace import (
+    JsonlTracer,
     load_events,
     pair_forwards,
     pipeline_cells,
@@ -75,6 +76,23 @@ def test_trace_recreates_after_delete(tmp_path: Path) -> None:
     kinds = [e["event"] for e in _events(path)]
     assert kinds[0] == "meta"
     assert "done" in kinds
+
+
+def test_worker_reopens_after_driver_recreates(tmp_path: Path) -> None:
+    """rm the JSONL, then the driver recreates it. Worker must follow."""
+    path = tmp_path / "shared.jsonl"
+    worker = JsonlTracer(str(path), write_meta=False)
+    driver = JsonlTracer(str(path), write_meta=True)
+    worker.record("stage", fwd_id=1, pp_rank=0)
+    driver.record("emit", fwd_id=1)
+    path.unlink()
+    driver.record("emit", fwd_id=2)
+    worker.record("stage", fwd_id=2, pp_rank=1)
+    kinds = [e["event"] for e in _events(path)]
+    assert kinds[0] == "meta"
+    assert kinds.count("emit") == 1
+    assert kinds.count("stage") == 1
+    assert next(e for e in _events(path) if e["event"] == "stage")["fwd_id"] == 2
 
 
 def test_trace_off_writes_nothing(tmp_path: Path) -> None:

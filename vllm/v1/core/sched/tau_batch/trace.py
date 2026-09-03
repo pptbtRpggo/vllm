@@ -104,11 +104,26 @@ class JsonlTracer:
                     except OSError:
                         pass
 
+    def _fd_tracks_path(self, path: Path) -> bool:
+        """False if the fd is closed, the path is gone, or it is a new inode.
+
+        Deleting the JSONL while serve is up creates a new file on the next
+        driver write. A worker that only checks ``path.exists()`` keeps the
+        old fd and writes stages into the unlinked inode.
+        """
+        if self._fp is None or self._fp.closed:
+            return False
+        try:
+            if not path.exists():
+                return False
+            return os.fstat(self._fp.fileno()).st_ino == path.stat().st_ino
+        except OSError:
+            return False
+
     def _ensure_open(self) -> bool:
         """Open or recreate the JSONL file. Caller holds ``_lock``."""
         path = Path(self.path)
-        missing = not path.exists()
-        if self._fp is not None and not self._fp.closed and not missing:
+        if self._fd_tracks_path(path):
             return True
         if self._fp is not None and not self._fp.closed:
             try:
