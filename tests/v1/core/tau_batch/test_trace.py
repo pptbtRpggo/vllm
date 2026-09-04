@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,11 +15,14 @@ from tests.v1.core.tau_batch.test_scheduler import (
     _tau_scheduler,
 )
 from vllm.v1.core.sched.tau_batch.plot_trace import pipeline_to_html, spans_to_html
+from vllm.v1.core.sched.tau_batch import trace as tau_trace
 from vllm.v1.core.sched.tau_batch.trace import (
     JsonlTracer,
     load_events,
     pair_forwards,
     pipeline_cells,
+    record_worker_phase,
+    trace_worker_phase,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -90,6 +95,58 @@ def test_trace_recreates_after_delete(tmp_path: Path) -> None:
     kinds = [e["event"] for e in _events(path)]
     assert kinds[0] == "meta"
     assert "done" in kinds
+
+
+def _reset_worker_tracer() -> None:
+    tau_trace._worker_tracer = None
+    tau_trace._worker_tracer_ready = False
+
+
+def test_worker_phases_record_recv_compute_send(tmp_path: Path) -> None:
+    path = tmp_path / "phases.jsonl"
+    cfg = SimpleNamespace(scheduler_config=SimpleNamespace(tau_batch_trace=str(path)))
+    _reset_worker_tracer()
+    try:
+        start = time.time_ns()
+        record_worker_phase(
+            cfg, kind="recv", fwd_id=1, start_ts_ns=start, req_ids=["r0"],
+            sync_end=False,
+        )
+        record_worker_phase(
+            cfg, kind="compute", fwd_id=1, start_ts_ns=start, req_ids=["r0"],
+            sync_end=False,
+        )
+        record_worker_phase(
+            cfg, kind="send", fwd_id=1, start_ts_ns=start, req_ids=["r0"],
+            sync_end=False,
+        )
+        kinds = [e["event"] for e in _events(path)]
+        assert kinds == ["recv", "compute", "send"]
+        recv = _events(path)[0]
+        assert recv["fwd_id"] == 1
+        assert recv["end_ts_ns"] >= recv["start_ts_ns"]
+    finally:
+        _reset_worker_tracer()
+
+
+def test_trace_worker_phase_skips_without_fwd_id(tmp_path: Path) -> None:
+    path = tmp_path / "skip.jsonl"
+    cfg = SimpleNamespace(scheduler_config=SimpleNamespace(tau_batch_trace=str(path)))
+    _reset_worker_tracer()
+    try:
+        out = SimpleNamespace(tau_fwd_id=None, num_scheduled_tokens={"r0": 1})
+        with trace_worker_phase(cfg, out, "recv"):
+            pass
+        assert not path.exists()
+        out.tau_fwd_id = 3
+        with trace_worker_phase(cfg, out, "compute", sync_end=False):
+            pass
+        events = _events(path)
+        assert [e["event"] for e in events] == ["compute"]
+        assert events[0]["fwd_id"] == 3
+        assert events[0]["req_ids"] == ["r0"]
+    finally:
+        _reset_worker_tracer()
 
 
 def test_worker_reopens_after_driver_recreates(tmp_path: Path) -> None:

@@ -4,9 +4,11 @@
 """Host-side JSONL trace for τ-Batch PP occupancy.
 
 Driver events (emit/done) span the whole pipeline Future. Worker
-``stage`` events add per-PP-rank execute_model wall times. Plotting
-places stage k after stage k-1 ends (recv unblocks on the previous
-send). Cross-process alignment uses ``time.time_ns()``, not monotonic.
+``stage`` is the whole execute_model wall. Inside that, ``recv`` /
+``compute`` / ``send`` split the PP rank: recv waits for the previous
+send, compute is this stage's forward, send is enqueue-return only
+(NCCL send is async). Plotting still places stage k after stage k-1
+ends. Cross-process alignment uses ``time.time_ns()``, not monotonic.
 
 Enable with ``--tau-batch-trace PATH`` or env ``TAU_BATCH_TRACE``.
 """
@@ -17,7 +19,8 @@ import json
 import os
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
@@ -26,7 +29,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 ENV_TRACE_PATH = "TAU_BATCH_TRACE"
 
 
@@ -276,15 +279,16 @@ def _sync_compute_device() -> None:
             return
 
 
-def record_worker_stage(
-    vllm_config: Any,
-    *,
-    fwd_id: int,
-    start_ts_ns: int,
-    req_ids: list[str],
-    features: Mapping[str, Any] | None = None,
-) -> None:
-    """Append one per-rank stage event. Safe to call from PP workers."""
+def _pp_rank() -> int:
+    try:
+        from vllm.distributed.parallel_state import get_pp_group
+
+        return int(get_pp_group().rank_in_group)
+    except Exception:
+        return -1
+
+
+def _ensure_worker_tracer(vllm_config: Any) -> JsonlTracer | None:
     global _worker_tracer, _worker_tracer_ready
     if not _worker_tracer_ready:
         _worker_tracer_ready = True
@@ -302,31 +306,114 @@ def record_worker_stage(
             except OSError:
                 logger.exception("PP worker failed to open JSONL trace")
                 _worker_tracer = None
-    if _worker_tracer is None:
-        return
-    _sync_compute_device()
-    end_ts_ns = time.time_ns()
-    pp_rank = -1
-    try:
-        from vllm.distributed.parallel_state import get_pp_group
+    return _worker_tracer
 
-        pp_rank = int(get_pp_group().rank_in_group)
-    except Exception:
-        pp_rank = -1
+
+def _record_worker_event(
+    vllm_config: Any,
+    event: str,
+    *,
+    fwd_id: int,
+    start_ts_ns: int,
+    req_ids: list[str],
+    features: Mapping[str, Any] | None = None,
+    sync_end: bool = True,
+) -> None:
+    tracer = _ensure_worker_tracer(vllm_config)
+    if tracer is None:
+        return
+    if sync_end:
+        _sync_compute_device()
     extra = dict(features) if features else {}
     extra.pop("req_ids", None)
     extra.pop("fwd_id", None)
     extra.pop("pp_rank", None)
     extra.pop("event", None)
-    _worker_tracer.record(
-        "stage",
+    extra.pop("kind", None)
+    tracer.record(
+        event,
         fwd_id=fwd_id,
-        pp_rank=pp_rank,
+        pp_rank=_pp_rank(),
         start_ts_ns=start_ts_ns,
-        end_ts_ns=end_ts_ns,
+        end_ts_ns=time.time_ns(),
         req_ids=req_ids,
         **extra,
     )
+
+
+def record_worker_stage(
+    vllm_config: Any,
+    *,
+    fwd_id: int,
+    start_ts_ns: int,
+    req_ids: list[str],
+    features: Mapping[str, Any] | None = None,
+) -> None:
+    """Append one per-rank execute_model envelope. Safe on PP workers."""
+    _record_worker_event(
+        vllm_config,
+        "stage",
+        fwd_id=fwd_id,
+        start_ts_ns=start_ts_ns,
+        req_ids=req_ids,
+        features=features,
+        sync_end=True,
+    )
+
+
+def record_worker_phase(
+    vllm_config: Any,
+    *,
+    kind: str,
+    fwd_id: int,
+    start_ts_ns: int,
+    req_ids: list[str],
+    features: Mapping[str, Any] | None = None,
+    sync_end: bool = True,
+) -> None:
+    """Append recv / compute / send inside one stage.
+
+    ``recv`` waits for the previous rank. ``compute`` is this rank's
+    forward. ``send`` is enqueue-return; NCCL send does not wait for
+    the transfer to finish (the next rank's recv does).
+    """
+    _record_worker_event(
+        vllm_config,
+        kind,
+        fwd_id=fwd_id,
+        start_ts_ns=start_ts_ns,
+        req_ids=req_ids,
+        features=features,
+        sync_end=sync_end,
+    )
+
+
+@contextmanager
+def trace_worker_phase(
+    vllm_config: Any,
+    scheduler_output: Any,
+    kind: str,
+    *,
+    sync_end: bool = True,
+) -> Iterator[None]:
+    """No-op unless ``scheduler_output.tau_fwd_id`` is set."""
+    fwd_id = getattr(scheduler_output, "tau_fwd_id", None)
+    if fwd_id is None:
+        yield
+        return
+    start_ts_ns = time.time_ns()
+    try:
+        yield
+    finally:
+        record_worker_phase(
+            vllm_config,
+            kind=kind,
+            fwd_id=int(fwd_id),
+            start_ts_ns=start_ts_ns,
+            req_ids=list(getattr(scheduler_output, "num_scheduled_tokens", {})),
+            features=getattr(scheduler_output, "tau_task", None),
+            sync_end=sync_end,
+        )
 
 
 @dataclass(frozen=True)

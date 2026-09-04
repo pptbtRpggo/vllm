@@ -612,17 +612,19 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict = get_pp_group().recv_tensor_dict(
-                all_gather_group=get_tp_group(),
-                all_gather_tensors=all_gather_tensors,
-            )
+            with self._tau_phase(scheduler_output, "recv"):
+                tensor_dict = get_pp_group().recv_tensor_dict(
+                    all_gather_group=get_tp_group(),
+                    all_gather_tensors=all_gather_tensors,
+                )
             assert tensor_dict is not None
             intermediate_tensors = IntermediateTensors(tensor_dict)
 
         with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
+            with self._tau_phase(scheduler_output, "compute"):
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
             if isinstance(output, (ModelRunnerOutput, NoneType)):
                 return output
 
@@ -633,13 +635,30 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
-        get_pp_group().send_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-        )
+        # send is enqueue-return; the next rank's recv waits for the transfer.
+        with self._tau_phase(scheduler_output, "send", sync_end=False):
+            get_pp_group().send_tensor_dict(
+                output.tensors,
+                all_gather_group=get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
+            )
 
         return None
+
+    def _tau_phase(
+        self,
+        scheduler_output: "SchedulerOutput",
+        kind: str,
+        *,
+        sync_end: bool = True,
+    ) -> AbstractContextManager[None]:
+        if getattr(scheduler_output, "tau_fwd_id", None) is None:
+            return nullcontext()
+        from vllm.v1.core.sched.tau_batch.trace import trace_worker_phase
+
+        return trace_worker_phase(
+            self.vllm_config, scheduler_output, kind, sync_end=sync_end
+        )
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
