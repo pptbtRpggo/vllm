@@ -26,7 +26,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 ENV_TRACE_PATH = "TAU_BATCH_TRACE"
 
 
@@ -231,7 +231,7 @@ def pair_forwards(events: Iterable[Mapping[str, Any]]) -> list[ForwardSpan]:
                 ),
                 phase=str(emit.get("phase") or done.get("phase") or ""),
                 req_ids=req_ids,
-                num_tokens=_opt_int(emit.get("num_tokens")),
+                num_tokens=_opt_int(emit.get("num_tokens", emit.get("tokens"))),
                 emit_mono_ns=int(emit["mono_ns"]),
                 done_mono_ns=int(done["mono_ns"]),
                 enqueue_mono_ns=_opt_int(
@@ -282,6 +282,7 @@ def record_worker_stage(
     fwd_id: int,
     start_ts_ns: int,
     req_ids: list[str],
+    features: Mapping[str, Any] | None = None,
 ) -> None:
     """Append one per-rank stage event. Safe to call from PP workers."""
     global _worker_tracer, _worker_tracer_ready
@@ -312,6 +313,11 @@ def record_worker_stage(
         pp_rank = int(get_pp_group().rank_in_group)
     except Exception:
         pp_rank = -1
+    extra = dict(features) if features else {}
+    extra.pop("req_ids", None)
+    extra.pop("fwd_id", None)
+    extra.pop("pp_rank", None)
+    extra.pop("event", None)
     _worker_tracer.record(
         "stage",
         fwd_id=fwd_id,
@@ -319,6 +325,7 @@ def record_worker_stage(
         start_ts_ns=start_ts_ns,
         end_ts_ns=end_ts_ns,
         req_ids=req_ids,
+        **extra,
     )
 
 

@@ -9,7 +9,11 @@ from vllm.v1.core.sched.tau_batch import (
     PackContext,
     TauBatchPlanner,
     TauRequestSnapshot,
+    annotate_request_budget,
     estimate_kv_blocks,
+    tau_max_ms,
+    ttft_slack_ms,
+    wait_ms,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -43,12 +47,14 @@ def _ctx(
     kv_free_blocks: int | None = None,
     block_size: int | None = None,
     max_num_batched_tokens: int | None = None,
+    pp_size: int | None = None,
 ) -> PackContext:
     return PackContext(
         now=now,
         max_num_seqs=max_num_seqs,
         max_microbatches=max_microbatches,
         max_reqs_per_microbatch=max_reqs_per_microbatch,
+        pp_size=pp_size,
         kv_free_blocks=kv_free_blocks,
         block_size=block_size,
         max_num_batched_tokens=max_num_batched_tokens,
@@ -72,6 +78,47 @@ def _assert_invariants(
         assert len(task.req_ids) <= ctx.max_reqs_per_microbatch
     assert len(plan.admitted_ids) <= ctx.max_num_seqs
     assert len(plan.tasks) <= ctx.max_microbatches
+
+
+def test_wait_ms_clamps_before_arrival():
+    assert wait_ms(arrival_time=2.0, now=1.0) == 0.0
+    assert wait_ms(arrival_time=1.0, now=1.5) == 500.0
+
+
+def test_ttft_slack_is_slo_minus_wait():
+    assert ttft_slack_ms(200.0, 50.0) == 150.0
+    assert ttft_slack_ms(200.0, 250.0) == -50.0
+
+
+def test_tau_max_divides_tpot_by_pp():
+    assert tau_max_ms(80.0, None) == 80.0
+    assert tau_max_ms(80.0, 4) == 20.0
+
+
+def test_annotate_request_budget_fills_wait_and_slack():
+    req = _req("a", arrival_time=1.0, ttft_slo_ms=200.0, tpot_slo_ms=80.0)
+    filled = annotate_request_budget(req, now=1.5, pp_size=4)
+    assert filled.wait_ms == 500.0
+    assert filled.ttft_slack_ms == -300.0
+    assert filled.tau_max_ms == 20.0
+    assert req.wait_ms == 0.0
+
+
+def test_planner_annotates_budgets_before_pack():
+    class Capture(GreedyListStrategy):
+        def pack(self, requests, ctx):
+            self.seen = list(requests)
+            return super().pack(requests, ctx)
+
+    capture = Capture()
+    planner = TauBatchPlanner(strategy=capture)
+    planner.plan(
+        [_req("a", arrival_time=1.0, ttft_slo_ms=200.0, tpot_slo_ms=80.0)],
+        _ctx(now=1.25, pp_size=2),
+    )
+    assert capture.seen[0].wait_ms == 250.0
+    assert capture.seen[0].ttft_slack_ms == -50.0
+    assert capture.seen[0].tau_max_ms == 40.0
 
 
 def test_empty_snapshot_returns_none():

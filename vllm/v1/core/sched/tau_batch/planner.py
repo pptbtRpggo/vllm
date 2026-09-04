@@ -11,6 +11,7 @@ from vllm.v1.core.sched.tau_batch.types import (
     MicroBatchList,
     PackContext,
     TauRequestSnapshot,
+    annotate_request_budget,
 )
 
 
@@ -54,6 +55,9 @@ class TauBatchPlanner:
         if not requests:
             return None
 
+        requests = [
+            annotate_request_budget(req, ctx.now, ctx.pp_size) for req in requests
+        ]
         packed = self.strategy.pack(requests, ctx)
         if not packed.tasks:
             return None

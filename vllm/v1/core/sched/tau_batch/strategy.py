@@ -46,7 +46,8 @@ class GreedyListStrategy:
     Requests that do not fit KV, exceed the take, or do not fit the remaining
     tasks are deferred. A short take is packed as-is.
 
-    This is the current default. The paper dual-ceiling packer is not here yet.
+    This is the current default. Snapshots carry wait/slack; this strategy
+    does not use them. The paper dual-ceiling packer is not here yet.
     """
 
     def pack(

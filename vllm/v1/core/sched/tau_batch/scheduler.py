@@ -21,8 +21,12 @@ from vllm.v1.core.sched.tau_batch.trace import JsonlTracer, resolve_trace_path
 from vllm.v1.core.sched.tau_batch.types import (
     MicroBatchList,
     PackContext,
+    TaskFeatures,
     TauRequestSnapshot,
+    annotate_request_budget,
     estimate_kv_blocks,
+    request_budget_dict,
+    wait_ms,
 )
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
@@ -86,13 +90,33 @@ def _enforce_slot_runtime_contract(vllm_config: VllmConfig) -> None:
         )
 
 
-def snapshot_from_request(request: Request) -> TauRequestSnapshot:
+def _request_seq_len(request: Request, phase: DispatchPhase) -> int:
+    """Length that enters the SCLS affine model for this phase.
+
+    Prefill uses prompt length L. Decode uses current context length l
+    (tokens already in KV).
+    """
+    if phase is DispatchPhase.PREFILL:
+        return int(request.num_prompt_tokens)
+    return int(request.num_computed_tokens)
+
+
+def snapshot_from_request(
+    request: Request,
+    now: float | None = None,
+    pp_size: int | None = None,
+) -> TauRequestSnapshot:
     """Build a planner snapshot from a vLLM Request without mutating it.
+
+    Copies ``Request.arrival_time`` (recorded at engine intake). When
+    ``now`` is given, also fills wait and slack.
 
     SLOs are read from ``sampling_params.extra_args`` when present.
 
     Args:
         request: Scheduler request. Must not be modified.
+        now: Snapshot clock in seconds. None skips wait/slack.
+        pp_size: Pipeline stages M for ``τ_max``.
 
     Returns:
         A TauRequestSnapshot for plan.
@@ -100,7 +124,7 @@ def snapshot_from_request(request: Request) -> TauRequestSnapshot:
     extra: dict[str, Any] = {}
     if request.sampling_params is not None and request.sampling_params.extra_args:
         extra = request.sampling_params.extra_args
-    return TauRequestSnapshot(
+    snap = TauRequestSnapshot(
         request_id=request.request_id,
         arrival_time=request.arrival_time,
         prompt_len=request.num_prompt_tokens,
@@ -108,6 +132,9 @@ def snapshot_from_request(request: Request) -> TauRequestSnapshot:
         tpot_slo_ms=float(extra.get("tpot_slo_ms", _DEFAULT_TPOT_SLO_MS)),
         max_new_tokens=request.max_tokens,
     )
+    if now is None:
+        return snap
+    return annotate_request_budget(snap, now, pp_size)
 
 
 class TauScheduler(Scheduler):
@@ -151,7 +178,7 @@ class TauScheduler(Scheduler):
         self._list: MicroBatchList | None = None
         self._wave_id: int | None = None
         self._next_wave_id = 0
-        self._inflight: dict[int, tuple[DispatchSlot, int]] = {}
+        self._inflight: dict[int, tuple[DispatchSlot, int, dict[str, Any], int]] = {}
         trace_path = resolve_trace_path(self.scheduler_config.tau_batch_trace)
         self._tracer: JsonlTracer | None = None
         if trace_path:
@@ -210,20 +237,34 @@ class TauScheduler(Scheduler):
     ) -> dict[int, EngineCoreOutputs]:
         slot = None
         fwd_id = None
+        features: dict[str, Any] = {}
+        emit_mono_ns: int | None = None
         inflight = self._inflight.pop(id(scheduler_output), None)
         if inflight is not None:
-            slot, fwd_id = inflight
+            slot, fwd_id, features, emit_mono_ns = inflight
         result = super().update_from_output(scheduler_output, model_runner_output)
         if slot is not None and slot.phase is DispatchPhase.PREFILL:
             self.dispatcher.on_prefill_complete(slot.microbatch_index)
         if slot is not None:
+            duration_ms = None
+            if emit_mono_ns is not None:
+                duration_ms = (time.monotonic_ns() - emit_mono_ns) / 1e6
             self._trace(
                 "done",
                 fwd_id=fwd_id,
                 wave_id=self._wave_id,
                 batch_idx=slot.microbatch_index,
-                phase=slot.phase.value,
                 req_ids=list(scheduler_output.num_scheduled_tokens),
+                duration_ms=duration_ms,
+                **features,
+            )
+            self._trace(
+                "task",
+                fwd_id=fwd_id,
+                wave_id=self._wave_id,
+                batch_idx=slot.microbatch_index,
+                duration_ms=duration_ms,
+                **features,
             )
         if self._list is not None and not self._admitted_unfinished():
             self._clear_list()
@@ -241,7 +282,8 @@ class TauScheduler(Scheduler):
             return
         self._clear_list()
         self._drop_unfittable_waiting()
-        snapshots = self._waiting_snapshot()
+        ctx = self._pack_context()
+        snapshots = self._waiting_snapshot(ctx.now, ctx.pp_size)
         if not snapshots:
             return
         if (
@@ -249,7 +291,7 @@ class TauScheduler(Scheduler):
             and len(snapshots) < self.min_waiting_to_plan
         ):
             return
-        packed = self.planner.plan(snapshots, self._pack_context())
+        packed = self.planner.plan(snapshots, ctx)
         if packed is None:
             return
         self._list = packed
@@ -262,8 +304,9 @@ class TauScheduler(Scheduler):
             batches=[list(task.req_ids) for task in packed.tasks],
             deferred_ids=sorted(packed.deferred_ids),
             waiting=len(snapshots),
-            pp_size=self.parallel_config.pipeline_parallel_size,
+            pp_size=ctx.pp_size,
             policy=self.dispatcher.policy.value,
+            requests=[request_budget_dict(req) for req in snapshots],
         )
 
     def _next_slot(self) -> tuple[DispatchSlot | None, set[str]]:
@@ -347,19 +390,38 @@ class TauScheduler(Scheduler):
             num_scheduled_tokens,
         )
         self.dispatcher.commit_slot(slot)
+        scheduled = [req for req in reqs if req.request_id in num_scheduled_tokens]
+        features = self._task_features(
+            slot, scheduled, int(out.total_num_scheduled_tokens)
+        ).as_dict()
+        features.update(self._model_trace_fields())
+        now = time.time()
+        features["req_waits"] = [
+            {
+                "req_id": req.request_id,
+                "arrival_time": req.arrival_time,
+                "wait_ms": wait_ms(req.arrival_time, now),
+                "s": _request_seq_len(req, slot.phase),
+            }
+            for req in scheduled
+        ]
+        out.tau_task = {
+            k: features[k]
+            for k in ("phase", "n", "s_max", "s_sum", "tokens", "pp_size", "seq_lens")
+            if k in features
+        }
         fwd_id = 0
         if self._tracer is not None:
             fwd_id = self._tracer.next_fwd_id()
             out.tau_fwd_id = fwd_id
-        self._inflight[id(out)] = (slot, fwd_id)
+        self._inflight[id(out)] = (slot, fwd_id, features, time.monotonic_ns())
         self._trace(
             "emit",
             fwd_id=fwd_id,
             wave_id=self._wave_id,
             batch_idx=slot.microbatch_index,
-            phase=slot.phase.value,
             req_ids=list(num_scheduled_tokens),
-            num_tokens=int(out.total_num_scheduled_tokens),
+            **features,
         )
         return out
 
@@ -498,8 +560,45 @@ class TauScheduler(Scheduler):
         self._update_after_schedule(scheduler_output)
         return scheduler_output
 
-    def _waiting_snapshot(self) -> list[TauRequestSnapshot]:
-        return [snapshot_from_request(req) for req in self.waiting]
+    def _waiting_snapshot(
+        self, now: float, pp_size: int | None
+    ) -> list[TauRequestSnapshot]:
+        return [snapshot_from_request(req, now, pp_size) for req in self.waiting]
+
+    def _task_features(
+        self,
+        slot: DispatchSlot,
+        reqs: list[Request],
+        tokens: int,
+    ) -> TaskFeatures:
+        seq_lens = tuple(_request_seq_len(req, slot.phase) for req in reqs)
+        return TaskFeatures(
+            phase=slot.phase.value,
+            n=len(reqs),
+            s_max=max(seq_lens) if seq_lens else 0,
+            s_sum=sum(seq_lens),
+            tokens=tokens,
+            pp_size=max(1, self.parallel_config.pipeline_parallel_size),
+            seq_lens=seq_lens,
+        )
+
+    def _model_trace_fields(self) -> dict[str, Any]:
+        cfg = getattr(self.vllm_config.model_config, "hf_text_config", None)
+        if cfg is None:
+            cfg = getattr(self.vllm_config.model_config, "hf_config", None)
+        fields: dict[str, Any] = {}
+        if cfg is None:
+            return fields
+        for name in (
+            "hidden_size",
+            "num_attention_heads",
+            "num_hidden_layers",
+            "intermediate_size",
+        ):
+            val = getattr(cfg, name, None)
+            if isinstance(val, int):
+                fields[name] = val
+        return fields
 
     def _pack_context(self) -> PackContext:
         pp = max(1, self.parallel_config.pipeline_parallel_size)

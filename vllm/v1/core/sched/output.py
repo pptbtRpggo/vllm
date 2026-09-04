@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from typing_extensions import deprecated
 
@@ -210,6 +210,8 @@ class SchedulerOutput:
     # τ-Batch JSONL: correlator for per-PP-rank stage timestamps.
     # None means workers skip stage tracing.
     tau_fwd_id: int | None = None
+    # Affine latency factors for this micro-batch task (n, s_max, ...).
+    tau_task: dict[str, Any] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

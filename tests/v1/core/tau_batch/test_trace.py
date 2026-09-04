@@ -45,6 +45,20 @@ def test_trace_writes_wave_emit_done(tmp_path: Path) -> None:
     assert kinds.count("done") == 2
     plan = next(e for e in events if e["event"] == "wave_plan")
     assert plan["batches"] == [["r0", "r1"], ["r2", "r3"]]
+    assert len(plan["requests"]) == 4
+    assert {r["req_id"] for r in plan["requests"]} == {"r0", "r1", "r2", "r3"}
+    assert all("wait_ms" in r and "ttft_slack_ms" in r for r in plan["requests"])
+    emit0 = next(e for e in events if e["event"] == "emit" and e["fwd_id"] == 1)
+    assert emit0["n"] == 2
+    assert emit0["s_max"] == 8
+    assert emit0["s_sum"] == 16
+    assert emit0["tokens"] == 16
+    assert emit0["pp_size"] == 2
+    assert emit0["phase"] == "prefill"
+    assert kinds.count("task") == 2
+    task0 = next(e for e in events if e["event"] == "task" and e["fwd_id"] == 1)
+    assert task0["n"] == 2
+    assert task0["duration_ms"] >= 0
     spans = pair_forwards(events)
     assert len(spans) == 2
     assert spans[0].job.endswith("B0_pre")

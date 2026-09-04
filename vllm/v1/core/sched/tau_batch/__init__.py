@@ -17,8 +17,14 @@ from vllm.v1.core.sched.tau_batch.types import (
     MicroBatchPlan,
     MicroBatchTask,
     PackContext,
+    TaskFeatures,
     TauRequestSnapshot,
+    annotate_request_budget,
     estimate_kv_blocks,
+    request_budget_dict,
+    tau_max_ms,
+    ttft_slack_ms,
+    wait_ms,
 )
 
 __all__ = [
@@ -32,9 +38,15 @@ __all__ = [
     "MicroBatchPlan",
     "MicroBatchTask",
     "PackContext",
+    "TaskFeatures",
     "TauBatchPlanner",
     "TauRequestSnapshot",
+    "annotate_request_budget",
     "estimate_kv_blocks",
+    "request_budget_dict",
+    "tau_max_ms",
+    "ttft_slack_ms",
+    "wait_ms",
     "TauScheduler",
     "snapshot_from_request",
 ]

@@ -382,6 +382,7 @@ class WorkerWrapperBase:
                 fwd_id=int(fwd_id),
                 start_ts_ns=start_ts_ns,
                 req_ids=list(scheduler_output.num_scheduled_tokens),
+                features=getattr(scheduler_output, "tau_task", None),
             )
 
     def reset_mm_cache(self) -> None:
