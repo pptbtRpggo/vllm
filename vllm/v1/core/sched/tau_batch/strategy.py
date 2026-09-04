@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from typing import Protocol
 
 from vllm.v1.core.sched.tau_batch.types import (
+    EosEvent,
     MicroBatchList,
     MicroBatchTask,
     PackContext,
@@ -35,6 +36,29 @@ class ListPackingStrategy(Protocol):
             A MicroBatchList. Empty ``tasks`` if nothing can be admitted.
         """
         ...
+
+
+class EosStrategy(Protocol):
+    """Runs when admitted requests finish (EOS or length cap).
+
+    The current implementation is a no-op. A later strategy can refill
+    the leftover list from waiting without exceeding the wave ceiling.
+    """
+
+    def on_eos(self, event: EosEvent) -> None:
+        """Handle one model step that finished one or more admitted requests.
+
+        Args:
+            event: Who finished, who remains on the list, and who is waiting.
+        """
+        ...
+
+
+class NoOpEosStrategy:
+    """Placeholder EOS hook. Does not refill or mutate the list."""
+
+    def on_eos(self, event: EosEvent) -> None:
+        return
 
 
 class GreedyListStrategy:

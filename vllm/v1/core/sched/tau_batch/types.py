@@ -81,6 +81,24 @@ class MicroBatchList:
     extra: Mapping[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class EosEvent:
+    """Admitted requests that finished in this model step.
+
+    Fired from ``update_from_output`` after the parent scheduler frees
+    those requests, while the active list is still set if anyone remains.
+    The default EOS strategy is a no-op; later refill can use
+    ``remaining_ids`` / ``waiting_ids`` without changing dispatch yet.
+    """
+
+    finished_ids: tuple[str, ...]
+    wave_id: int | None
+    batch_idx: int | None
+    phase: str | None
+    remaining_ids: tuple[str, ...]
+    waiting_ids: tuple[str, ...]
+
+
 # Older name kept so existing imports keep working.
 MicroBatchPlan = MicroBatchTask
 

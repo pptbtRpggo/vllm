@@ -4,10 +4,13 @@
 from collections.abc import Sequence
 
 from vllm.v1.core.sched.tau_batch.strategy import (
+    EosStrategy,
     GreedyListStrategy,
     ListPackingStrategy,
+    NoOpEosStrategy,
 )
 from vllm.v1.core.sched.tau_batch.types import (
+    EosEvent,
     MicroBatchList,
     PackContext,
     TauRequestSnapshot,
@@ -21,15 +24,30 @@ class TauBatchPlanner:
     The planner is stateless with respect to previous deferred ids: each call
     takes the current snapshot plus PackContext. admitted/deferred on the
     returned list record this call only. No wave id is assigned here.
+
+    ``on_eos`` forwards to ``eos_strategy``. The default hook is empty.
     """
 
-    def __init__(self, strategy: ListPackingStrategy | None = None) -> None:
+    def __init__(
+        self,
+        strategy: ListPackingStrategy | None = None,
+        eos_strategy: EosStrategy | None = None,
+    ) -> None:
         """Initialize the planner.
 
         Args:
             strategy: Packing strategy. Defaults to GreedyListStrategy.
+            eos_strategy: Hook after admitted requests finish. Defaults
+                to NoOpEosStrategy.
         """
         self.strategy = strategy if strategy is not None else GreedyListStrategy()
+        self.eos_strategy = (
+            eos_strategy if eos_strategy is not None else NoOpEosStrategy()
+        )
+
+    def on_eos(self, event: EosEvent) -> None:
+        """Forward an EOS event to ``eos_strategy``. Currently a no-op."""
+        self.eos_strategy.on_eos(event)
 
     def plan(
         self,

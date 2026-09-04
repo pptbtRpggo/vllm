@@ -9,10 +9,13 @@ from vllm.v1.core.sched.tau_batch.dispatch import (
 )
 from vllm.v1.core.sched.tau_batch.planner import TauBatchPlanner
 from vllm.v1.core.sched.tau_batch.strategy import (
+    EosStrategy,
     GreedyListStrategy,
     ListPackingStrategy,
+    NoOpEosStrategy,
 )
 from vllm.v1.core.sched.tau_batch.types import (
+    EosEvent,
     MicroBatchList,
     MicroBatchPlan,
     MicroBatchTask,
@@ -31,12 +34,15 @@ __all__ = [
     "DispatchPhase",
     "DispatchPolicy",
     "DispatchSlot",
+    "EosEvent",
+    "EosStrategy",
     "GreedyListStrategy",
     "ListDispatcher",
     "ListPackingStrategy",
     "MicroBatchList",
     "MicroBatchPlan",
     "MicroBatchTask",
+    "NoOpEosStrategy",
     "PackContext",
     "TaskFeatures",
     "TauBatchPlanner",

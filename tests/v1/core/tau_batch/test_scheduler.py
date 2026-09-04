@@ -377,6 +377,29 @@ def test_list_end_resets_dispatcher():
     assert sched.dispatcher.peek_slot() is None
 
 
+def test_eos_hook_runs_when_decode_finishes():
+    seen: list = []
+
+    class Capture:
+        def on_eos(self, event) -> None:
+            seen.append(event)
+
+    sched = _tau_scheduler()
+    sched.planner.eos_strategy = Capture()
+    _add_requests(sched, n=2, max_tokens=2)
+    pre = sched.schedule()
+    sched.update_from_output(pre, _sampled(pre))
+    assert seen == []
+    assert sched._list is not None
+    dec = sched.schedule()
+    assert set(dec.num_scheduled_tokens) == {"r0", "r1"}
+    sched.update_from_output(dec, _sampled(dec))
+    assert len(seen) == 1
+    assert set(seen[0].finished_ids) == {"r0", "r1"}
+    assert seen[0].remaining_ids == ()
+    assert seen[0].phase == "decode"
+
+
 def test_min_waiting_to_plan_holds_until_threshold():
     sched = _tau_scheduler(tau_batch_min_waiting=8)
     _add_requests(sched, n=4)

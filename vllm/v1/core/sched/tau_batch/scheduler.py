@@ -19,6 +19,7 @@ from vllm.v1.core.sched.tau_batch.dispatch import (
 from vllm.v1.core.sched.tau_batch.planner import TauBatchPlanner
 from vllm.v1.core.sched.tau_batch.trace import JsonlTracer, resolve_trace_path
 from vllm.v1.core.sched.tau_batch.types import (
+    EosEvent,
     MicroBatchList,
     PackContext,
     TaskFeatures,
@@ -242,6 +243,7 @@ class TauScheduler(Scheduler):
         inflight = self._inflight.pop(id(scheduler_output), None)
         if inflight is not None:
             slot, fwd_id, features, emit_mono_ns = inflight
+        prev_finished = set(self.finished_req_ids)
         result = super().update_from_output(scheduler_output, model_runner_output)
         if slot is not None and slot.phase is DispatchPhase.PREFILL:
             self.dispatcher.on_prefill_complete(slot.microbatch_index)
@@ -266,9 +268,61 @@ class TauScheduler(Scheduler):
                 duration_ms=duration_ms,
                 **features,
             )
+        self._maybe_run_eos_hook(slot, scheduler_output, prev_finished)
         if self._list is not None and not self._admitted_unfinished():
             self._clear_list()
         return result
+
+    def _maybe_run_eos_hook(
+        self,
+        slot: DispatchSlot | None,
+        scheduler_output: SchedulerOutput,
+        prev_finished: set[str],
+    ) -> None:
+        """Run the EOS strategy if this step finished admitted requests.
+
+        The default strategy is a no-op. Called before the list is cleared
+        so a later refill can still see remaining admitted ids.
+        """
+        if self._list is None:
+            return
+        finished_ids = tuple(
+            sorted(
+                (self.finished_req_ids - prev_finished)
+                & set(scheduler_output.num_scheduled_tokens)
+                & self._list.admitted_ids
+            )
+        )
+        if not finished_ids:
+            return
+        remaining_ids = tuple(
+            sorted(
+                rid
+                for rid in self._list.admitted_ids
+                if rid not in finished_ids
+                and (req := self.requests.get(rid)) is not None
+                and not req.is_finished()
+            )
+        )
+        waiting_ids = tuple(req.request_id for req in self.waiting)
+        event = EosEvent(
+            finished_ids=finished_ids,
+            wave_id=self._wave_id,
+            batch_idx=None if slot is None else slot.microbatch_index,
+            phase=None if slot is None else slot.phase.value,
+            remaining_ids=remaining_ids,
+            waiting_ids=waiting_ids,
+        )
+        self._trace(
+            "eos",
+            wave_id=event.wave_id,
+            batch_idx=event.batch_idx,
+            phase=event.phase,
+            finished_ids=list(event.finished_ids),
+            remaining_ids=list(event.remaining_ids),
+            waiting_ids=list(event.waiting_ids),
+        )
+        self.planner.on_eos(event)
 
     def _clear_list(self) -> None:
         if self._wave_id is not None:

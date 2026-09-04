@@ -4,8 +4,10 @@
 import pytest
 
 from vllm.v1.core.sched.tau_batch import (
+    EosEvent,
     GreedyListStrategy,
     MicroBatchList,
+    NoOpEosStrategy,
     PackContext,
     TauBatchPlanner,
     TauRequestSnapshot,
@@ -119,6 +121,36 @@ def test_planner_annotates_budgets_before_pack():
     assert capture.seen[0].wait_ms == 250.0
     assert capture.seen[0].ttft_slack_ms == -50.0
     assert capture.seen[0].tau_max_ms == 40.0
+
+
+def _eos_event(*finished: str, remaining: tuple[str, ...] = ()) -> EosEvent:
+    return EosEvent(
+        finished_ids=finished,
+        wave_id=0,
+        batch_idx=0,
+        phase="decode",
+        remaining_ids=remaining,
+        waiting_ids=("late",),
+    )
+
+
+def test_default_eos_strategy_is_noop():
+    planner = TauBatchPlanner()
+    assert isinstance(planner.eos_strategy, NoOpEosStrategy)
+    planner.on_eos(_eos_event("r0"))
+
+
+def test_planner_forwards_eos_to_strategy():
+    seen: list[EosEvent] = []
+
+    class Capture:
+        def on_eos(self, event: EosEvent) -> None:
+            seen.append(event)
+
+    planner = TauBatchPlanner(eos_strategy=Capture())
+    event = _eos_event("r0", remaining=("r1",))
+    planner.on_eos(event)
+    assert seen == [event]
 
 
 def test_empty_snapshot_returns_none():
