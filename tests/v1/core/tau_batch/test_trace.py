@@ -8,7 +8,7 @@ import pytest
 
 from tests.v1.core.tau_batch.test_batch_queue import _QueueCore
 from tests.v1.core.tau_batch.test_scheduler import (
-    _add_wave,
+    _add_requests,
     _sampled,
     _tau_scheduler,
 )
@@ -30,7 +30,7 @@ def _events(path: Path) -> list[dict]:
 def test_trace_writes_wave_emit_done(tmp_path: Path) -> None:
     path = tmp_path / "tau.jsonl"
     sched = _tau_scheduler(tau_batch_trace=str(path))
-    _add_wave(sched)
+    _add_requests(sched)
     pre0 = sched.schedule()
     pre1 = sched.schedule()
     assert pre0.tau_fwd_id == 1
@@ -57,7 +57,7 @@ def test_trace_not_created_until_first_write(tmp_path: Path) -> None:
     sched = _tau_scheduler(tau_batch_trace=str(path))
     assert sched._tracer is not None
     assert not path.exists()
-    _add_wave(sched)
+    _add_requests(sched)
     assert not path.exists()
     sched.schedule()
     assert path.exists()
@@ -67,7 +67,7 @@ def test_trace_not_created_until_first_write(tmp_path: Path) -> None:
 def test_trace_recreates_after_delete(tmp_path: Path) -> None:
     path = tmp_path / "rotate.jsonl"
     sched = _tau_scheduler(tau_batch_trace=str(path))
-    _add_wave(sched)
+    _add_requests(sched)
     first = sched.schedule()
     assert path.exists()
     path.unlink()
@@ -97,7 +97,7 @@ def test_worker_reopens_after_driver_recreates(tmp_path: Path) -> None:
 
 def test_trace_off_writes_nothing(tmp_path: Path) -> None:
     sched = _tau_scheduler()
-    _add_wave(sched)
+    _add_requests(sched)
     sched.schedule()
     assert list(tmp_path.iterdir()) == []
     assert sched._tracer is None
@@ -106,7 +106,7 @@ def test_trace_off_writes_nothing(tmp_path: Path) -> None:
 def test_trace_queue_events_from_batch_queue(tmp_path: Path) -> None:
     path = tmp_path / "q.jsonl"
     sched = _tau_scheduler(tau_batch_trace=str(path))
-    _add_wave(sched, n=4, max_tokens=2)
+    _add_requests(sched, n=4, max_tokens=2)
     core = _QueueCore(sched, queue_size=2)
     core.step_with_batch_queue()
     core.step_with_batch_queue()

@@ -8,7 +8,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class TauRequestSnapshot:
-    """Waiting-queue snapshot of one request for wave planning.
+    """Waiting-queue snapshot of one request for list packing.
 
     This is independent of ``vllm.v1.request.Request`` so the planner can be
     unit-tested and later reused by a scheduler adapter.
@@ -32,15 +32,16 @@ class TauRequestSnapshot:
 
 
 @dataclass(frozen=True)
-class MicroBatchPlan:
-    """One ordered micro-batch in a wave.
+class MicroBatchTask:
+    """One micro-batch task: n request tasks of the same phase.
 
-    ``index`` is the dispatch position. After construction the request order
-    inside ``req_ids`` must not be reshuffled.
+    At dispatch time this becomes n prefills or n decodes together. ``index``
+    is the position in the list. After construction ``req_ids`` must not be
+    reshuffled.
 
     Attributes:
-        req_ids: Request ids in this micro-batch, in stable order.
-        index: Zero-based dispatch index in the wave.
+        req_ids: The n request ids in this micro-batch task, in stable order.
+        index: Zero-based index in the micro-batch-task list.
     """
 
     req_ids: tuple[str, ...]
@@ -48,50 +49,51 @@ class MicroBatchPlan:
 
 
 @dataclass(frozen=True)
-class WavePlan:
-    """Result of one ``plan_wave`` call on a waiting snapshot.
+class MicroBatchList:
+    """Packed micro-batch-task list.
 
-    ``admitted_ids`` / ``deferred_ids`` record this wave only. The next wave
-    is planned from a fresh waiting snapshot; do not concatenate deferred ids
-    with new arrivals.
+    ``admitted_ids`` / ``deferred_ids`` record this pack call only.
+    A wave id is stamped later, when dispatch starts.
 
     Attributes:
-        wave_id: Monotonic id assigned by TauBatchPlanner.
-        microbatches: Dispatch-ordered micro-batches. Union of req_ids equals
+        tasks: Dispatch-ordered micro-batch tasks. Union of req_ids equals
             admitted_ids.
-        admitted_ids: Requests packed into this wave.
+        admitted_ids: Requests packed into this list.
         deferred_ids: Requests seen in the snapshot but not packed.
-        extra: Strategy-private metadata (e.g. strategy name). Not an input
-            to the next plan_wave call.
+        extra: Strategy-private metadata. Not an input to the next pack call.
     """
 
-    wave_id: int
-    microbatches: tuple[MicroBatchPlan, ...]
+    tasks: tuple[MicroBatchTask, ...]
     admitted_ids: frozenset[str]
     deferred_ids: frozenset[str]
     extra: Mapping[str, Any] = field(default_factory=dict)
 
 
+# Older name kept so existing imports keep working.
+MicroBatchPlan = MicroBatchTask
+
+
 @dataclass(frozen=True)
 class PackContext:
-    """Shared packing limits for one plan_wave call.
+    """Shared packing limits for one pack call.
 
-    Request-level SLOs live on TauRequestSnapshot. PackContext is the
-    system-level capacity for this snapshot.
+    Request-level SLOs live on TauRequestSnapshot. The default greedy
+    strategy uses the caps below (take then split). A later paper
+    strategy can use the SLOs and ``oracle``.
 
     Attributes:
         now: Current timestamp in seconds (same clock as arrival_time).
         max_num_seqs: Take at most this many from the waiting snapshot.
-        max_microbatches: Then pack at most this many micro-batches.
-        max_reqs_per_microbatch: Max requests in one micro-batch. Not
+        max_microbatches: Then pack at most this many micro-batch tasks.
+        max_reqs_per_microbatch: Max n in one micro-batch task. Not
             derived from max_num_seqs or max_microbatches. Overflow is
             deferred; a short take is packed as-is.
         pp_size: Pipeline-parallel size. Reserved for later strategies.
-        kv_free_blocks: Free KV blocks at plan time. None disables the
+        kv_free_blocks: Free KV blocks at pack time. None disables the
             KV filter.
         block_size: Tokens per KV block. Required when kv_free_blocks is set.
-        max_num_batched_tokens: Unused. The paper does not cap tokens per
-            batch; kept so older callers still construct PackContext.
+        max_num_batched_tokens: Unused. Kept so older callers still construct
+            PackContext.
         oracle: Latency oracle. Reserved for later strategies.
     """
 

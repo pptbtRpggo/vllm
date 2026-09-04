@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -19,8 +20,8 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.tau_batch.dispatch import (
     DispatchPhase,
-    WaveDispatcher,
-    WaveDispatchPolicy,
+    DispatchPolicy,
+    ListDispatcher,
 )
 from vllm.v1.core.sched.tau_batch.scheduler import TauScheduler
 from vllm.v1.kv_cache_interface import (
@@ -120,7 +121,7 @@ def _req(
     *,
     tpot_slo_ms: float,
     prompt_len: int = 8,
-    arrival_time: float = 0.0,
+    arrival_time: float | None = None,
     max_tokens: int = 4,
 ) -> Request:
     global _none_hash_initialized
@@ -142,19 +143,18 @@ def _req(
         sampling_params=sampling_params,
         pooling_params=None,
         eos_token_id=EOS_TOKEN_ID,
-        arrival_time=arrival_time,
+        arrival_time=time.time() if arrival_time is None else arrival_time,
         block_hasher=get_request_block_hasher(16, sha256),
     )
 
 
-def _add_wave(
+def _add_requests(
     sched: TauScheduler, n: int = 4, max_tokens: int = 4
 ) -> list[Request]:
     reqs = [
         _req(
             f"r{i}",
             tpot_slo_ms=10.0 * (i + 1),
-            arrival_time=float(i),
             max_tokens=max_tokens,
         )
         for i in range(n)
@@ -178,7 +178,7 @@ def _sampled(scheduler_output, token_id: int = 1) -> ModelRunnerOutput:
 
 def test_prefill_holdback_exposes_one_microbatch():
     sched = _tau_scheduler()
-    _add_wave(sched)
+    _add_requests(sched)
     out = sched.schedule()
     assert set(out.num_scheduled_tokens) == {"r0", "r1"}
     assert out.total_num_scheduled_tokens == 16
@@ -191,7 +191,7 @@ def test_prefill_holdback_exposes_one_microbatch():
 
 def test_second_prefill_does_not_mix_first_batch():
     sched = _tau_scheduler()
-    _add_wave(sched)
+    _add_requests(sched)
     first = sched.schedule()
     second = sched.schedule()
     assert set(first.num_scheduled_tokens) == {"r0", "r1"}
@@ -202,7 +202,7 @@ def test_second_prefill_does_not_mix_first_batch():
 
 def test_peek_none_before_prefill_complete_does_not_commit_decode():
     sched = _tau_scheduler()
-    _add_wave(sched)
+    _add_requests(sched)
     sched.schedule()
     sched.schedule()
     empty = sched.schedule()
@@ -213,7 +213,7 @@ def test_peek_none_before_prefill_complete_does_not_commit_decode():
 
 def test_overlap_decode_after_own_prefill_complete():
     sched = _tau_scheduler()
-    _add_wave(sched)
+    _add_requests(sched)
     pre0 = sched.schedule()
     pre1 = sched.schedule()
     sched.update_from_output(pre0, _sampled(pre0))
@@ -244,7 +244,7 @@ def _assert_running_sends_block_delta(sched: TauScheduler, out, req_id: str) -> 
 
 def test_cached_decode_sends_only_new_kv_blocks():
     sched = _tau_scheduler()
-    _add_wave(sched, max_tokens=32)
+    _add_requests(sched, max_tokens=32)
     pre0 = sched.schedule()
     pre1 = sched.schedule()
     sched.update_from_output(pre0, _sampled(pre0))
@@ -262,8 +262,8 @@ def test_cached_decode_sends_only_new_kv_blocks():
 
 def test_drain_waits_for_all_prefill_completes():
     sched = _tau_scheduler()
-    sched.dispatcher = WaveDispatcher(WaveDispatchPolicy.DRAIN)
-    _add_wave(sched)
+    sched.dispatcher = ListDispatcher(DispatchPolicy.DRAIN)
+    _add_requests(sched)
     pre0 = sched.schedule()
     pre1 = sched.schedule()
     sched.update_from_output(pre0, _sampled(pre0))
@@ -274,11 +274,11 @@ def test_drain_waits_for_all_prefill_completes():
     assert set(dec.num_scheduled_tokens) == {"r0", "r1"}
 
 
-def test_new_arrival_does_not_join_active_wave():
+def test_new_arrival_does_not_join_active_list():
     sched = _tau_scheduler()
-    _add_wave(sched)
+    _add_requests(sched)
     pre0 = sched.schedule()
-    extra = _req("late", tpot_slo_ms=1.0, arrival_time=99.0)
+    extra = _req("late", tpot_slo_ms=1.0)
     sched.add_request(extra)
     pre1 = sched.schedule()
     assert "late" not in pre1.num_scheduled_tokens
@@ -295,7 +295,7 @@ def test_new_arrival_does_not_join_active_wave():
 
 def test_allocate_fail_drops_request_and_continues():
     sched = _tau_scheduler()
-    _add_wave(sched, n=2)
+    _add_requests(sched, n=2)
     real = sched.kv_cache_manager.allocate_slots
     calls = {"n": 0}
 
@@ -315,7 +315,7 @@ def test_allocate_fail_drops_request_and_continues():
 
 def test_allocate_fail_all_returns_empty():
     sched = _tau_scheduler()
-    _add_wave(sched, n=2)
+    _add_requests(sched, n=2)
     with patch.object(sched.kv_cache_manager, "allocate_slots", return_value=None):
         empty = sched.schedule()
     assert empty.total_num_scheduled_tokens == 0
@@ -354,44 +354,48 @@ def test_disabled_long_prefill_does_not_cap_tokens():
         enable_chunked_prefill=True,
         long_prefill_token_threshold=4,
     )
-    _add_wave(sched, n=2)
+    _add_requests(sched, n=2)
     out = sched.schedule()
     assert set(out.num_scheduled_tokens) == {"r0", "r1"}
     assert all(n == 8 for n in out.num_scheduled_tokens.values())
     assert out.total_num_scheduled_tokens == 16
 
 
-def test_wave_end_resets_dispatcher():
+def test_list_end_resets_dispatcher():
     sched = _tau_scheduler()
-    _add_wave(sched, n=2)
+    _add_requests(sched, n=2)
     out = sched.schedule()
-    assert sched._wave is not None
+    assert sched._list is not None
+    assert sched._wave_id == 0
     for rid in out.num_scheduled_tokens:
         sched.finish_requests(rid, RequestStatus.FINISHED_ABORTED)
     empty = sched.schedule()
     assert empty.total_num_scheduled_tokens == 0
-    assert sched._wave is None
-    assert sched.dispatcher.plan is None
+    assert sched._list is None
+    assert sched._wave_id is None
+    assert sched.dispatcher.active_list is None
     assert sched.dispatcher.peek_slot() is None
 
 
 def test_min_waiting_to_plan_holds_until_threshold():
     sched = _tau_scheduler(tau_batch_min_waiting=8)
-    _add_wave(sched, n=4)
+    _add_requests(sched, n=4)
     empty = sched.schedule()
     assert empty.total_num_scheduled_tokens == 0
-    assert sched._wave is None
+    assert sched._list is None
+    assert sched._wave_id is None
     assert len(sched.waiting) == 4
     extra = [
-        _req(f"r{i}", tpot_slo_ms=10.0 * (i + 1), arrival_time=float(i))
+        _req(f"r{i}", tpot_slo_ms=10.0 * (i + 1))
         for i in range(4, 8)
     ]
     for req in extra:
         sched.add_request(req)
     out = sched.schedule()
     assert out.total_num_scheduled_tokens > 0
-    assert sched._wave is not None
-    assert len(sched._wave.admitted_ids) + len(sched._wave.deferred_ids) == 8
+    assert sched._list is not None
+    assert sched._wave_id == 0
+    assert len(sched._list.admitted_ids) + len(sched._list.deferred_ids) == 8
 
 
 def test_pack_context_does_not_derive_size_from_p():

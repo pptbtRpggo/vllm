@@ -8,10 +8,10 @@ set -euo pipefail
 #   ./serve_tau.sh /path/or/hf-id
 #
 # Packing (take then split; overflow deferred, no padding):
-#   MAX_NUM_SEQS          wave take cap          default 32
-#   MAX_REQS_PER_MB       per micro-batch cap    default 4
-#   MAX_MICROBATCHES      P; 0 = ceil(take/size) default 0 → 8
-#   MIN_WAITING           plan_wave threshold    default = MAX_NUM_SEQS
+#   MAX_NUM_SEQS          take cap               default 32
+#   MAX_REQS_PER_MB       n cap per task         default 4
+#   MAX_MICROBATCHES      P; 0 = ceil(take/n)    default 0 → 8
+#   MIN_WAITING           plan threshold         default = MAX_NUM_SEQS
 #
 # Trace is created on the first write. Delete the JSONL to start a new run
 # without restarting serve.

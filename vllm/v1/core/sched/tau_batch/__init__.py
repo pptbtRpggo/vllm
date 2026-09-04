@@ -3,37 +3,39 @@
 
 from vllm.v1.core.sched.tau_batch.dispatch import (
     DispatchPhase,
+    DispatchPolicy,
     DispatchSlot,
-    WaveDispatcher,
-    WaveDispatchPolicy,
+    ListDispatcher,
 )
 from vllm.v1.core.sched.tau_batch.planner import TauBatchPlanner
 from vllm.v1.core.sched.tau_batch.strategy import (
-    GreedyWaveStrategy,
-    WavePackingStrategy,
+    GreedyListStrategy,
+    ListPackingStrategy,
 )
 from vllm.v1.core.sched.tau_batch.types import (
+    MicroBatchList,
     MicroBatchPlan,
+    MicroBatchTask,
     PackContext,
     TauRequestSnapshot,
-    WavePlan,
     estimate_kv_blocks,
 )
 
 __all__ = [
     "DispatchPhase",
+    "DispatchPolicy",
     "DispatchSlot",
-    "GreedyWaveStrategy",
+    "GreedyListStrategy",
+    "ListDispatcher",
+    "ListPackingStrategy",
+    "MicroBatchList",
     "MicroBatchPlan",
+    "MicroBatchTask",
     "PackContext",
     "TauBatchPlanner",
     "TauRequestSnapshot",
     "estimate_kv_blocks",
     "TauScheduler",
-    "WaveDispatcher",
-    "WaveDispatchPolicy",
-    "WavePackingStrategy",
-    "WavePlan",
     "snapshot_from_request",
 ]
 

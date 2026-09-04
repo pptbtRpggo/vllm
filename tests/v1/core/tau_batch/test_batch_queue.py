@@ -18,11 +18,11 @@ from dataclasses import dataclass
 import pytest
 
 from tests.v1.core.tau_batch.test_scheduler import (
-    _add_wave,
+    _add_requests,
     _sampled,
     _tau_scheduler,
 )
-from vllm.v1.core.sched.tau_batch.dispatch import DispatchPhase, WaveDispatchPolicy
+from vllm.v1.core.sched.tau_batch.dispatch import DispatchPhase, DispatchPolicy
 from vllm.v1.core.sched.tau_batch.scheduler import TauScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine.core import EngineCore
@@ -123,7 +123,7 @@ class _QueueCore:
 
 def _run_queue(
     *,
-    policy: WaveDispatchPolicy,
+    policy: DispatchPolicy,
     queue_size: int,
     n_req: int = 4,
     max_tokens: int = 2,
@@ -135,7 +135,7 @@ def _run_queue(
         pipeline_parallel_size=2,
     )
     sched.dispatcher = sched.dispatcher.__class__(policy)
-    _add_wave(sched, n=n_req, max_tokens=max_tokens)
+    _add_requests(sched, n=n_req, max_tokens=max_tokens)
     core = _QueueCore(sched, queue_size)
     traces: list[QueueStep] = []
     for step in range(max_steps):
@@ -180,7 +180,7 @@ def _run_queue(
 
 def test_overlap_fills_then_pops_oldest_prefill():
     traces = _run_queue(
-        policy=WaveDispatchPolicy.OVERLAP, queue_size=2, max_tokens=2
+        policy=DispatchPolicy.OVERLAP, queue_size=2, max_tokens=2
     )
     assert traces[0].action == "fill"
     assert traces[0].scheduled == "B0_pre"
@@ -193,7 +193,7 @@ def test_overlap_fills_then_pops_oldest_prefill():
 
 def test_drain_zero_token_does_not_enqueue():
     traces = _run_queue(
-        policy=WaveDispatchPolicy.DRAIN, queue_size=2, max_tokens=2
+        policy=DispatchPolicy.DRAIN, queue_size=2, max_tokens=2
     )
     assert [t.scheduled for t in traces[:2]] == ["B0_pre", "B1_pre"]
     wait_steps = [t for t in traces[2:] if t.action == "wait/pop"]

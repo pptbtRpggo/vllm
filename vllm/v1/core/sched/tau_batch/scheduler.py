@@ -12,16 +12,16 @@ from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.sched.tau_batch.dispatch import (
     DispatchPhase,
+    DispatchPolicy,
     DispatchSlot,
-    WaveDispatcher,
-    WaveDispatchPolicy,
+    ListDispatcher,
 )
 from vllm.v1.core.sched.tau_batch.planner import TauBatchPlanner
 from vllm.v1.core.sched.tau_batch.trace import JsonlTracer, resolve_trace_path
 from vllm.v1.core.sched.tau_batch.types import (
+    MicroBatchList,
     PackContext,
     TauRequestSnapshot,
-    WavePlan,
     estimate_kv_blocks,
 )
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
@@ -38,15 +38,15 @@ _DEFAULT_TPOT_SLO_MS = 100.0
 def _resolve_max_microbatches(
     configured: int, max_num_seqs: int, max_reqs_per_microbatch: int
 ) -> int:
-    """Return P. 0 means enough batches to hold one full wave at the
-    per-micro-batch size. Per-batch size is never derived from P.
+    """Return P. 0 means enough tasks to hold one full take at the
+    per-task size. Per-task n is never derived from P.
     """
     if configured >= 1:
         return configured
     return max(1, cdiv(max_num_seqs, max_reqs_per_microbatch))
 
 
-def _enforce_wave_runtime_contract(vllm_config: VllmConfig) -> None:
+def _enforce_slot_runtime_contract(vllm_config: VllmConfig) -> None:
     """Turn off features that split one Prefill slot across forwards.
 
     Tau-batch treats one ``schedule()`` as one complete Prefill or Decode
@@ -95,7 +95,7 @@ def snapshot_from_request(request: Request) -> TauRequestSnapshot:
         request: Scheduler request. Must not be modified.
 
     Returns:
-        A TauRequestSnapshot for plan_wave.
+        A TauRequestSnapshot for plan.
     """
     extra: dict[str, Any] = {}
     if request.sampling_params is not None and request.sampling_params.extra_args:
@@ -111,16 +111,17 @@ def snapshot_from_request(request: Request) -> TauRequestSnapshot:
 
 
 class TauScheduler(Scheduler):
-    """Wave-aware scheduler: one DispatchSlot per schedule() call.
+    """List-aware scheduler: one DispatchSlot per schedule() call.
 
-    plan_wave reserves KV for prompt plus max generate length. This
-    class allocates that exact micro-batch and builds SchedulerOutput
-    itself; it does not call Scheduler.schedule(). If allocate_slots
-    fails for one request, that request is finished with ERROR and the
-    next request in the slot is tried.
+    The planner uses take-then-split to build a micro-batch-task list.
+    This class stamps a wave id when dispatch starts, then allocates that
+    exact task and builds SchedulerOutput itself; it does not call
+    Scheduler.schedule(). If allocate_slots fails for one request, that
+    request is finished with ERROR and the next request in the slot is
+    tried.
 
     on_prefill_complete is recorded in update_from_output, not schedule().
-    New arrivals stay in waiting until the active wave has no unfinished
+    New arrivals stay in waiting until the active list has no unfinished
     admitted requests.
 
     ``__init__`` disables chunked prefill, prefix caching, long-prefill
@@ -134,10 +135,10 @@ class TauScheduler(Scheduler):
             vllm_config = args[0]
         if vllm_config is None:
             raise TypeError("TauScheduler requires vllm_config")
-        _enforce_wave_runtime_contract(vllm_config)
+        _enforce_slot_runtime_contract(vllm_config)
         super().__init__(*args, **kwargs)
         self.planner = TauBatchPlanner()
-        self.dispatcher = WaveDispatcher(WaveDispatchPolicy.OVERLAP)
+        self.dispatcher = ListDispatcher(DispatchPolicy.OVERLAP)
         self.max_reqs_per_microbatch = (
             self.scheduler_config.tau_batch_max_reqs_per_microbatch
         )
@@ -147,7 +148,9 @@ class TauScheduler(Scheduler):
             self.max_reqs_per_microbatch,
         )
         self.min_waiting_to_plan = self.scheduler_config.tau_batch_min_waiting
-        self._wave: WavePlan | None = None
+        self._list: MicroBatchList | None = None
+        self._wave_id: int | None = None
+        self._next_wave_id = 0
         self._inflight: dict[int, tuple[DispatchSlot, int]] = {}
         trace_path = resolve_trace_path(self.scheduler_config.tau_batch_trace)
         self._tracer: JsonlTracer | None = None
@@ -159,14 +162,14 @@ class TauScheduler(Scheduler):
             )
         logger.warning(
             "TauScheduler: take at most %d waiting, pack size <= %d, "
-            "at most %d micro-batches (overflow deferred, no padding).",
+            "at most %d micro-batch tasks (overflow deferred, no padding).",
             self.max_num_running_reqs,
             self.max_reqs_per_microbatch,
             self.max_microbatches,
         )
         if self.min_waiting_to_plan > 0:
             logger.warning(
-                "TauScheduler: plan_wave waits for %d waiting requests "
+                "TauScheduler: plan waits for %d waiting requests "
                 "(--tau-batch-min-waiting). Set 0 to plan immediately.",
                 self.min_waiting_to_plan,
             )
@@ -188,13 +191,13 @@ class TauScheduler(Scheduler):
 
     def schedule(self) -> SchedulerOutput:
         for _ in range(2):
-            self._maybe_start_wave()
-            if self._wave is None:
+            self._maybe_start_list()
+            if self._list is None:
                 return SchedulerOutput.make_empty()
             slot, allowed = self._next_slot()
             if slot is None:
                 if not self._admitted_unfinished():
-                    self._clear_wave()
+                    self._clear_list()
                     continue
                 return SchedulerOutput.make_empty()
             return self._schedule_slot(slot, allowed)
@@ -217,25 +220,26 @@ class TauScheduler(Scheduler):
             self._trace(
                 "done",
                 fwd_id=fwd_id,
-                wave_id=self._wave.wave_id if self._wave is not None else None,
+                wave_id=self._wave_id,
                 batch_idx=slot.microbatch_index,
                 phase=slot.phase.value,
                 req_ids=list(scheduler_output.num_scheduled_tokens),
             )
-        if self._wave is not None and not self._admitted_unfinished():
-            self._clear_wave()
+        if self._list is not None and not self._admitted_unfinished():
+            self._clear_list()
         return result
 
-    def _clear_wave(self) -> None:
-        if self._wave is not None:
-            self._trace("wave_end", wave_id=self._wave.wave_id)
-        self._wave = None
+    def _clear_list(self) -> None:
+        if self._wave_id is not None:
+            self._trace("wave_end", wave_id=self._wave_id)
+        self._list = None
+        self._wave_id = None
         self.dispatcher.reset()
 
-    def _maybe_start_wave(self) -> None:
-        if self._wave is not None and self._admitted_unfinished():
+    def _maybe_start_list(self) -> None:
+        if self._list is not None and self._admitted_unfinished():
             return
-        self._clear_wave()
+        self._clear_list()
         self._drop_unfittable_waiting()
         snapshots = self._waiting_snapshot()
         if not snapshots:
@@ -245,24 +249,26 @@ class TauScheduler(Scheduler):
             and len(snapshots) < self.min_waiting_to_plan
         ):
             return
-        plan = self.planner.plan_wave(snapshots, self._pack_context())
-        if plan is None:
+        packed = self.planner.plan(snapshots, self._pack_context())
+        if packed is None:
             return
-        self._wave = plan
-        self.dispatcher.start(plan)
+        self._list = packed
+        self._wave_id = self._next_wave_id
+        self._next_wave_id += 1
+        self.dispatcher.start(packed)
         self._trace(
             "wave_plan",
-            wave_id=plan.wave_id,
-            batches=[list(mb.req_ids) for mb in plan.microbatches],
-            deferred_ids=sorted(plan.deferred_ids),
+            wave_id=self._wave_id,
+            batches=[list(task.req_ids) for task in packed.tasks],
+            deferred_ids=sorted(packed.deferred_ids),
             waiting=len(snapshots),
             pp_size=self.parallel_config.pipeline_parallel_size,
             policy=self.dispatcher.policy.value,
         )
 
     def _next_slot(self) -> tuple[DispatchSlot | None, set[str]]:
-        assert self._wave is not None
-        p = len(self._wave.microbatches)
+        assert self._list is not None
+        p = len(self._list.tasks)
         skips = 0
         while skips < p:
             slot = self.dispatcher.peek_slot()
@@ -278,10 +284,10 @@ class TauScheduler(Scheduler):
     def _schedule_slot(
         self, slot: DispatchSlot, allowed: set[str]
     ) -> SchedulerOutput:
-        assert self._wave is not None
+        assert self._list is not None
         reqs = [
             self.requests[rid]
-            for rid in self._wave.microbatches[slot.microbatch_index].req_ids
+            for rid in self._list.tasks[slot.microbatch_index].req_ids
             if rid in allowed
         ]
         scheduled_new: list[Request] = []
@@ -349,7 +355,7 @@ class TauScheduler(Scheduler):
         self._trace(
             "emit",
             fwd_id=fwd_id,
-            wave_id=self._wave.wave_id,
+            wave_id=self._wave_id,
             batch_idx=slot.microbatch_index,
             phase=slot.phase.value,
             req_ids=list(num_scheduled_tokens),
@@ -508,8 +514,8 @@ class TauScheduler(Scheduler):
         )
 
     def _alive_ids(self, slot: DispatchSlot) -> set[str]:
-        assert self._wave is not None
-        ids = self._wave.microbatches[slot.microbatch_index].req_ids
+        assert self._list is not None
+        ids = self._list.tasks[slot.microbatch_index].req_ids
         alive: set[str] = set()
         for rid in ids:
             req = self.requests.get(rid)
@@ -518,9 +524,9 @@ class TauScheduler(Scheduler):
         return alive
 
     def _admitted_unfinished(self) -> bool:
-        if self._wave is None:
+        if self._list is None:
             return False
-        for rid in self._wave.admitted_ids:
+        for rid in self._list.admitted_ids:
             req = self.requests.get(rid)
             if req is not None and not req.is_finished():
                 return True

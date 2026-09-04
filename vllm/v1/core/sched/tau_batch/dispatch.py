@@ -4,10 +4,10 @@
 from dataclasses import dataclass
 from enum import Enum
 
-from vllm.v1.core.sched.tau_batch.types import WavePlan
+from vllm.v1.core.sched.tau_batch.types import MicroBatchList
 
 
-class WaveDispatchPolicy(Enum):
+class DispatchPolicy(Enum):
     """When Decode slots may be offered after Prefill fill.
 
     OVERLAP (default): a micro-batch may Decode as soon as its own Prefill
@@ -31,7 +31,7 @@ class DispatchSlot:
     """One micro-batch to expose to a single schedule() call.
 
     Attributes:
-        microbatch_index: Index into WavePlan.microbatches.
+        microbatch_index: Index into MicroBatchList.tasks.
         phase: Prefill the whole prompt, or decode one step.
     """
 
@@ -39,8 +39,11 @@ class DispatchSlot:
     phase: DispatchPhase
 
 
-class WaveDispatcher:
-    """Issues ordered Prefill then cyclic Decode for one WavePlan.
+class ListDispatcher:
+    """Issues ordered Prefill then cyclic Decode for one MicroBatchList.
+
+    Each task is issued first as n prefills, then as n decodes. A wave id
+    is not stored here; the scheduler stamps that label at dispatch start.
 
     peek_slot does not advance. commit_slot advances only after the caller
     actually scheduled that slot. on_prefill_complete records that a
@@ -52,49 +55,49 @@ class WaveDispatcher:
     """
 
     def __init__(
-        self, policy: WaveDispatchPolicy = WaveDispatchPolicy.OVERLAP
+        self, policy: DispatchPolicy = DispatchPolicy.OVERLAP
     ) -> None:
         self.policy = policy
-        self._plan: WavePlan | None = None
+        self._list: MicroBatchList | None = None
         self._prefills_committed = 0
         self._prefill_done: set[int] = set()
         self._decode_cursor = 0
 
-    def start(self, plan: WavePlan) -> None:
-        """Begin dispatching ``plan``. Replaces any previous wave.
+    def start(self, packed: MicroBatchList) -> None:
+        """Begin dispatching ``packed``. Replaces any previous list.
 
         Args:
-            plan: Non-empty wave from TauBatchPlanner.plan_wave.
+            packed: Non-empty micro-batch-task list.
         """
-        if not plan.microbatches:
-            raise ValueError("WavePlan.microbatches must be non-empty")
-        self._plan = plan
+        if not packed.tasks:
+            raise ValueError("MicroBatchList.tasks must be non-empty")
+        self._list = packed
         self._prefills_committed = 0
         self._prefill_done = set()
         self._decode_cursor = 0
 
     def reset(self) -> None:
-        """Drop the active plan. peek_slot() is None until the next start()."""
-        self._plan = None
+        """Drop the active list. peek_slot() is None until the next start()."""
+        self._list = None
         self._prefills_committed = 0
         self._prefill_done = set()
         self._decode_cursor = 0
 
     @property
-    def plan(self) -> WavePlan | None:
-        return self._plan
+    def active_list(self) -> MicroBatchList | None:
+        return self._list
 
     def peek_slot(self) -> DispatchSlot | None:
         """Return the next slot without advancing.
 
         Returns:
             The slot to hold back to, or None if the caller must wait for
-            on_prefill_complete (not the end of the wave). None if start()
+            on_prefill_complete (not the end of the list). None if start()
             has not been called.
         """
-        if self._plan is None:
+        if self._list is None:
             return None
-        p = len(self._plan.microbatches)
+        p = len(self._list.tasks)
         if self._prefills_committed < p:
             return DispatchSlot(self._prefills_committed, DispatchPhase.PREFILL)
         if not self._decode_ready():
@@ -108,7 +111,7 @@ class WaveDispatcher:
             slot: Must equal the current peek_slot().
 
         Raises:
-            ValueError: No active plan, or slot is not the current peek.
+            ValueError: No active list, or slot is not the current peek.
         """
         expected = self.peek_slot()
         if expected is None:
@@ -118,9 +121,9 @@ class WaveDispatcher:
         if slot.phase is DispatchPhase.PREFILL:
             self._prefills_committed += 1
             return
-        plan = self._plan
-        assert plan is not None
-        self._decode_cursor = (slot.microbatch_index + 1) % len(plan.microbatches)
+        packed = self._list
+        assert packed is not None
+        self._decode_cursor = (slot.microbatch_index + 1) % len(packed.tasks)
 
     def on_prefill_complete(self, microbatch_index: int) -> None:
         """Record that Prefill for ``microbatch_index`` has finished.
@@ -129,16 +132,16 @@ class WaveDispatcher:
         before start(). Completes during Prefill fill do not offer Decode
         until every Prefill slot has been committed.
         """
-        if self._plan is None:
+        if self._list is None:
             return
-        p = len(self._plan.microbatches)
+        p = len(self._list.tasks)
         if 0 <= microbatch_index < p:
             self._prefill_done.add(microbatch_index)
 
     def _decode_ready(self) -> bool:
-        assert self._plan is not None
-        p = len(self._plan.microbatches)
-        if self.policy is WaveDispatchPolicy.DRAIN:
+        assert self._list is not None
+        p = len(self._list.tasks)
+        if self.policy is DispatchPolicy.DRAIN:
             if len(self._prefill_done) < p:
                 return False
         return self._decode_cursor in self._prefill_done

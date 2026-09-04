@@ -2,74 +2,64 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Sequence
-from dataclasses import replace
 
 from vllm.v1.core.sched.tau_batch.strategy import (
-    GreedyWaveStrategy,
-    WavePackingStrategy,
+    GreedyListStrategy,
+    ListPackingStrategy,
 )
 from vllm.v1.core.sched.tau_batch.types import (
+    MicroBatchList,
     PackContext,
     TauRequestSnapshot,
-    WavePlan,
 )
 
 
 class TauBatchPlanner:
-    """Plans a wave from a waiting-queue snapshot.
+    """Packs a waiting snapshot into a micro-batch-task list.
 
     The planner is stateless with respect to previous deferred ids: each call
     takes the current snapshot plus PackContext. admitted/deferred on the
-    returned WavePlan are a record of this call only.
+    returned list record this call only. No wave id is assigned here.
     """
 
-    def __init__(
-        self,
-        strategy: WavePackingStrategy | None = None,
-        *,
-        wave_id_start: int = 0,
-    ) -> None:
+    def __init__(self, strategy: ListPackingStrategy | None = None) -> None:
         """Initialize the planner.
 
         Args:
-            strategy: Packing strategy. Defaults to GreedyWaveStrategy.
-            wave_id_start: First wave_id to assign on a successful plan.
+            strategy: Packing strategy. Defaults to GreedyListStrategy.
         """
-        self.strategy = strategy if strategy is not None else GreedyWaveStrategy()
-        self._next_wave_id = wave_id_start
+        self.strategy = strategy if strategy is not None else GreedyListStrategy()
 
-    def plan_wave(
+    def plan(
         self,
         requests: Sequence[TauRequestSnapshot],
         ctx: PackContext,
-    ) -> WavePlan | None:
-        """Select a subset and pack it into ordered micro-batches.
+    ) -> MicroBatchList | None:
+        """Pack a micro-batch-task list from the waiting snapshot.
 
         Args:
             requests: Current waiting snapshot. Each request appears once.
-            ctx: Shared packing limits for this call.
+            ctx: System caps and clock for this call.
 
         Returns:
-            A WavePlan, or None if the snapshot is empty or nothing was
-            admitted.
+            A MicroBatchList, or None if the snapshot is empty or nothing
+            was admitted.
 
         Raises:
             ValueError: Invalid snapshot or PackContext, or the strategy
-                returned a plan that violates invariants.
+                returned a list that violates invariants.
         """
         self._validate_context(ctx)
         self._validate_requests(requests)
         if not requests:
             return None
 
-        raw = self.strategy.pack(requests, ctx)
-        if not raw.microbatches:
+        packed = self.strategy.pack(requests, ctx)
+        if not packed.tasks:
             return None
 
-        plan = replace(raw, wave_id=self._next_wave_id)
-        self._validate_plan(plan, requests, ctx)
-        self._next_wave_id += 1
-        return plan
+        self._validate_list(packed, requests, ctx)
+        return packed
 
     @staticmethod
     def _validate_context(ctx: PackContext) -> None:
@@ -126,17 +116,17 @@ class TauBatchPlanner:
                 )
 
     @staticmethod
-    def _validate_plan(
-        plan: WavePlan,
+    def _validate_list(
+        packed: MicroBatchList,
         requests: Sequence[TauRequestSnapshot],
         ctx: PackContext,
     ) -> None:
         input_ids = {req.request_id for req in requests}
-        admitted = plan.admitted_ids
-        deferred = plan.deferred_ids
+        admitted = packed.admitted_ids
+        deferred = packed.deferred_ids
 
-        if not plan.microbatches:
-            raise ValueError("WavePlan.microbatches must be non-empty")
+        if not packed.tasks:
+            raise ValueError("MicroBatchList.tasks must be non-empty")
         extra = admitted - input_ids
         if extra:
             raise ValueError(f"admitted_ids contains unknown ids: {sorted(extra)}")
@@ -147,33 +137,33 @@ class TauBatchPlanner:
         if admitted & deferred:
             raise ValueError("admitted_ids and deferred_ids must be disjoint")
 
-        packed: list[str] = []
-        packed_set: set[str] = set()
-        for i, batch in enumerate(plan.microbatches):
-            if batch.index != i:
+        seen: list[str] = []
+        seen_set: set[str] = set()
+        for i, task in enumerate(packed.tasks):
+            if task.index != i:
                 raise ValueError(
-                    f"microbatches[{i}].index must be {i}, got {batch.index}"
+                    f"tasks[{i}].index must be {i}, got {task.index}"
                 )
-            if not batch.req_ids:
-                raise ValueError(f"microbatches[{i}] must be non-empty")
-            if len(batch.req_ids) > ctx.max_reqs_per_microbatch:
+            if not task.req_ids:
+                raise ValueError(f"tasks[{i}] must be non-empty")
+            if len(task.req_ids) > ctx.max_reqs_per_microbatch:
                 raise ValueError(
-                    f"microbatches[{i}] has {len(batch.req_ids)} reqs, "
+                    f"tasks[{i}] has {len(task.req_ids)} reqs, "
                     f"max is {ctx.max_reqs_per_microbatch}"
                 )
-            for req_id in batch.req_ids:
-                if req_id in packed_set:
-                    raise ValueError(f"request {req_id} appears in multiple batches")
-                packed_set.add(req_id)
-                packed.append(req_id)
+            for req_id in task.req_ids:
+                if req_id in seen_set:
+                    raise ValueError(f"request {req_id} appears in multiple tasks")
+                seen_set.add(req_id)
+                seen.append(req_id)
 
-        if frozenset(packed) != admitted:
-            raise ValueError("union of microbatch req_ids must equal admitted_ids")
+        if frozenset(seen) != admitted:
+            raise ValueError("union of task req_ids must equal admitted_ids")
         if len(admitted) > ctx.max_num_seqs:
             raise ValueError(
                 f"admitted {len(admitted)} requests, max_num_seqs is {ctx.max_num_seqs}"
             )
-        if len(plan.microbatches) > ctx.max_microbatches:
+        if len(packed.tasks) > ctx.max_microbatches:
             raise ValueError(
-                f"{len(plan.microbatches)} microbatches, max is {ctx.max_microbatches}"
+                f"{len(packed.tasks)} tasks, max is {ctx.max_microbatches}"
             )
