@@ -180,3 +180,103 @@ python tools/tau_batch_run.py check-trace "$RUN_DIR/trace.jsonl" --pp 2
 本分支 ShareGPT sampler 默认过滤 prompt 大于 1024 tokens、prompt+output 大于 2048 tokens 的样本。
 因此即使服务设为 `MAX_MODEL_LEN=4096`，本流程也不会自然产生接近 4096 的上下文覆盖。
 更长上下文需要另行扩展采样器或采用可控长度数据，不能把本轮拟合结果直接视为全长度通用预测器。
+
+## 6. 全量分批采集与自动拟合
+
+共享 NFS 上的 JSONL 文件锁可能阻塞调度和 worker。长期采集时，启动服务前通过
+`TRACE=/tmp/tau_<唯一名称>.jsonl` 把实时 trace 放在服务器本地磁盘；
+不要移动、清空或替换运行中的 trace。下面的 campaign 会把每批已完成的区间备份到输出目录。
+
+在服务已经启动、smoke 通过且没有其他客户端请求的前提下运行：
+
+```bash
+cd /path/to/vllm
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+python tools/tau_batch_campaign.py "$RUN_DIR" \
+  --dataset "$PWD/datasets/sharegpt.json" \
+  --index-dir "$RUN_DIR/sharegpt_index_seed0" \
+  --output-dir "$RUN_DIR/campaign_all_01" \
+  --stage-layers 16 --shard-size 1000 --output-len 256 --concurrency 32 \
+  > "$RUN_DIR/campaign_all_01.log" 2>&1
+```
+
+这是长时间任务，可在已有 tmux 会话中运行。`--stage-layers 16` 仅适用于当前
+32 层模型、PP=2 且每个 stage 分配 16 层的情况，换模型或 PP 后必须核对。
+脚本不启动、不重启服务。输出目录必须是新目录，不会覆盖上次结果。
+索引目录首次使用时依据模型 tokenizer 生成；复用时核对数据集 SHA256、模型路径和 seed。
+
+“全量”指 sampler 可接受的全部原始行：使用前两轮对话，prompt 4–1024 tokens，
+输出固定 256 tokens、ignore EOS；不是重放整段多轮会话，也不是使用原回答长度。
+先按 seed 排列有效样本，再分为互不重叠的分片。每批只采一次正式数据，
+使用 `smoke` 模式跳过额外 warmup，但显式覆盖请求数和输出长度。
+已有首批正式采集可通过 `--adopt-report .../result_trace_check.json --adopt-count 1000`
+纳入；必须使用同一完整数据集、seed 和输出长度。
+`--await-exit` 可等待外部监督程序写入的、含 `returncode` 字段的退出 JSON。
+
+输出包含：
+
+- `status.json`：完成数、当前分片、状态及失败原因。
+- `manifest.json`、`source_indices.json`：运行配置、工具哈希、原始行编号。
+- `shard_*/trace.jsonl`、`trace_check.json`：每批校验通过的正式区间，已重定位字节偏移。
+- `shard_*/parameters.json`：每批每个 PP rank 的 prefill/decode 拟合结果。
+- `parameters_all.json`：全量完成后的合并拟合。
+
+失败会停止，不自动重放部分成功的分片。可创建 `campaign_all_01/STOP_AFTER_BATCH`
+让它在当前批完成并归档后停止。磁盘余量低于默认 10 GiB、服务不空闲或 trace 被替换时也停止。
+当前脚本不自动恢复失败任务；检查 `status.json` 和已归档原始行编号后再决定续采范围。
+
+也可以单独拟合已有的校验通过区间（只需要 NumPy，不导入 vLLM 或 NPU）：
+
+```bash
+python tools/tau_batch_fit.py \
+  --trace /tmp/tau_<唯一名称>.jsonl \
+  --report "$RUN_DIR/bench/collect_<时间>_<id>/result_trace_check.json" \
+  --stage-layers 16 --output "$RUN_DIR/parameters_01.json"
+```
+
+输出单位为毫秒。每个 PP rank、prefill/decode 分别拟合：
+
+- τ-Batch 有效形式：`a*n*s_max + b*n + c`。
+- SCLS 四参数形式：`p1*n*s_max + p2*n + p3*s_max + p4`；decode 对应 `d1..d4`。
+- 对照形式：`u1*s_sum + u2*n + u3*s_max + u4`，用于检验未 padding 的实际 token 总量是否更合适。
+
+固定模型宽度时，τ-Batch 公式的 `alpha_proj*d_model²` 与 `beta` 都乘同一变量 `n`，
+无法分别辨识。脚本只报告其和，以及除以每 stage 层数后的有效参数。
+若设计矩阵秩不足，则输出 `rank_deficient`，不输出任意一组系数冒充唯一解。
+最后 20% 的完整 wave 留作验证，并与训练集平均耗时这一常数基线比较。
+`all_data_fit` 是使用全部样本的最终拟合，验证指标使用独立的 `training_fit`。
+结构检查通过不等于计时口径已经校准：标签仍是含主机执行和结束同步的 runner 耗时。
+
+## NPU 上验证 EOS 触发
+
+保持通过 `serve_tau.sh` 启动的服务在线且空闲，在服务器另一终端运行：
+
+```bash
+python tools/tau_batch_eos_smoke.py --run-dir /absolute/path/to/trace_runs/<本次服务目录>
+```
+
+脚本使用 Python 标准库，只发送三个小请求，不启动或重启服务。
+从该目录的 `run.json` 读取模型路径和 trace 路径，要求开启 `compute` trace。
+端口不是 8000 时加 `--base-url http://127.0.0.1:<端口>`。
+
+| 用例 | 控制方式 | 必须观察到的结果 |
+| --- | --- | --- |
+| prefill EOS | 只允许 EOS token | 输出 1 个 EOS，`finish_reason=stop`，prefill 阶段触发一次 |
+| decode EOS | 首个 token 禁止 EOS，之后强烈偏向 EOS | 输出非 EOS、EOS 两个 token，`finish_reason=stop`，decode 阶段触发一次 |
+| ignore EOS | 只允许 EOS，开启 `ignore_eos`，限制 3 个输出 token | 输出 3 个 EOS，`finish_reason=length`，最后才触发一次 |
+
+decode 用例使用 `min_tokens=1`、两个允许的 token 和 `logit_bias`，
+并检查实际返回的 token ID；不把概率偏置直接当作成功证据。
+默认从模型 `config.json` 读取 EOS 和 BOS，BOS 作为非 EOS 的对照 token。
+模型配置有多个 EOS 或没有 BOS 时，需要明确传入
+`--eos-token-id <实际EOS> --other-token-id <有效且非停止的token>`。
+
+脚本核对请求 ID、实际输出 token、完成原因、执行阶段、每次执行的各 PP rank
+计算记录，以及最后一次结果处理后的唯一 `eos` 事件。
+请求参数、响应、原始 trace 片段和 `report.json` 存在脚本打印的
+`<run-dir>/bench/eos_<时间>_<id>/`，失败返回非零退出码，不改写原 trace。
+
+`eos` trace 位于 `planner.on_eos(event)` 调用之前；当前默认策略不执行动作。
+这些测试验证实机走到触发点，结合单元测试验证回调转发，不验证回调后的重组策略。
+当前触发口径是请求在输出处理时完成，因此达到长度上限也会触发。

@@ -185,6 +185,17 @@ def test_collect_warmup_and_measured_ranges_are_separate(tmp_path, monkeypatch):
     assert len(json.loads((target / "dataset.json").read_text())["sha256"]) == 64
 
 
+def test_explicit_result_dir_refuses_overwrite(tmp_path, monkeypatch):
+    _, manifest, args = setup_run(tmp_path, monkeypatch)
+    calls = fake_benchmark(monkeypatch, manifest)
+    args.result_dir = tmp_path / "chosen"
+    assert runner.bench(args) == 0
+    assert (args.result_dir / "result_trace_check.json").exists()
+    with pytest.raises(FileExistsError):
+        runner.bench(args)
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("stage_only,delta", [(True, 0), (False, -1)])
 def test_collect_stops_before_measured_run_on_failed_warmup(
     tmp_path, monkeypatch, stage_only, delta

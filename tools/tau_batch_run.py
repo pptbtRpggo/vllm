@@ -403,7 +403,12 @@ def bench(args):
     args.base_url = (args.base_url or f"http://{host}:{settings['PORT']}").rstrip("/")
     args.dataset = Path(args.dataset).expanduser().resolve()
     trace = Path(manifest["trace"])
-    target = run / "bench" / (args.mode + "_" + stamp())
+    result_dir = getattr(args, "result_dir", None)
+    target = (
+        Path(result_dir).expanduser().resolve()
+        if result_dir
+        else run / "bench" / (args.mode + "_" + stamp())
+    )
     command = bench_command(
         manifest, args, target, args.num_prompts, "result", args.output_len
     )
@@ -491,6 +496,7 @@ def main():
     )
     benchmark.add_argument("--download", action="store_true")
     benchmark.add_argument("--num-prompts", type=int)
+    benchmark.add_argument("--result-dir", help="New directory for this benchmark")
     benchmark.add_argument("--output-len", type=int)
     benchmark.add_argument("--concurrency", type=int, default=32)
     benchmark.add_argument("--request-rate", type=float, default=float("inf"))
