@@ -9,9 +9,25 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 # 修改这里的默认值，或临时覆盖：REQUEST_RATE=5 CONCURRENCY=16 bash bench_tau.sh ...
 RUN_DIR="${RUN_DIR:-}"                 # serve_tau.sh 打印的运行目录；读取其中 run.json
 MODE="${MODE:-smoke}"                 # smoke：小测试；collect：先预热、再正式采集
-NUM_PROMPTS="${NUM_PROMPTS:-}"         # 正式请求总数；留空时 smoke=32、collect=1000
-OUTPUT_LEN="${OUTPUT_LEN:-}"           # 每个请求的目标输出 token 数；smoke=64、collect=256
-CONCURRENCY="${CONCURRENCY:-32}"       # 最多同时未完成的 HTTP 请求数，不是 microbatch 大小
+# 两种模式的配置直接在下面修改；命令行参数和已有环境变量仍可覆盖默认值。
+# 此函数在解析 --mode 后调用，确保选择的模式正确生效。
+apply_mode_defaults() {
+    case "$MODE" in
+        smoke) # 小测试：不额外预热
+            NUM_PROMPTS="${NUM_PROMPTS:-8}"    # 总共发送 8 个请求
+            OUTPUT_LEN="${OUTPUT_LEN:-16}"    # 每个请求生成 16 个 token
+            CONCURRENCY="${CONCURRENCY:-8}"   # 最多 8 个未完成请求
+            ;;
+        collect) # 正式采集：先预热，再发送下面指定的正式请求
+            NUM_PROMPTS="${NUM_PROMPTS:-1000}" # 正式请求总数
+            OUTPUT_LEN="${OUTPUT_LEN:-256}"   # 每个请求生成的 token 数
+            CONCURRENCY="${CONCURRENCY:-32}"  # 最多同时未完成的请求数
+            ;;
+        *) echo 'ERROR: MODE 必须是 smoke 或 collect' >&2; exit 2 ;;
+    esac
+}
+
+# 两种模式共用的参数
 REQUEST_RATE="${REQUEST_RATE:-inf}"   # 目标请求数/秒；inf 表示尽快发送，仍受并发上限限制
 BURSTINESS="${BURSTINESS:-1}"          # 有限速率时：1 随机指数间隔；<1 更突发；inf 等间隔
 IGNORE_EOS="${IGNORE_EOS:-1}"          # 1 忽略 EOS 以采固定输出长度；0 允许自然 EOS 结束
@@ -33,7 +49,7 @@ usage: bash bench_tau.sh [服务运行目录] [选项]
 --num-prompts N            正式请求总数
 --output-len N             每个请求的目标输出 token 数
 --request-rate R           目标请求数/秒，默认 inf
---concurrency N            最多同时未完成的请求数，默认 32
+--concurrency N            最多同时未完成的请求数，smoke 默认 8、collect 默认 32
 --burstiness B             到达间隔：1 随机，inf 等间隔
 --dataset 路径 --download  数据集；缺失时允许下载
 --seed N --base-url URL --result-dir 新目录 --ready-timeout 秒数
@@ -70,11 +86,7 @@ while (($#)); do
 done
 RUN_DIR="${run_arg:-$RUN_DIR}"
 if [[ -z "$RUN_DIR" ]]; then usage >&2; exit 2; fi
-case "$MODE" in
-    smoke) NUM_PROMPTS="${NUM_PROMPTS:-32}"; OUTPUT_LEN="${OUTPUT_LEN:-64}" ;;
-    collect) NUM_PROMPTS="${NUM_PROMPTS:-1000}"; OUTPUT_LEN="${OUTPUT_LEN:-256}" ;;
-    *) echo 'ERROR: MODE 必须是 smoke 或 collect' >&2; exit 2 ;;
-esac
+apply_mode_defaults
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export MODE NUM_PROMPTS OUTPUT_LEN CONCURRENCY REQUEST_RATE BURSTINESS IGNORE_EOS
 export SEED DATASET DOWNLOAD BASE_URL RESULT_DIR WARMUP_REQUESTS READY_TIMEOUT

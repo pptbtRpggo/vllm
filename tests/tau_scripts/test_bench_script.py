@@ -200,7 +200,7 @@ def test_smoke_defaults_and_explicit_overrides(bench_setup):
     (command,) = calls(s)
     assert option(command, "--num-prompts") == "16"
     assert option(command, "--max-concurrency") == "3"
-    assert option(command, "--sharegpt-output-len") == "64"
+    assert option(command, "--sharegpt-output-len") == "16"
     assert "--ignore-eos" not in command
 
 

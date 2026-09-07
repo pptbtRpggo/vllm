@@ -56,7 +56,7 @@ export RUN_DIR="/home/m7zhang/code/vllm/trace_runs/<终端A打印的目录名>"
 bash bench_tau.sh "$RUN_DIR" --download
 ```
 
-脚本自动读取模型和端口、等待服务就绪，然后发送 32 个请求，每个生成 64 tokens。
+脚本自动读取模型和端口、等待服务就绪，然后发送 8 个请求，每个生成 16 tokens。
 默认读取 `datasets/sharegpt.json`；文件已存在时直接复用，否则下载 ShareGPT。
 使用其他数据文件时加 `--dataset /实际路径/sharegpt.json`。
 
@@ -64,15 +64,15 @@ bash bench_tau.sh "$RUN_DIR" --download
 
 同一服务上，各项测试和采集依次执行，不要同时运行多个客户端。
 
-`bench_tau.sh` 顶部是可调参数和中文说明，下面直接调用 `vllm bench serve`。
+`bench_tau.sh` 顶部分别列出 smoke 和 collect 配置，可直接修改对应数值；下面直接调用 `vllm bench serve`。
 它读取 ShareGPT prompt，通过 HTTP 请求 `/v1/completions`；microbatch 由服务端组建。
 
 | 参数 | 默认值 | 控制什么 |
 | --- | --- | --- |
 | `MODE` | `smoke` | 小测试；改成 `collect` 则先预热、再正式采集 |
-| `NUM_PROMPTS` | smoke 32 / collect 1000 | 正式请求总数 |
-| `OUTPUT_LEN` | smoke 64 / collect 256 | 每个请求的目标输出 token 数 |
-| `CONCURRENCY` | `32` | 最多同时未完成的请求数 |
+| `NUM_PROMPTS` | smoke 8 / collect 1000 | 正式请求总数 |
+| `OUTPUT_LEN` | smoke 16 / collect 256 | 每个请求的目标输出 token 数 |
+| `CONCURRENCY` | smoke 8 / collect 32 | 最多同时未完成的请求数 |
 | `REQUEST_RATE` | `inf` | 目标请求数/秒；`inf` 表示尽快发送 |
 | `BURSTINESS` | `1` | 有限速率下，`1` 为随机间隔、`inf` 为等间隔 |
 | `IGNORE_EOS` | `1` | 忽略 EOS，便于采固定输出长度；`0` 允许自然结束 |

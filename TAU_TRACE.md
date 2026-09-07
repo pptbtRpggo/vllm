@@ -96,7 +96,7 @@ bash bench_tau.sh "$RUN_DIR" --download
 bash bench_tau.sh "$RUN_DIR" --dataset /data/ShareGPT_V3_unfiltered_cleaned_split.json
 ```
 
-默认 smoke：32 个请求、每个生成 64 tokens、最大并发 32、无限请求发送速率。
+默认 smoke：8 个请求、每个生成 16 tokens、最大并发 8、无限请求发送速率。
 使用 HTTP 流式请求 `/v1/completions`，默认设置 `--ignore-eos`，便于获得足够多的 decode 样本。
 脚本等待 `/v1/models` 就绪，并核对模型名。不要在同一个服务上同时发送其他请求或启动另一份 bench。
 
@@ -105,9 +105,9 @@ bash bench_tau.sh "$RUN_DIR" --dataset /data/ShareGPT_V3_unfiltered_cleaned_spli
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
 | `MODE` | `smoke` | `collect` 先预热再采集 |
-| `NUM_PROMPTS` | smoke 32 / collect 1000 | 正式请求数 |
-| `OUTPUT_LEN` | smoke 64 / collect 256 | 单请求目标输出长度 |
-| `CONCURRENCY` | `32` | 最多同时未完成的 HTTP 请求数，不控制 microbatch 大小 |
+| `NUM_PROMPTS` | smoke 8 / collect 1000 | 正式请求数 |
+| `OUTPUT_LEN` | smoke 16 / collect 256 | 单请求目标输出长度 |
+| `CONCURRENCY` | smoke 8 / collect 32 | 最多同时未完成的 HTTP 请求数，不控制 microbatch 大小 |
 | `REQUEST_RATE` | `inf` | 目标请求数/秒；实际发送还受并发限制 |
 | `BURSTINESS` | `1` | 有限速率下，1 按指数分布采样间隔；小于 1 更突发；inf 等间隔 |
 | `IGNORE_EOS` | `1` | 0 允许自然结束；trace 检查仍要求 prefill/decode 覆盖 |
