@@ -4,6 +4,8 @@
 
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +18,66 @@ spec = importlib.util.spec_from_file_location(
 )
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
+
+
+def test_latest_run_discovery_and_overrides(tmp_path, monkeypatch):
+    root = tmp_path / "repo with spaces"
+    (root / "tools").mkdir(parents=True)
+    shutil.copy2(ROOT / "bench_tau.sh", root / "bench_tau.sh")
+    shutil.copy2(ROOT / "tools/tau_batch_run.py", root / "tools/tau_batch_run.py")
+    monkeypatch.setattr(runner, "ROOT", root)
+    monkeypatch.setattr(runner, "capture", lambda command: "")
+    settings = dict.fromkeys(runner.SERVE_SETTING_NAMES, "1")
+    settings.update(PP="2", MIN_WAITING="0", HOST="127.0.0.1", PORT="8000")
+    for key, value in settings.items():
+        monkeypatch.setenv(key, value)
+    latest = root / "trace_runs/latest"
+    env = {key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ}
+    env.update(PYTHON=sys.executable, TMPDIR=str(tmp_path))
+
+    def bench(*args, **overrides):
+        return subprocess.run(
+            ["bash", str(root / "bench_tau.sh"), *args, "--dry-run"],
+            env={**env, **overrides},
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    missing = bench()
+    assert missing.returncode == 2
+    assert "请先运行 serve_tau.sh" in missing.stderr
+    first = tmp_path / "first run"
+    for index, run in enumerate((first, tmp_path / "second run")):
+        args = runner.argparse.Namespace(
+            run_dir=str(run),
+            trace=str(run / "trace.jsonl"),
+            model=f"/models/model{index}",
+            command=["vllm", "serve"],
+            dry_run=True,
+        )
+        runner.prepare_serve(args)
+        assert not run.exists()
+        if index == 0:
+            assert not latest.is_symlink()
+        else:
+            assert latest.resolve() == first
+        args.dry_run = False
+        runner.prepare_serve(args)
+        assert latest.resolve() == run
+        for mode in ("smoke", "collect"):
+            result = bench("--mode", mode)
+            assert result.returncode == 0, result.stderr
+            assert f"--model /models/model{index}" in result.stdout
+            assert not (run / "bench").exists()
+    assert "--model /models/model0" in bench(RUN_DIR=str(first)).stdout
+    explicit = bench(str(first), RUN_DIR=str(latest))
+    assert explicit.returncode == 0, explicit.stderr
+    assert "--model /models/model0" in explicit.stdout
+    latest.unlink()
+    latest.symlink_to(tmp_path / "missing")
+    assert bench().returncode == 2
 
 
 def records(start=1):

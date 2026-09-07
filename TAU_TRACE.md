@@ -78,13 +78,13 @@ EOS 回调策略没有变化。
 
 ## 3. 终端 B：先 smoke
 
-激活相同 Python 环境，把以下目录替换为终端 A 打印的完整路径。
-两个终端不会自动共享 `RUN_DIR` 变量。
+激活相同 Python 环境。服务启动时自动更新 `trace_runs/latest`，bench 默认读取它，无需复制目录。
+多服务时可显式传入运行目录；优先级：命令行目录 > `RUN_DIR` 环境变量 > `trace_runs/latest`。
+`latest` 记录启动配置，不保证服务已经就绪；bench 会等待服务就绪。
 
 ```bash
 cd /path/to/vllm
-export RUN_DIR=/absolute/path/to/vllm/trace_runs/mb4_20260907_120000
-bash bench_tau.sh "$RUN_DIR" --download
+bash bench_tau.sh --mode smoke --download
 ```
 
 `--download` 仅在默认 `datasets/sharegpt.json` 不存在时下载
@@ -93,7 +93,7 @@ bash bench_tau.sh "$RUN_DIR" --download
 无法访问 Hugging Face 时，可自行把该 JSON 传到服务器，再运行：
 
 ```bash
-bash bench_tau.sh "$RUN_DIR" --dataset /data/ShareGPT_V3_unfiltered_cleaned_split.json
+bash bench_tau.sh --dataset /data/ShareGPT_V3_unfiltered_cleaned_split.json
 ```
 
 默认 smoke：8 个请求、每个生成 16 tokens、最大并发 8、无限请求发送速率。
@@ -118,7 +118,7 @@ bash bench_tau.sh "$RUN_DIR" --dataset /data/ShareGPT_V3_unfiltered_cleaned_spli
 可以直接修改脚本默认值，也可以临时设置，例如：
 
 ```bash
-REQUEST_RATE=5 BURSTINESS=inf CONCURRENCY=16 bash bench_tau.sh "$RUN_DIR" --mode collect
+REQUEST_RATE=5 BURSTINESS=inf CONCURRENCY=16 bash bench_tau.sh --mode collect
 ```
 
 这是目标每秒 5 个请求、等间隔到达、最多 16 个未完成请求；达到并发上限时客户端等待。
@@ -157,7 +157,7 @@ Python 辅助程序只读取配置、记录采集区间和校验结果；预热�
 ## 4. smoke 通过后：正式采集
 
 ```bash
-bash bench_tau.sh "$RUN_DIR" \
+bash bench_tau.sh \
   --mode collect \
   --dataset "$PWD/datasets/sharegpt.json" \
   --num-prompts 1000 \
@@ -197,6 +197,7 @@ RUN_DIR/
 也可手动检查整个文件：
 
 ```bash
+RUN_DIR="$(cd trace_runs/latest && pwd -P)"
 TRACE=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["trace"])' "$RUN_DIR/run.json")
 python tools/tau_batch_run.py check-trace "$TRACE" --pp 2
 ```

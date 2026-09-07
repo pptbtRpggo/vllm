@@ -5,9 +5,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 # ==================== 可修改参数 ====================
-# 用法：bash bench_tau.sh /服务运行目录
+# 用法：bash bench_tau.sh --mode smoke（自动读取最近启动的服务配置）
 # 修改这里的默认值，或临时覆盖：REQUEST_RATE=5 CONCURRENCY=16 bash bench_tau.sh ...
-RUN_DIR="${RUN_DIR:-}"                 # serve_tau.sh 打印的运行目录；读取其中 run.json
+RUN_DIR="${RUN_DIR:-}"                 # 留空使用 trace_runs/latest；也可指定服务运行目录
 MODE="${MODE:-smoke}"                 # smoke：小测试；collect：先预热、再正式采集
 # 两种模式的配置直接在下面修改；命令行参数和已有环境变量仍可覆盖默认值。
 # 此函数在解析 --mode 后调用，确保选择的模式正确生效。
@@ -45,6 +45,7 @@ usage() {
     cat <<'HELP'
 usage: bash bench_tau.sh [服务运行目录] [选项]
 
+省略目录时读取本仓库 trace_runs/latest；多服务时可手动指定目录。
 --mode smoke|collect       小测试或正式采集
 --num-prompts N            正式请求总数
 --output-len N             每个请求的目标输出 token 数
@@ -84,8 +85,13 @@ while (($#)); do
             run_arg="$1"; shift ;;
     esac
 done
-RUN_DIR="${run_arg:-$RUN_DIR}"
-if [[ -z "$RUN_DIR" ]]; then usage >&2; exit 2; fi
+RUN_DIR="${run_arg:-${RUN_DIR:-$ROOT/trace_runs/latest}}"
+if [[ ! -f "$RUN_DIR/run.json" ]]; then
+    echo "ERROR: 找不到 $RUN_DIR/run.json；请先运行 serve_tau.sh，或手动指定服务运行目录。" >&2
+    exit 2
+fi
+# 固定本次使用的实际目录，避免另一个服务更新 latest 后影响正在执行的 bench。
+RUN_DIR="$(cd "$RUN_DIR" && pwd -P)"
 apply_mode_defaults
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export MODE NUM_PROMPTS OUTPUT_LEN CONCURRENCY REQUEST_RATE BURSTINESS IGNORE_EOS

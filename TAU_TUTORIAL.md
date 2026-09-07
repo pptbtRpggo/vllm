@@ -48,12 +48,13 @@ MAX_NUM_SEQS=8 bash serve_tau.sh /absolute/path/to/model
 
 ## 3. 终端 B：检查服务并运行 smoke
 
-两个终端不共享变量。把下面 `RUN_DIR` 的值换成终端 A 打印的实际目录；不需要创建目录。
+服务启动时会将运行目录记录到 `trace_runs/latest`，bench 自动读取，无需复制路径。它表示最近一次启动的配置，不代表服务已经就绪；bench 会等待服务就绪。
+
+同时启动多个服务时，可用 `bash bench_tau.sh /指定运行目录 --mode smoke` 选择服务；显式目录优先于 `RUN_DIR` 环境变量，最后才使用 `latest`。
 
 ```bash
 cd /home/m7zhang/code/vllm
-export RUN_DIR="/home/m7zhang/code/vllm/trace_runs/<终端A打印的目录名>"
-bash bench_tau.sh "$RUN_DIR" --download
+bash bench_tau.sh --mode smoke --download
 ```
 
 脚本自动读取模型和端口、等待服务就绪，然后发送 8 个请求，每个生成 16 tokens。
@@ -80,13 +81,13 @@ bash bench_tau.sh "$RUN_DIR" --download
 例如，目标平均每秒 5 个请求，最多 16 个并发：
 
 ```bash
-REQUEST_RATE=5 CONCURRENCY=16 bash bench_tau.sh "$RUN_DIR"
+REQUEST_RATE=5 CONCURRENCY=16 bash bench_tau.sh
 ```
 
 改成目标等间隔到达：
 
 ```bash
-REQUEST_RATE=5 BURSTINESS=inf CONCURRENCY=16 bash bench_tau.sh "$RUN_DIR"
+REQUEST_RATE=5 BURSTINESS=inf CONCURRENCY=16 bash bench_tau.sh
 ```
 
 并发上限达到后，请求会在客户端等待，因此实际发送速率可能低于目标速率。
@@ -98,13 +99,11 @@ REQUEST_RATE=5 BURSTINESS=inf CONCURRENCY=16 bash bench_tau.sh "$RUN_DIR"
 在终端 B 执行：
 
 ```bash
-export RESULT_DIR="$RUN_DIR/bench/collect_01"
-
-bash bench_tau.sh "$RUN_DIR" --mode collect --result-dir "$RESULT_DIR"
+bash bench_tau.sh --mode collect
 ```
 
 先执行 32 个预热请求，再采集 1000 个正式请求；生成时忽略 EOS，目标输出长度为 256 tokens。
-再次采集时改用新的 `RESULT_DIR`。
+每次自动创建新的结果目录。下文的 `RUN_DIR` 指服务运行目录，`RESULT_DIR` 指本次 bench 打印的结果目录。
 
 | 文件 | 内容 |
 | --- | --- |
@@ -123,6 +122,7 @@ bash bench_tau.sh "$RUN_DIR" --mode collect --result-dir "$RESULT_DIR"
 下面的 `16` 仅适用于每个 stage 分配 16 层的模型，换模型时必须修改。
 
 ```bash
+RUN_DIR="$(cd trace_runs/latest && pwd -P)"
 export CAMPAIGN_DIR="$RUN_DIR/campaign_01"
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
@@ -151,9 +151,11 @@ touch "$RUN_DIR/campaign_01/STOP_AFTER_BATCH"
 
 ## 5. 拟合 stage 耗时预测模型
 
-对第 4 节的单批正式采集执行：
+对第 4 节的单批正式采集执行；将 `RESULT_DIR` 替换为该次 bench 打印的结果目录：
 
 ```bash
+RUN_DIR="$(cd trace_runs/latest && pwd -P)"
+RESULT_DIR="/本次bench打印的结果目录"
 TRACE=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["trace"])' "$RUN_DIR/run.json")
 python tools/tau_batch_fit.py \
   --trace "$TRACE" \

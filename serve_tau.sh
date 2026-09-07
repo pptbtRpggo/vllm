@@ -31,6 +31,7 @@ usage: bash serve_tau.sh [模型目录] [--run-dir 新目录] [--dry-run]
 默认：NPU=0,1，PP=2，TP=1，每个 microbatch 最多 4 个请求。
 可调参数、默认值与中文说明都在本脚本顶部。
 --dry-run  只查看最终参数，不创建文件、不启动服务。
+启动时自动将本次目录记录到 trace_runs/latest，bench 无需再填写目录。
 HELP
 }
 

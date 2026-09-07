@@ -97,6 +97,11 @@ def prepare_serve(args):
         )
     if run == trace:
         raise ValueError("RUN_DIR and TRACE must be different paths")
+    latest = ROOT / "trace_runs" / "latest"
+    if any(latest == p or latest in p.parents for p in (run, trace)):
+        raise ValueError("trace_runs/latest is reserved for the latest run link")
+    if latest.exists() and not latest.is_symlink():
+        raise ValueError(f"{latest} already exists and is not a symlink")
     run.mkdir(parents=True)
     trace.parent.mkdir(parents=True, exist_ok=True)
     versions = {}
@@ -122,8 +127,19 @@ def prepare_serve(args):
     )
     (run / "packages.txt").write_text(capture([sys.executable, "-m", "pip", "freeze"]))
     (run / "npu.txt").write_text(capture(["npu-smi", "info"]))
+    # Publish only complete metadata. Atomic replacement also handles a stale link.
+    latest.parent.mkdir(parents=True, exist_ok=True)
+    temporary = latest.with_name(".latest_" + uuid.uuid4().hex)
+    try:
+        temporary.symlink_to(run, target_is_directory=True)
+        temporary.replace(latest)
+    finally:
+        temporary.unlink(missing_ok=True)
     print(f"RUN_DIR={run}\nTRACE={trace}", flush=True)
-    print(f"终端 B: bash {ROOT / 'bench_tau.sh'} {shlex.quote(str(run))}", flush=True)
+    print(
+        f"终端 B: bash {shlex.quote(str(ROOT / 'bench_tau.sh'))} --mode smoke",
+        flush=True,
+    )
     print("启动命令: " + shlex.join(command), flush=True)
     if int(settings["MIN_WAITING"]) != 0:
         print("注意：MIN_WAITING 非零可能阻塞小样本或尾部请求；bench 脚本会拒绝运行。")

@@ -4,6 +4,7 @@
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -17,7 +18,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
-def launch_env(tmp_path):
+def launch_env(tmp_path, monkeypatch):
+    # Keep the launcher's latest link inside the test's disposable repository.
+    root = tmp_path / "repo"
+    (root / "tools").mkdir(parents=True)
+    shutil.copy2(ROOT / "serve_tau.sh", root / "serve_tau.sh")
+    shutil.copy2(ROOT / "tools/tau_batch_run.py", root / "tools/tau_batch_run.py")
+    monkeypatch.setattr(sys.modules[__name__], "ROOT", root)
     env = {
         key: os.environ[key]
         for key in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL")
