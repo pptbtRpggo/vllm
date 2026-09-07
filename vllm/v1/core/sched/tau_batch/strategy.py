@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import deque
 from collections.abc import Sequence
 from typing import Protocol
 
@@ -116,30 +117,38 @@ def _pack_pool(
     batches: list[list[TauRequestSnapshot]] = []
     remaining_kv = ctx.kv_free_blocks
     cap = ctx.max_microbatches
-    pending = list(ordered)
+    request_cap = min(ctx.max_reqs_per_microbatch, ctx.max_num_seqs)
+    # Individually oversized prompts cannot fit any task in this plan. The
+    # admitted/deferred partition still retains them for the caller.
+    token_cap = ctx.max_num_batched_tokens
+    pending = deque(
+        req for req in ordered if token_cap is None or req.prompt_len <= token_cap
+    )
     while pending and (cap == 0 or len(batches) < cap):
         current: list[TauRequestSnapshot] = []
         skipped: list[TauRequestSnapshot] = []
         tokens = 0
-        for req in pending:
+        while pending and len(current) < request_cap:
+            req = pending.popleft()
             need = _kv_blocks_if_fits(req, remaining_kv, ctx.block_size)
             if need is None:
                 # Free capacity only decreases during this pack call.
                 continue
-            if len(current) >= ctx.max_reqs_per_microbatch or (
-                ctx.max_num_batched_tokens is not None
-                and tokens + req.prompt_len > ctx.max_num_batched_tokens
-            ):
+            if token_cap is not None and tokens + req.prompt_len > token_cap:
                 skipped.append(req)
                 continue
             current.append(req)
             tokens += req.prompt_len
             if remaining_kv is not None:
                 remaining_kv -= need
+            if tokens == token_cap:
+                break
         if not current:
             break
         batches.append(current)
-        pending = skipped
+        # Only revisit token-unfit candidates. Leave the untouched tail in
+        # place instead of scanning/copying it for every full task.
+        pending.extendleft(reversed(skipped))
     return batches
 
 

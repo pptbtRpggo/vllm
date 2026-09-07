@@ -7,18 +7,52 @@
   complete prompt lengths in each micro-batch. If a request does not fit the
   current task, later requests are considered; skipped requests can enter a
   later task. Remaining requests are deferred, never split into prompt chunks.
-- `TauBatchPlanner` validates custom packer output. `TauScheduler` checks the
-  actual forward token total before allocating KV and again before emitting.
+  Each task is bounded by both `max_reqs_per_microbatch` and `max_num_seqs`;
+  `max_num_seqs` does not limit the total requests retaining KV across a wave.
+- `TauBatchPlanner` validates custom packer output, including the sum of KV
+  reservations across every admitted request. This uses the same conservative
+  prompt-plus-max-output block estimate as the default packer. `TauScheduler`
+  checks actual forward request/token counts before allocating KV and again
+  before emitting.
 - `TauScheduler.configure_vllm_config(config)` runs during `VllmConfig`
   initialization, before workers/executors. Scheduler construction validates
   the contract without mutating worker-related flags.
 - `ListDispatcher.retire(index)` removes a finished/cancelled micro-batch from
   both readiness gates and decode rotation without renumbering in-flight tasks.
+- A wave is replaced only after its requests finish/cancel and all its issued
+  forwards return. In-flight records retain the original wave and Request
+  identities, so cancellation and request-ID reuse cannot redirect old tokens
+  or completion notifications to a replacement request/wave.
+- Zero-token control outputs carry finished IDs to workers, including after
+  the final wave. Pure waits are skipped through `is_idle_output`; the default
+  scheduler interface preserves delivery of all outputs for other schedulers.
+  Internal allocation/admission errors produce one terminal client output;
+  external cancellation keeps the existing abort API semantics.
 - `TauScheduler.pipeline_snapshot()` copies pending requests, active requests,
   per-request context lengths/KV block IDs, prefill readiness, and in-flight
   counts. Requests already admitted but not yet dispatched are excluded from
   the waiting candidate set. `computed_tokens` includes scheduled work, so it
   is not proof that an in-flight KV write has completed.
+
+## Supported workload
+
+The current adapter supports ordinary text generation with PP/TP and one
+ordinary `FullAttentionSpec` KV group whose block size matches the scheduler.
+LoRA, multimodal/encoder-decoder/pooling models, KV/EC connectors, DP and
+context parallelism are rejected by configuration validation. Unsupported KV
+layouts (including multiple groups, MLA and sliding/chunked attention) are
+rejected before constructing the scheduler's cache manager.
+
+Per-request structured output, LoRA, multimodal input, pooling and KV transfer
+are terminated with one error output through the normal client-output path.
+They are never sent to the worker as cached requests. This declares the current
+adapter boundary; it does not claim those features are unsupported by vLLM.
+
+The default packer leaves the untouched queue tail in place when a task fills,
+and only revisits candidates skipped for the current task's token limit.
+Individually token-oversized candidates remain deferred. The ordinary full-task
+case takes linear scanning work after sorting; adversarial token-fit cases can
+still require repeated scans. The optimization does not change packing order.
 
 ## Latency predictor injection
 
@@ -80,8 +114,10 @@ coverage verification, controlled sampling, regression/validation, run IDs and
 TP-rank-aware joins remain profiling work. The detailed phase hooks currently
 live in `gpu_worker.py`; an overridden worker must instrument its own path.
 
-## Deliberately unchanged behavior in this patch
+## Remaining behavior choices
 
-The running-count overflow/drop policy, zero-token completion/control-message
-handling, and `min_waiting` behavior are unchanged. They remain distinct from
-the per-forward token budget and the cancelled-micro-batch readiness fix.
+`min_waiting` remains unchanged. A positive threshold can hold a partial tail
+until more requests arrive; set it to zero for immediate planning.
+The existing terminal-error policy for an unreservable request or an unexpected
+`allocate_slots` failure remains; automatic retry/preemption is not implemented.
+Candidates skipped by the packer's aggregate KV/token limits remain waiting.

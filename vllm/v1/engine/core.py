@@ -345,6 +345,8 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        if self.scheduler.is_idle_output(scheduler_output):
+            return {}, False
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with self.log_error_detail(scheduler_output):
@@ -381,8 +383,8 @@ class EngineCore:
         1. Try to schedule a new batch if the batch queue is not full.
         If a new batch is scheduled, directly return an empty engine core
         output. In other words, fulfilling the batch queue has a higher priority
-        than getting model outputs. A 0-token schedule is not executed or
-        enqueued; if the queue is non-empty we wait on the in-flight batch.
+        than getting model outputs. Pure waits are skipped; zero-token control
+        outputs still reach workers and are queued without sampling.
         2. If there is no new scheduled batch, meaning that the batch queue
         is full or no other requests can be scheduled, we block until the first
         batch in the job queue is finished.
@@ -400,13 +402,14 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
-            # 0-token schedule means wait for in-flight work (e.g. τ-Batch
-            # peek_slot is None). Do not execute or enqueue an empty batch.
-            if scheduler_output.total_num_scheduled_tokens > 0:
+            if not self.scheduler.is_idle_output(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
-                if not self.is_ec_producer:
+                if (
+                    not self.is_ec_producer
+                    and scheduler_output.total_num_scheduled_tokens > 0
+                ):
                     model_executed = True
 
                 if self.is_pooling_model or not model_executed:
@@ -436,9 +439,7 @@ class EngineCore:
                     batch_queue.appendleft((future, scheduler_output))
                     _tau_trace_queue = getattr(self.scheduler, "trace_queue", None)
                     if _tau_trace_queue is not None:
-                        _tau_trace_queue(
-                            "enqueue", scheduler_output, len(batch_queue)
-                        )
+                        _tau_trace_queue("enqueue", scheduler_output, len(batch_queue))
                     if (
                         model_executed
                         and len(batch_queue) < self.batch_queue_size
@@ -482,9 +483,7 @@ class EngineCore:
             batch_queue.appendleft((future, deferred_scheduler_output))
             _tau_trace_queue = getattr(self.scheduler, "trace_queue", None)
             if _tau_trace_queue is not None:
-                _tau_trace_queue(
-                    "enqueue", deferred_scheduler_output, len(batch_queue)
-                )
+                _tau_trace_queue("enqueue", deferred_scheduler_output, len(batch_queue))
 
         return engine_core_outputs, model_executed
 

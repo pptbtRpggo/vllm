@@ -8,7 +8,7 @@ set -euo pipefail
 #   ./serve_tau.sh /path/or/hf-id
 #
 # Packing (strategy walks the whole waiting pool; no take-N):
-#   MAX_NUM_SEQS          running-slot / worker table cap   default 32
+#   MAX_NUM_SEQS          request capacity per forward     default 32
 #   MAX_REQS_PER_MB       n cap per task                    default 4
 #   MAX_MICROBATCHES      list cap; 0 = whole pool          default 0
 #   MIN_WAITING           pack threshold                    default = MAX_NUM_SEQS

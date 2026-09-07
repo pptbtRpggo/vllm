@@ -78,6 +78,7 @@ def _assert_invariants(
         assert task.index == i
         assert task.req_ids
         assert len(task.req_ids) <= ctx.max_reqs_per_microbatch
+        assert len(task.req_ids) <= ctx.max_num_seqs
     if ctx.max_microbatches >= 1:
         assert len(plan.tasks) <= ctx.max_microbatches
 
@@ -209,7 +210,7 @@ def test_greedy_does_not_cut_pool_by_max_num_seqs():
     _assert_invariants(plan, requests, ctx)
     assert plan.admitted_ids == {"r0", "r1", "r2", "r3", "r4"}
     assert plan.deferred_ids == frozenset()
-    assert [len(task.req_ids) for task in plan.tasks] == [4, 1]
+    assert [len(task.req_ids) for task in plan.tasks] == [2, 2, 1]
 
 
 def test_greedy_prefers_tighter_tpot_then_earlier_arrival():
@@ -446,3 +447,106 @@ def test_custom_packer_cannot_exceed_token_limit():
 def test_invalid_token_limit_rejected():
     with pytest.raises(ValueError, match="max_num_batched_tokens"):
         TauBatchPlanner().plan([_req("a")], _ctx(max_num_batched_tokens=0))
+
+
+@pytest.mark.parametrize("task_cap", [1, 4])
+def test_worker_request_capacity_limits_each_task_not_whole_wave(task_cap):
+    requests = [_req(str(i)) for i in range(6)]
+    ctx = _ctx(max_num_seqs=2, max_reqs_per_microbatch=task_cap, max_microbatches=0)
+    plan = TauBatchPlanner().plan(requests, ctx)
+    _assert_invariants(plan, requests, ctx)
+    assert len(plan.admitted_ids) == 6
+    assert all(len(task.req_ids) <= min(task_cap, 2) for task in plan.tasks)
+
+
+def test_custom_plan_cannot_exceed_worker_request_capacity():
+    class Oversized:
+        def pack(self, requests, ctx):
+            from vllm.v1.core.sched.tau_batch import MicroBatchTask
+
+            return MicroBatchList(
+                tasks=(MicroBatchTask(("a", "b", "c"), 0),),
+                admitted_ids=frozenset({"a", "b", "c"}),
+                deferred_ids=frozenset(),
+            )
+
+    with pytest.raises(ValueError, match="max_num_seqs"):
+        TauBatchPlanner(strategy=Oversized()).plan(
+            [_req(rid) for rid in "abc"],
+            _ctx(max_num_seqs=2, max_reqs_per_microbatch=4),
+        )
+
+
+@pytest.mark.parametrize("free,admitted", [(8, ("a", "b")), (4, ("a",))])
+def test_custom_plan_kv_reservation_accepts_exact_capacity(free, admitted):
+    from vllm.v1.core.sched.tau_batch import MicroBatchTask
+
+    class Custom:
+        def pack(self, requests, ctx):
+            return MicroBatchList(
+                tasks=tuple(
+                    MicroBatchTask((rid,), i) for i, rid in enumerate(admitted)
+                ),
+                admitted_ids=frozenset(admitted),
+                deferred_ids=frozenset({"a", "b"} - set(admitted)),
+            )
+
+    requests = [_req(rid, prompt_len=32, max_new_tokens=32) for rid in "ab"]
+    plan = TauBatchPlanner(strategy=Custom()).plan(
+        requests, _ctx(kv_free_blocks=free, block_size=16)
+    )
+    assert plan.admitted_ids == set(admitted)
+
+
+def test_custom_plan_kv_reservation_covers_entire_wave():
+    from vllm.v1.core.sched.tau_batch import MicroBatchTask
+
+    class Custom:
+        def pack(self, requests, ctx):
+            return MicroBatchList(
+                tasks=(MicroBatchTask(("a",), 0), MicroBatchTask(("b",), 1)),
+                admitted_ids=frozenset({"a", "b"}),
+                deferred_ids=frozenset(),
+            )
+
+    with pytest.raises(ValueError, match="reserves 8 KV blocks, only 4"):
+        TauBatchPlanner(strategy=Custom()).plan(
+            [_req(rid, prompt_len=32, max_new_tokens=32) for rid in "ab"],
+            _ctx(kv_free_blocks=4, block_size=16),
+        )
+
+
+def test_full_tasks_do_not_rescan_untouched_waiting_tail(monkeypatch):
+    from vllm.v1.core.sched.tau_batch import strategy
+
+    examined = 0
+    original = strategy._kv_blocks_if_fits
+
+    def count(*args):
+        nonlocal examined
+        examined += 1
+        return original(*args)
+
+    monkeypatch.setattr(strategy, "_kv_blocks_if_fits", count)
+    requests = [_req(str(i), prompt_len=8) for i in range(1000)]
+    requests.insert(0, _req("oversized", prompt_len=1000))
+    plan = TauBatchPlanner().plan(
+        requests,
+        _ctx(max_microbatches=0, max_reqs_per_microbatch=4, max_num_batched_tokens=32),
+    )
+    assert len(plan.tasks) == 250
+    assert plan.deferred_ids == {"oversized"}
+    # A linear work bound, not a machine-dependent timing threshold.
+    assert examined <= 2 * len(requests)
+
+
+def test_token_skips_precede_untouched_tail_in_next_microbatch():
+    requests = [
+        _req(rid, prompt_len=n)
+        for rid, n in [("a", 7), ("b", 6), ("c", 3), ("d", 4), ("e", 5)]
+    ]
+    plan = TauBatchPlanner().plan(
+        requests,
+        _ctx(max_microbatches=0, max_reqs_per_microbatch=2, max_num_batched_tokens=10),
+    )
+    assert [task.req_ids for task in plan.tasks] == [("a", "c"), ("b", "d"), ("e",)]

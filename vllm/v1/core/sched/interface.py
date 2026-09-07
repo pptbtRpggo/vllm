@@ -151,6 +151,15 @@ class SchedulerInterface(ABC):
         not yet returned in SchedulerOutputs."""
         return self.has_unfinished_requests() or self.has_finished_requests()
 
+    def is_idle_output(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Whether an output can be skipped without notifying workers.
+
+        By default every output is delivered, including zero-token control
+        messages and connector/DP work. Schedulers that explicitly emit pure
+        waits may override this; token count alone does not imply idleness.
+        """
+        return False
+
     @abstractmethod
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

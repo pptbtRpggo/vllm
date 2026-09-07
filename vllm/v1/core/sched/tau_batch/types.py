@@ -113,12 +113,12 @@ class PackContext:
     Attributes:
         now: Current timestamp in seconds (same clock as arrival_time).
             Used to compute wait and TTFT slack at plan time.
-        max_num_seqs: Current scheduler running-request cap. This does not
-            truncate the candidate pool or constrain the default packer.
+        max_num_seqs: Worker request capacity per forward. Limits each task,
+            not the candidate pool or the total number of admitted requests.
         max_microbatches: Pack at most this many micro-batch tasks; 0 is unlimited.
-        max_reqs_per_microbatch: Max n in one micro-batch task. Not
-            derived from max_num_seqs or max_microbatches. Overflow is
-            deferred; a short pool is packed as-is.
+        max_reqs_per_microbatch: Desired max n in one micro-batch task, also
+            bounded by max_num_seqs. Overflow is deferred to later tasks or
+            planning calls; a short pool is packed as-is.
         pp_size: Pipeline-parallel size M. Used for ``τ_max = TPOT / M``.
         kv_free_blocks: Free KV blocks at pack time. None disables the
             KV filter.

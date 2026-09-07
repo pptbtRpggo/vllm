@@ -95,7 +95,10 @@ def _tau_scheduler(
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
-                ["layer"], FullAttentionSpec(16, 1, 1, torch.float32, False)
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
             )
         ],
     )
@@ -286,6 +289,12 @@ def test_new_arrival_does_not_join_active_list():
     assert set(dec.num_scheduled_tokens) == {"r0", "r1"}
     for rid in ("r0", "r1", "r2", "r3"):
         sched.finish_requests(rid, RequestStatus.FINISHED_ABORTED)
+    cleanup = sched.schedule()
+    assert not cleanup.num_scheduled_tokens
+    assert cleanup.finished_req_ids == {"r0", "r1", "r2", "r3"}
+    sched.update_from_output(pre1, _sampled(pre1))
+    sched.update_from_output(dec, _sampled(dec))
+    sched.update_from_output(cleanup, _sampled(cleanup))
     nxt = sched.schedule()
     assert set(nxt.num_scheduled_tokens) == {"late"}
 
@@ -366,6 +375,9 @@ def test_list_end_resets_dispatcher():
         sched.finish_requests(rid, RequestStatus.FINISHED_ABORTED)
     empty = sched.schedule()
     assert empty.total_num_scheduled_tokens == 0
+    assert sched._list is not None
+    sched.update_from_output(out, _sampled(out))
+    sched.update_from_output(empty, _sampled(empty))
     assert sched._list is None
     assert sched._wave_id is None
     assert sched.dispatcher.active_list is None

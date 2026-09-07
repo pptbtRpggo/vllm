@@ -3,7 +3,7 @@
 
 import time
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from vllm.logger import init_logger
@@ -13,6 +13,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.sched.tau_batch.config import (
     configure_tau_batch,
     validate_tau_batch_config,
+    validate_tau_kv_layout,
 )
 from vllm.v1.core.sched.tau_batch.dispatch import (
     DispatchPhase,
@@ -39,7 +40,7 @@ from vllm.v1.core.sched.tau_batch.types import (
     request_budget_dict,
     wait_ms,
 )
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
@@ -48,6 +49,16 @@ logger = init_logger(__name__)
 # Prototype defaults when sampling_params.extra_args has no SLO.
 _DEFAULT_TTFT_SLO_MS = 10_000.0
 _DEFAULT_TPOT_SLO_MS = 100.0
+
+
+@dataclass(frozen=True)
+class _InFlightForward:
+    slot: DispatchSlot
+    wave_id: int
+    requests: tuple[Request, ...]
+    fwd_id: int | None = None
+    features: dict[str, Any] | None = None
+    emit_mono_ns: int | None = None
 
 
 def _resolve_max_microbatches(configured: int) -> int:
@@ -116,7 +127,7 @@ class TauScheduler(Scheduler):
 
     on_prefill_complete is recorded in update_from_output, not schedule().
     New arrivals stay in waiting until the active list has no unfinished
-    admitted requests.
+    admitted requests and all its issued forwards have returned.
 
     ``configure_vllm_config`` disables unsupported features before workers
     initialize. ``__init__`` only validates that execution contract.
@@ -131,6 +142,12 @@ class TauScheduler(Scheduler):
         if vllm_config is None:
             raise TypeError("TauScheduler requires vllm_config")
         validate_tau_batch_config(vllm_config)
+        kv_cache_config = kwargs.get(
+            "kv_cache_config", args[1] if len(args) > 1 else None
+        )
+        block_size = kwargs.get("block_size", args[3] if len(args) > 3 else None)
+        if kv_cache_config is not None and block_size is not None:
+            validate_tau_kv_layout(kv_cache_config, block_size)
         planner = kwargs.pop("planner", None)
         self.latency_oracle: LatencyOracle | None = kwargs.pop("latency_oracle", None)
         super().__init__(*args, **kwargs)
@@ -144,11 +161,11 @@ class TauScheduler(Scheduler):
         )
         self.min_waiting_to_plan = self.scheduler_config.tau_batch_min_waiting
         self._list: MicroBatchList | None = None
+        self._wave_requests: dict[str, Request] = {}
         self._wave_id: int | None = None
         self._next_wave_id = 0
-        self._inflight: dict[
-            int, tuple[DispatchSlot, int, dict[str, Any], int | None]
-        ] = {}
+        self._inflight: dict[int, _InFlightForward] = {}
+        self._pending_errors: dict[int, list[EngineCoreOutput]] = {}
         trace_path = resolve_trace_path(self.scheduler_config.tau_batch_trace)
         self._tracer: JsonlTracer | None = None
         if trace_path:
@@ -160,7 +177,7 @@ class TauScheduler(Scheduler):
         logger.warning(
             "TauScheduler: pack the waiting pool into tasks of size <= %d, "
             "list cap %s (0 = whole pool), KV-unfit skipped. "
-            "--max-num-seqs=%d is the running-slot cap, not a take cap.",
+            "--max-num-seqs=%d limits each forward, not the whole list.",
             self.max_reqs_per_microbatch,
             self.max_microbatches,
             self.max_num_running_reqs,
@@ -177,6 +194,24 @@ class TauScheduler(Scheduler):
             return
         self._tracer.record(event, **fields)
 
+    def add_request(self, request: Request) -> None:
+        # Reject per-request features through the normal terminal-output path,
+        # not an exception that could stop the engine's input loop.
+        super().add_request(request)
+        unsupported = None
+        if request.structured_output_request is not None:
+            unsupported = "structured output"
+        elif request.lora_request is not None:
+            unsupported = "LoRA"
+        elif request.has_encoder_inputs:
+            unsupported = "multimodal input"
+        elif request.pooling_params is not None:
+            unsupported = "pooling"
+        elif request.kv_transfer_params is not None:
+            unsupported = "KV transfer"
+        if unsupported is not None:
+            self._drop_request(request, f"TauScheduler does not support {unsupported}")
+
     def trace_queue(
         self, action: str, scheduler_output: SchedulerOutput, depth: int
     ) -> None:
@@ -184,17 +219,33 @@ class TauScheduler(Scheduler):
         fwd_id = None
         inflight = self._inflight.get(id(scheduler_output))
         if inflight is not None:
-            fwd_id = inflight[1]
+            fwd_id = inflight.fwd_id
         self._trace(action, fwd_id=fwd_id, queue_depth=depth)
 
     def schedule(self) -> SchedulerOutput:
         self._ensure_active_list()
         if self._list is None:
-            return SchedulerOutput.make_empty()
+            return self._empty_output()
         slot, allowed = self._next_slot()
         if slot is None:
-            return SchedulerOutput.make_empty()
+            return self._empty_output()
         return self._schedule_slot(slot, allowed)
+
+    def _empty_output(self) -> SchedulerOutput:
+        # A cleanup forward must consume finished IDs and update the previous
+        # worker-batch state just like a normal forward. A pure wait must not.
+        if self.finished_req_ids:
+            return self._emit_output([], [], [], {}, {})
+        return SchedulerOutput.make_empty()
+
+    def is_idle_output(self, scheduler_output: SchedulerOutput) -> bool:
+        return (
+            scheduler_output.total_num_scheduled_tokens == 0
+            and not scheduler_output.finished_req_ids
+            and not scheduler_output.free_encoder_mm_hashes
+            and scheduler_output.kv_connector_metadata is None
+            and scheduler_output.ec_connector_metadata is None
+        )
 
     def update_from_output(
         self,
@@ -205,12 +256,45 @@ class TauScheduler(Scheduler):
         fwd_id = None
         features: dict[str, Any] = {}
         emit_mono_ns: int | None = None
+        wave_id = None
         inflight = self._inflight.pop(id(scheduler_output), None)
         if inflight is not None:
-            slot, fwd_id, features, emit_mono_ns = inflight
+            slot = inflight.slot
+            wave_id = inflight.wave_id
+            fwd_id = inflight.fwd_id
+            features = inflight.features or {}
+            emit_mono_ns = inflight.emit_mono_ns
+            # A cancelled ID can be submitted again while its old forward is
+            # still in flight. Never apply those old tokens to the new Request.
+            live_ids = {
+                req.request_id
+                for req in inflight.requests
+                if self.requests.get(req.request_id) is req
+            }
+            if live_ids != scheduler_output.num_scheduled_tokens.keys():
+                tokens = {
+                    rid: n
+                    for rid, n in scheduler_output.num_scheduled_tokens.items()
+                    if rid in live_ids
+                }
+                update_output = replace(
+                    scheduler_output,
+                    num_scheduled_tokens=tokens,
+                    total_num_scheduled_tokens=sum(tokens.values()),
+                )
+            else:
+                update_output = scheduler_output
+        else:
+            update_output = scheduler_output
         prev_finished = set(self.finished_req_ids)
-        result = super().update_from_output(scheduler_output, model_runner_output)
-        if slot is not None and slot.phase is DispatchPhase.PREFILL:
+        result = super().update_from_output(update_output, model_runner_output)
+        for client_index, errors in self._pending_errors.items():
+            if client_index not in result:
+                result[client_index] = EngineCoreOutputs()
+            result[client_index].outputs.extend(errors)
+        self._pending_errors.clear()
+        current_wave = slot is not None and wave_id == self._wave_id
+        if current_wave and slot is not None and slot.phase is DispatchPhase.PREFILL:
             self.dispatcher.on_prefill_complete(slot.microbatch_index)
         if slot is not None and self._tracer is not None:
             duration_ms = None
@@ -219,14 +303,19 @@ class TauScheduler(Scheduler):
             self._trace(
                 "done",
                 fwd_id=fwd_id,
-                wave_id=self._wave_id,
+                wave_id=wave_id,
                 batch_idx=slot.microbatch_index,
                 req_ids=list(scheduler_output.num_scheduled_tokens),
                 duration_ms=duration_ms,
                 **features,
             )
-        self._maybe_run_eos_hook(slot, scheduler_output, prev_finished)
-        if self._list is not None and not self._admitted_unfinished():
+        if current_wave:
+            self._maybe_run_eos_hook(slot, update_output, prev_finished)
+        if (
+            self._list is not None
+            and not self._admitted_unfinished()
+            and not self._inflight
+        ):
             self._clear_list()
         return result
 
@@ -258,6 +347,7 @@ class TauScheduler(Scheduler):
                 for rid in self._list.admitted_ids
                 if rid not in finished_ids
                 and (req := self.requests.get(rid)) is not None
+                and self._wave_requests.get(rid) is req
                 and not req.is_finished()
             )
         )
@@ -282,15 +372,17 @@ class TauScheduler(Scheduler):
         self.planner.on_eos(event)
 
     def _clear_list(self) -> None:
+        assert not self._inflight, "cannot replace a wave with forwards in flight"
         if self._wave_id is not None:
             self._trace("wave_end", wave_id=self._wave_id)
         self._list = None
+        self._wave_requests = {}
         self._wave_id = None
         self.dispatcher.reset()
 
     def _ensure_active_list(self) -> None:
         """Keep the unfinished list or replace it from the waiting pool."""
-        if self._list is not None and self._admitted_unfinished():
+        if self._inflight or (self._list is not None and self._admitted_unfinished()):
             return
         self._clear_list()
         self._drop_unfittable_waiting()
@@ -303,15 +395,8 @@ class TauScheduler(Scheduler):
         packed = self.planner.plan(snapshots, ctx)
         if packed is None:
             return
-        if len(packed.admitted_ids) > self.max_num_running_reqs:
-            logger.warning(
-                "TauScheduler packed %d requests but --max-num-seqs is %d. "
-                "Raise --max-num-seqs or extra requests are dropped when "
-                "they would enter running.",
-                len(packed.admitted_ids),
-                self.max_num_running_reqs,
-            )
         self._list = packed
+        self._wave_requests = {rid: self.requests[rid] for rid in packed.admitted_ids}
         self._wave_id = self._next_wave_id
         self._next_wave_id += 1
         self.dispatcher.start(packed)
@@ -348,6 +433,7 @@ class TauScheduler(Scheduler):
         # request state. The packer skips non-fitting requests; a malformed
         # custom plan must not silently turn into a partial Prefill.
         planned_tokens = sum(max(0, self._num_new_tokens(req)) for req in reqs)
+        self._validate_forward_requests(len(reqs))
         self._validate_forward_tokens(planned_tokens)
         scheduled_new: list[Request] = []
         scheduled_running: list[Request] = []
@@ -359,13 +445,6 @@ class TauScheduler(Scheduler):
             num_new = self._num_new_tokens(req)
             if num_new <= 0:
                 continue
-            if (
-                req.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
-                and len(self.running) >= self.max_num_running_reqs
-            ):
-                self._drop_request(req, "max_num_seqs is full")
-                continue
-
             kind = "running"
             if req.status == RequestStatus.WAITING:
                 kind = "new"
@@ -396,7 +475,7 @@ class TauScheduler(Scheduler):
                 scheduled_running.append(req)
 
         if not num_scheduled_tokens:
-            return SchedulerOutput.make_empty()
+            return self._empty_output()
 
         out = self._emit_output(
             scheduled_new,
@@ -406,12 +485,14 @@ class TauScheduler(Scheduler):
             num_scheduled_tokens,
         )
         self.dispatcher.commit_slot(slot)
+        assert self._wave_id is not None
+        scheduled = tuple(req for req in reqs if req.request_id in num_scheduled_tokens)
+        forward = _InFlightForward(slot, self._wave_id, scheduled)
         if self._tracer is None:
-            self._inflight[id(out)] = (slot, 0, {}, None)
+            self._inflight[id(out)] = forward
             return out
-        scheduled = [req for req in reqs if req.request_id in num_scheduled_tokens]
         features = self._task_features(
-            slot, scheduled, int(out.total_num_scheduled_tokens)
+            slot, list(scheduled), int(out.total_num_scheduled_tokens)
         ).as_dict()
         now = time.time()
         features["req_waits"] = [
@@ -430,7 +511,12 @@ class TauScheduler(Scheduler):
         }
         fwd_id = self._tracer.next_fwd_id()
         out.tau_fwd_id = fwd_id
-        self._inflight[id(out)] = (slot, fwd_id, features, time.monotonic_ns())
+        self._inflight[id(out)] = replace(
+            forward,
+            fwd_id=fwd_id,
+            features=features,
+            emit_mono_ns=time.monotonic_ns(),
+        )
         self._trace(
             "emit",
             fwd_id=fwd_id,
@@ -447,6 +533,13 @@ class TauScheduler(Scheduler):
                 f"TauScheduler forward has {tokens} tokens, "
                 f"max_num_batched_tokens is {self.max_num_scheduled_tokens}; "
                 "repack complete requests without chunked prefill"
+            )
+
+    def _validate_forward_requests(self, count: int) -> None:
+        if count > self.max_num_running_reqs:
+            raise ValueError(
+                f"TauScheduler forward has {count} requests, "
+                f"max_num_seqs is {self.max_num_running_reqs}"
             )
 
     def _num_new_tokens(self, request: Request) -> int:
@@ -491,39 +584,40 @@ class TauScheduler(Scheduler):
             if self.log_stats:
                 request.record_event(EngineCoreEventType.SCHEDULED, time.monotonic())
 
-    def _drop_request(self, request: Request, reason: str) -> None:
+    def _drop_request(self, request: Request, reason: str, **trace_fields: Any) -> None:
+        if request.is_finished():
+            return
         logger.error(
             "TauScheduler dropping request %s: %s",
             request.request_id,
             reason,
         )
-        self._trace("drop", req_id=request.request_id, reason=reason)
+        self._trace("drop", req_id=request.request_id, reason=reason, **trace_fields)
         self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
+        self._pending_errors.setdefault(request.client_index, []).append(
+            EngineCoreOutput(
+                request_id=request.request_id,
+                new_token_ids=[],
+                finish_reason=request.get_finished_reason(),
+                events=request.take_events(),
+                trace_headers=request.trace_headers,
+                num_cached_tokens=request.num_cached_tokens,
+            )
+        )
 
     def _drop_unfittable_waiting(self) -> None:
         free = self.kv_cache_manager.block_pool.get_num_free_blocks()
-        drop_ids: list[str] = []
         for req in list(self.waiting):
             need = estimate_kv_blocks(
                 req.num_prompt_tokens, req.max_tokens, self.block_size
             )
             if need > free:
-                logger.error(
-                    "TauScheduler dropping %s: reserved %d KV blocks exceeds free %d",
-                    req.request_id,
-                    need,
-                    free,
-                )
-                self._trace(
-                    "drop",
-                    req_id=req.request_id,
-                    reason="reserved KV exceeds free blocks",
+                self._drop_request(
+                    req,
+                    f"reserved {need} KV blocks exceeds free {free}",
                     need_blocks=need,
                     free_blocks=free,
                 )
-                drop_ids.append(req.request_id)
-        if drop_ids:
-            self.finish_requests(drop_ids, RequestStatus.FINISHED_ERROR)
 
     def _emit_output(
         self,
@@ -533,6 +627,7 @@ class TauScheduler(Scheduler):
         req_to_new_blocks: dict[str, KVCacheBlocks],
         num_scheduled_tokens: dict[str, int],
     ) -> SchedulerOutput:
+        self._validate_forward_requests(len(num_scheduled_tokens))
         self._validate_forward_tokens(sum(num_scheduled_tokens.values()))
         if self.use_v2_model_runner:
             scheduled_new = scheduled_new + scheduled_resumed
@@ -668,6 +763,7 @@ class TauScheduler(Scheduler):
                     )
                     for rid in task.req_ids
                     if (req := self.requests.get(rid)) is not None
+                    and self._wave_requests.get(rid) is req
                     and not req.is_finished()
                 )
                 active.append(
@@ -678,8 +774,9 @@ class TauScheduler(Scheduler):
                         prefill_completed=state.prefill_completed,
                         retired=state.retired or not requests,
                         in_flight=sum(
-                            slot.microbatch_index == task.index
-                            for slot, _, _, _ in self._inflight.values()
+                            forward.slot.microbatch_index == task.index
+                            and forward.wave_id == self._wave_id
+                            for forward in self._inflight.values()
                         ),
                     )
                 )
@@ -696,6 +793,7 @@ class TauScheduler(Scheduler):
                 snapshot_from_request(req, ctx.now, ctx.pp_size)
                 for req in self.waiting
                 if req.request_id not in admitted
+                or self._wave_requests.get(req.request_id) is not req
             ),
         )
 
@@ -705,7 +803,11 @@ class TauScheduler(Scheduler):
         alive: set[str] = set()
         for rid in ids:
             req = self.requests.get(rid)
-            if req is not None and not req.is_finished():
+            if (
+                req is not None
+                and self._wave_requests.get(rid) is req
+                and not req.is_finished()
+            ):
                 alive.add(rid)
         return alive
 
@@ -714,6 +816,10 @@ class TauScheduler(Scheduler):
             return False
         for rid in self._list.admitted_ids:
             req = self.requests.get(rid)
-            if req is not None and not req.is_finished():
+            if (
+                req is not None
+                and self._wave_requests.get(rid) is req
+                and not req.is_finished()
+            ):
                 return True
         return False

@@ -15,6 +15,7 @@ from vllm.v1.core.sched.tau_batch.types import (
     PackContext,
     TauRequestSnapshot,
     annotate_request_budget,
+    estimate_kv_blocks,
 )
 
 
@@ -165,6 +166,11 @@ class TauBatchPlanner:
                 raise ValueError(f"tasks[{i}].index must be {i}, got {task.index}")
             if not task.req_ids:
                 raise ValueError(f"tasks[{i}] must be non-empty")
+            if len(task.req_ids) > ctx.max_num_seqs:
+                raise ValueError(
+                    f"tasks[{i}] has {len(task.req_ids)} reqs, "
+                    f"max_num_seqs is {ctx.max_num_seqs}"
+                )
             if len(task.req_ids) > ctx.max_reqs_per_microbatch:
                 raise ValueError(
                     f"tasks[{i}] has {len(task.req_ids)} reqs, "
@@ -187,6 +193,18 @@ class TauBatchPlanner:
 
         if frozenset(seen) != admitted:
             raise ValueError("union of task req_ids must equal admitted_ids")
+        if ctx.kv_free_blocks is not None:
+            assert ctx.block_size is not None
+            reserved = sum(
+                estimate_kv_blocks(req.prompt_len, req.max_new_tokens, ctx.block_size)
+                for req in requests
+                if req.request_id in admitted
+            )
+            if reserved > ctx.kv_free_blocks:
+                raise ValueError(
+                    f"plan reserves {reserved} KV blocks, "
+                    f"only {ctx.kv_free_blocks} are free"
+                )
         if ctx.max_microbatches >= 1 and len(packed.tasks) > ctx.max_microbatches:
             raise ValueError(
                 f"{len(packed.tasks)} tasks, max is {ctx.max_microbatches}"

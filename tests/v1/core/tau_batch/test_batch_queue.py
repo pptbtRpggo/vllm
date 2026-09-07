@@ -3,8 +3,8 @@
 
 """CPU probe of EngineCore.step_with_batch_queue on v0.13.
 
-v0.13 stores (future, scheduler_output) in the queue. A 0-token
-schedule must not execute_model or enqueue.
+v0.13 stores (future, scheduler_output) in the queue. Pure waits must
+not execute_model or enqueue; zero-token control outputs must be delivered.
 """
 
 from __future__ import annotations
