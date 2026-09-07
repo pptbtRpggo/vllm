@@ -2,7 +2,9 @@
 
 本流程面向当前分支、单机 Ascend、TP=1、PP=2 和纯文本生成模型。
 `serve_tau.sh` 启动服务，`bench_tau.sh` 下载/读取 ShareGPT、压测、检查 trace。
-两者均使用当前环境的 `python`，也可以通过 `PYTHON=/path/to/python` 指定。
+服务直接调用当前环境的 `vllm serve`，流量直接调用 `vllm bench serve`。
+配置和 trace 辅助程序使用 `python`，可通过 `PYTHON=/path/to/python` 指定。
+`vllm` 与 `python` 应来自同一已配置环境。
 脚本不会安装或升级 CANN、torch-npu、vllm-ascend。
 
 `serve_tau.sh` 默认选择本仓库的
@@ -30,23 +32,27 @@ bash serve_tau.sh /absolute/path/to/model --dry-run
 ```
 
 应使用与本分支 vLLM 0.13.0 相容的 vllm-ascend 和依赖组合。
-脚本通过 `python -m vllm.entrypoints.cli.main` 并设置仓库 `PYTHONPATH` 来使用当前源码；
+`serve_tau.sh` 顶部列出所有可调参数、默认值和中文说明，下面直接构造 `vllm serve` 命令。
+脚本设置仓库 `PYTHONPATH` 来使用当前源码；
 环境仍须有兼容的 vLLM 编译产物、Ascend 插件和模型依赖。
 仅有一个未构建的源码 checkout 不等于环境安装完成。
 
 ## 2. 终端 A：启动服务
 
-以下模型路径需要替换；`RUN_DIR` 必须是尚不存在的目录，脚本负责创建。
+默认启动只需要模型路径，运行目录和本地 trace 文件自动生成：
 
 ```bash
 cd /path/to/vllm
-export RUN_DIR="$PWD/trace_runs/mb4_$(date +%Y%m%d_%H%M%S)"
-ASCEND_RT_VISIBLE_DEVICES=0,1 \
-MAX_REQS_PER_MB=4 \
-bash serve_tau.sh /absolute/path/to/model --run-dir "$RUN_DIR"
+bash serve_tau.sh /absolute/path/to/model
 ```
 
-服务保持前台运行，Ctrl+C 停止。启动时会打印实际 `RUN_DIR` 和终端 B 命令。
+服务保持前台运行，Ctrl+C 停止。启动时会打印实际 `RUN_DIR`、`TRACE` 和终端 B 命令。
+服务通过 shell 的 `exec` 启动，当前 PID 直接成为 vLLM，退出信号由 vLLM 处理。
+Python 辅助命令只保存配置和环境记录，不监护服务；不再生成 `server_exit.json`。
+`RUN_DIR` 默认是仓库下 `trace_runs/<时间>_<id>/`；`TRACE` 默认在系统临时目录
+（Linux 通常为 `/tmp`）下使用独立文件名。
+仍可通过环境变量或 `--run-dir` 指定运行目录，通过 `TRACE` 指定 trace 文件。
+指定的路径必须尚不存在；如需恢复自动路径，先 `unset RUN_DIR RUN TRACE`。
 不再通过删除正在写入的 trace 来开启新一轮；重启时使用新目录。
 `MODEL=/absolute/path/to/model bash serve_tau.sh` 形式仍然可用。
 
@@ -58,15 +64,14 @@ bash serve_tau.sh /absolute/path/to/model --run-dir "$RUN_DIR"
 | `TP` / `PP` | `1` / `2` | 张量/流水线并行度 |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | 本机访问地址；跨机访问时自行设置 HOST |
 | `MAX_MODEL_LEN` | `4096` | 请求总长度上限 |
-| `MAX_NUM_SEQS` | `32` | 单次 forward 请求容量 |
 | `MAX_NUM_BATCHED_TOKENS` | `8192` | 单次 forward token 预算 |
-| `MAX_REQS_PER_MB` | `4` | 单个 microbatch 请求数上限 |
+| `MAX_NUM_SEQS` | `4` | 单次 forward / 单个 microbatch 的请求数上限 |
 | `MAX_MICROBATCHES` | `0` | 不额外限制 wave 的 microbatch 数 |
 | `MIN_WAITING` | `0` | 不因等待阈值阻塞小样本或最后几个请求 |
 | `GPU_MEM` | `0.90` | 传给 vLLM 的 `--gpu-memory-utilization`，Ascend 沿用该名字 |
 
 相对旧脚本：`MIN_WAITING` 从 `MAX_NUM_SEQS` 改为 `0`；token 预算从 4096 改为 8192；
-HOST 改为本机地址；trace 默认使用每次启动的独立目录。
+HOST 改为本机地址；trace 默认使用每次启动的独立本地临时文件。
 8192 是本轮采集的预算选择，并非 Ascend 的强制要求，也不是 KV cache 容量。
 当改变 microbatch 上限时，仍可能因 token 预算或 KV 余量而形成更小的 microbatch。
 EOS 回调策略没有变化。
@@ -92,13 +97,39 @@ bash bench_tau.sh "$RUN_DIR" --dataset /data/ShareGPT_V3_unfiltered_cleaned_spli
 ```
 
 默认 smoke：32 个请求、每个生成 64 tokens、最大并发 32、无限请求发送速率。
-使用 `/v1/completions`，并设置 `--ignore-eos`，便于获得足够多的 decode 样本。
+使用 HTTP 流式请求 `/v1/completions`，默认设置 `--ignore-eos`，便于获得足够多的 decode 样本。
 脚本等待 `/v1/models` 就绪，并核对模型名。不要在同一个服务上同时发送其他请求或启动另一份 bench。
+
+`bench_tau.sh` 顶部集中定义流量参数，下面可直接查看完整 `vllm bench serve` 命令：
+
+| 变量 | 默认值 | 含义 |
+| --- | --- | --- |
+| `MODE` | `smoke` | `collect` 先预热再采集 |
+| `NUM_PROMPTS` | smoke 32 / collect 1000 | 正式请求数 |
+| `OUTPUT_LEN` | smoke 64 / collect 256 | 单请求目标输出长度 |
+| `CONCURRENCY` | `32` | 最多同时未完成的 HTTP 请求数，不控制 microbatch 大小 |
+| `REQUEST_RATE` | `inf` | 目标请求数/秒；实际发送还受并发限制 |
+| `BURSTINESS` | `1` | 有限速率下，1 按指数分布采样间隔；小于 1 更突发；inf 等间隔 |
+| `IGNORE_EOS` | `1` | 0 允许自然结束；trace 检查仍要求 prefill/decode 覆盖 |
+| `SEED` | `0` | 数据与到达间隔的随机种子 |
+| `WARMUP_REQUESTS` | `32` | collect 的额外预热请求数 |
+| `READY_TIMEOUT` | `300` | 等待服务就绪的秒数 |
+
+可以直接修改脚本默认值，也可以临时设置，例如：
+
+```bash
+REQUEST_RATE=5 BURSTINESS=inf CONCURRENCY=16 bash bench_tau.sh "$RUN_DIR" --mode collect
+```
+
+这是目标每秒 5 个请求、等间隔到达、最多 16 个未完成请求；达到并发上限时客户端等待。
+`REQUEST_RATE=inf` 时不设到达间隔，`BURSTINESS` 不起作用。
+Python 辅助程序只读取配置、记录采集区间和校验结果；预热与正式请求的执行顺序在 shell 中。
+运行期间按 Ctrl+C 或向 bench shell 发送 TERM 会停止客户端，不关闭服务。
 
 检查包含：客户端成功数、prefill/decode 在每个 PP rank 上的 compute 覆盖、
 每个 emit 是否有全部 rank 的 compute、重复记录、计时区间和特征字段是否有效。
 通过时返回 0；失败返回非零，并保留日志和报告。
-`--dry-run` 只打印最终 bench 命令，不下载数据或发送请求。
+`--dry-run` 只打印将执行的 bench 命令（collect 包含预热和正式两条），不下载数据或发送请求。
 
 ### 缺少 compute 时
 
@@ -155,27 +186,28 @@ RUN_DIR/
   packages.txt             # pip freeze
   npu.txt                  # npu-smi info
   server.log
-  server_exit.json         # 服务停止后写出
-  trace.jsonl
   bench/collect_<时间>_<id>/
     dataset.json           # 数据集路径、大小、SHA256
     warmup.json / warmup.log / warmup_command.json / warmup_trace_check.json
     result.json / result.log / result_command.json / result_trace_check.json
 ```
 
+原始 trace 位于 `run.json` 的 `trace` 字段指定位置，默认不在运行目录内。
+
 也可手动检查整个文件：
 
 ```bash
-python tools/tau_batch_run.py check-trace "$RUN_DIR/trace.jsonl" --pp 2
+TRACE=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["trace"])' "$RUN_DIR/run.json")
+python tools/tau_batch_run.py check-trace "$TRACE" --pp 2
 ```
 
 ## 5. 为预测器扩大覆盖范围
 
-仅一次 `MAX_REQS_PER_MB=4` 运行不足以覆盖所有 n 和上下文长度。
-可依次以 `MAX_REQS_PER_MB=1、2、4、8` 重启服务，每次使用新 `RUN_DIR`，
+仅一次 `MAX_NUM_SEQS=4` 运行不足以覆盖所有 n 和上下文长度。
+可依次以 `MAX_NUM_SEQS=1、2、4、8` 重启服务，每次使用新 `RUN_DIR`，
 在各服务上分别运行 `--output-len 64、256、512`，保持模型、TP/PP、token 预算等条件固定。
 需要稳定复现实验时固定 seed；需要不同样本时显式改变 seed，并按不同运行划分训练和验证集。
-`MAX_REQS_PER_MB` 只是上限，训练时使用 trace 中实际的 `n`、`seq_lens`、`tokens` 和 `pp_rank`。
+`MAX_NUM_SEQS` 只是上限，训练时使用 trace 中实际的 `n`、`seq_lens`、`tokens` 和 `pp_rank`。
 
 本分支 ShareGPT sampler 默认过滤 prompt 大于 1024 tokens、prompt+output 大于 2048 tokens 的样本。
 因此即使服务设为 `MAX_MODEL_LEN=4096`，本流程也不会自然产生接近 4096 的上下文覆盖。
@@ -183,8 +215,8 @@ python tools/tau_batch_run.py check-trace "$RUN_DIR/trace.jsonl" --pp 2
 
 ## 6. 全量分批采集与自动拟合
 
-共享 NFS 上的 JSONL 文件锁可能阻塞调度和 worker。长期采集时，启动服务前通过
-`TRACE=/tmp/tau_<唯一名称>.jsonl` 把实时 trace 放在服务器本地磁盘；
+共享 NFS 上的 JSONL 文件锁可能阻塞调度和 worker。当前默认把实时 trace 放在系统临时目录；
+若该目录被平台改到共享盘，启动前通过 `TRACE=/tmp/tau_<唯一名称>.jsonl` 指定本地磁盘。
 不要移动、清空或替换运行中的 trace。下面的 campaign 会把每批已完成的区间备份到输出目录。
 
 在服务已经启动、smoke 通过且没有其他客户端请求的前提下运行：
@@ -253,7 +285,7 @@ python tools/tau_batch_fit.py \
 保持通过 `serve_tau.sh` 启动的服务在线且空闲，在服务器另一终端运行：
 
 ```bash
-python tools/tau_batch_eos_smoke.py --run-dir /absolute/path/to/trace_runs/<本次服务目录>
+python tools/tau_batch_eos_smoke.py --run-dir "/absolute/path/to/trace_runs/<本次服务目录>"
 ```
 
 脚本使用 Python 标准库，只发送三个小请求，不启动或重启服务。

@@ -217,8 +217,10 @@ def test_campaign_covers_source_once_and_stops_on_failure(
     monkeypatch.setattr(campaign, "ensure_idle", lambda *args: None)
     monkeypatch.setattr(campaign, "fit", lambda *args: {"fitted": True})
     batches = []
+    monkeypatch.setenv("IGNORE_EOS", "0")
 
     def benchmark(command, **kwargs):
+        assert kwargs["env"]["IGNORE_EOS"] == "1"
         dataset = Path(command[command.index("--dataset") + 1])
         selected = json.loads(dataset.read_text())
         batches.append([x["id"] for x in selected])
@@ -246,6 +248,9 @@ def test_campaign_covers_source_once_and_stops_on_failure(
     else:
         campaign.campaign(args)
     state = json.loads((args.output_dir / "status.json").read_text())
+    manifest = json.loads((args.output_dir / "manifest.json").read_text())
+    assert "bench_tau.sh" in manifest["tools"]
+    assert "serve_tau.sh" in manifest["tools"]
     if fail_second:
         assert state["status"] == "failed"
         assert state["completed"] == 2

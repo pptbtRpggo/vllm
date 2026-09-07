@@ -190,7 +190,11 @@ def campaign(args):
                 "shard_size": args.shard_size,
                 "tools": {
                     p.name: digest(p)
-                    for p in Path(__file__).parent.glob("tau_batch_*.py")
+                    for p in [
+                        *Path(__file__).parent.glob("tau_batch_*.py"),
+                        Path(__file__).parents[1] / "bench_tau.sh",
+                        Path(__file__).parents[1] / "serve_tau.sh",
+                    ]
                 },
                 "note": "First two turns; fixed output length; no oversampling. "
                 "Each source row appears in one formal shard. Warmup excluded.",
@@ -298,7 +302,13 @@ def campaign(args):
             # count and output length above explicitly define the formal workload.
             with (args.output_dir / f"bench_{start:06d}.log").open("x") as log:
                 subprocess.run(
-                    command, stdout=log, stderr=subprocess.STDOUT, check=True
+                    command,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=True,
+                    # Campaign samples keep a fixed target output length even
+                    # if the interactive bench environment allows natural EOS.
+                    env={**os.environ, "IGNORE_EOS": "1"},
                 )
             complete(start, end, target / "result_trace_check.json")
         state["status"] = "fitting_all"
