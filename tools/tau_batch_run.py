@@ -4,7 +4,8 @@
 """Ascend fixed-wave trace collection helpers; uses only the Python stdlib.
 
 Run through serve_tau.sh / bench_tau.sh, or use the check-trace subcommand.
-This does not install packages or instrument the Ascend worker.
+Selects the repository's instrumented Ascend worker; does not modify the plugin
+installation or install packages.
 """
 
 import argparse
@@ -120,6 +121,8 @@ def serve_command(model, settings, trace):
     for key, flag in flags.items():
         command.extend(["--" + flag, settings[key]])
     return command + [
+        "--worker-cls",
+        "vllm.v1.worker.tau_ascend_worker.TauAscendWorker",
         "--scheduler-cls",
         "vllm.v1.core.sched.tau_batch.TauScheduler",
         "--tau-batch-trace",
@@ -453,7 +456,8 @@ def bench(args):
         if not report["passed"]:
             raise ValueError(
                 f"Trace is not ready for fitting; inspect {target}. "
-                "Missing compute events on Ascend require NPUWorker instrumentation. "
+                "If compute is missing, verify that serve selected TauAscendWorker "
+                "and its runner hook was installed (see server.log). "
                 "Do not substitute stage or done/PP for compute duration."
             )
 

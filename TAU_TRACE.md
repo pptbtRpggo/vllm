@@ -5,12 +5,17 @@
 两者均使用当前环境的 `python`，也可以通过 `PYTHON=/path/to/python` 指定。
 脚本不会安装或升级 CANN、torch-npu、vllm-ascend。
 
-**当前限制：本仓库细分 `compute` 埋点在 GPU worker；标准 vllm-ascend
-v0.13.0 的 NPUWorker 使用自己的执行路径，没有这些埋点。**
-因此，在尚未接入等价埋点的 Ascend 环境里，服务和请求可以运行，但采集检查预期会报
-`missing: ["pp0/prefill", ...]`，正式采集会中止。
-先运行 smoke 判断实际环境；只有 `stage` 或 `emit/done` 时，不应开始拟合计算耗时预测器。
-本次脚本没有修改外部 vllm-ascend 包。
+`serve_tau.sh` 默认选择本仓库的
+`vllm.v1.worker.tau_ascend_worker.TauAscendWorker`。
+它继承已安装的 `NPUWorker`，在插件完成设备和 runner 初始化后，
+仅包装该 runner 实例的 `execute_model()`，记录 `compute`；无需修改或重装插件。
+PP 通信、模型加载和返回值处理仍由插件完成。
+
+计时口径沿用 host 起止时间和结束时 NPU 同步，不是纯设备 kernel 时间。
+没有 `tau_fwd_id` 的调用不会添加同步。模型执行或同步失败会抛出异常，
+不会写出正常的 `compute` 记录。只有 `stage` 而没有 `compute` 时，
+采集检查仍会失败，不会把外层时间误作计算标签。
+此接入基于官方 vllm-ascend v0.13.0 的调用路径；自定义/其他版本插件仍需实机 smoke 验证。
 
 ## 1. 环境准备
 
@@ -99,14 +104,22 @@ bash bench_tau.sh "$RUN_DIR" --dataset /data/ShareGPT_V3_unfiltered_cleaned_spli
 
 查看 `bench/smoke_*/result_trace_check.json` 和服务日志。
 如果有 `stage`，但 `compute` 为 0，说明仅有 worker 外层执行区间。
-需要在远端实际使用的 `vllm_ascend.worker.worker.NPUWorker.execute_model` 内，
-针对本 rank 的模型执行接入 `trace_worker_phase(..., "compute")` 或等价实现，
-传递同一个 scheduler output，保留 `tau_fwd_id` / `tau_task`；根据实际实现单独标记通信。
-具体插入位置必须结合安装版本、异步返回路径和同步行为确认，不能仅用一个外层计时器替代。
+先确认服务已停止并用更新后的 `serve_tau.sh` 重新启动，不能只更新 bench。
+新服务的 `run.json` 中应包含：
+
+```text
+--worker-cls vllm.v1.worker.tau_ascend_worker.TauAscendWorker
+```
+
+`server.log` 中应出现 `Tau Ascend compute tracing installed`。
+如果没有，检查是否仍在使用旧服务或旧代码。
+如果选择了新 worker 仍缺少记录，需核对远端插件是否在初始化后替换了 runner，
+或使用不同的执行入口；保留 `run.json`、`packages.txt` 和 `server.log` 来定位。
+不要跳过检查器继续采集。
 
 `stage` 包括其包围的通信等待和调度开销；`done - emit` 则是一次 forward 从提交到回收的时长。
 两者都不能直接除以 PP 数当作单 stage 的计算时间。
-即使接入现有 compute context manager，记录的也是 host 区间加结束同步，
+当前 compute 记录的是 host 区间加结束同步，
 可能包括排队和调度开销，同步也可能改变流水线重叠。需要在 NPU 上验证测量边界；
 脚本结构检查通过不等于纯 kernel 时间已经测准。
 

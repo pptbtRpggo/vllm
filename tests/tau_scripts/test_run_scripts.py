@@ -217,6 +217,10 @@ def test_server_dry_run_and_existing_run_protection(tmp_path, monkeypatch, capsy
     preview = json.loads(capsys.readouterr().out)
     assert preview["settings"]["MIN_WAITING"] == "0"
     assert "/models/a b" in preview["command"]
+    command = preview["command"]
+    assert command[command.index("--worker-cls") + 1] == (
+        "vllm.v1.worker.tau_ascend_worker.TauAscendWorker"
+    )
     args.dry_run = False
     with pytest.raises(ValueError, match="NEW RUN_DIR"):
         runner.serve(args)

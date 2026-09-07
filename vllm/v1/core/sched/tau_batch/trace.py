@@ -270,12 +270,12 @@ def _sync_compute_device() -> None:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     npu = getattr(torch, "npu", None)
-    if npu is not None and callable(getattr(npu, "is_available", None)):
-        try:
-            if npu.is_available():
-                npu.synchronize()
-        except Exception:
-            return
+    if (
+        npu is not None
+        and callable(getattr(npu, "is_available", None))
+        and npu.is_available()
+    ):
+        npu.synchronize()
 
 
 def _pp_rank() -> int:
@@ -402,24 +402,26 @@ def trace_worker_phase(
     *,
     sync_end: bool = True,
 ) -> Iterator[None]:
-    """No-op unless ``scheduler_output.tau_fwd_id`` is set."""
+    """Record successful calls only; no-op without ``tau_fwd_id``.
+
+    Execution and synchronization exceptions propagate without writing a normal
+    phase event, so incomplete work cannot masquerade as a latency sample.
+    """
     fwd_id = getattr(scheduler_output, "tau_fwd_id", None)
     if fwd_id is None:
         yield
         return
     start_ts_ns = time.time_ns()
-    try:
-        yield
-    finally:
-        record_worker_phase(
-            vllm_config,
-            kind=kind,
-            fwd_id=int(fwd_id),
-            start_ts_ns=start_ts_ns,
-            req_ids=list(getattr(scheduler_output, "num_scheduled_tokens", {})),
-            features=getattr(scheduler_output, "tau_task", None),
-            sync_end=sync_end,
-        )
+    yield
+    record_worker_phase(
+        vllm_config,
+        kind=kind,
+        fwd_id=int(fwd_id),
+        start_ts_ns=start_ts_ns,
+        req_ids=list(getattr(scheduler_output, "num_scheduled_tokens", {})),
+        features=getattr(scheduler_output, "tau_task", None),
+        sync_end=sync_end,
+    )
 
 
 @dataclass(frozen=True)

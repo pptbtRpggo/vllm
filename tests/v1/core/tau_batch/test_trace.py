@@ -326,3 +326,45 @@ def test_decode_features_describe_context_including_input_token(tmp_path):
     events = _events(path)
     assert "hidden_size" in events[0]["config"]
     assert all("hidden_size" not in e for e in events if e["event"] == "emit")
+
+
+def test_npu_sync_error_is_not_silently_ignored(monkeypatch):
+    import torch
+
+    def fail():
+        raise RuntimeError("NPU sync failed")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(is_available=lambda: True, synchronize=fail),
+        raising=False,
+    )
+    with pytest.raises(RuntimeError, match="NPU sync failed"):
+        tau_trace._sync_compute_device()
+
+
+@pytest.mark.parametrize("failure", ["execution", "synchronization"])
+def test_phase_failure_does_not_record_success(tmp_path, monkeypatch, failure):
+    path = tmp_path / "failed.jsonl"
+    cfg = SimpleNamespace(scheduler_config=SimpleNamespace(tau_batch_trace=str(path)))
+    out = SimpleNamespace(tau_fwd_id=1, num_scheduled_tokens={"r": 1})
+    _reset_worker_tracer()
+
+    def fail():
+        raise RuntimeError("failed")
+
+    try:
+        monkeypatch.setattr(tau_trace, "_sync_compute_device", fail)
+        with (
+            pytest.raises(RuntimeError, match="failed"),
+            trace_worker_phase(cfg, out, "compute"),
+        ):
+            if failure == "execution":
+                fail()
+        assert not path.exists() or not _events(path)
+    finally:
+        if tau_trace._worker_tracer is not None:
+            tau_trace._worker_tracer.close()
+        _reset_worker_tracer()
