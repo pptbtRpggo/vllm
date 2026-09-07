@@ -4,4 +4,4 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-exec "${PYTHON:-python}" "${ROOT}/tools/tau_batch_run.py" serve "$@"
+exec "${PYTHON:-python}" "${ROOT}/tools/tau_batch_run.py" bench "$@"

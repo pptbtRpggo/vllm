@@ -228,3 +228,8 @@ ep_kernels_workspace/
 # Allow tracked library source folders under submodules (e.g., benchmarks/lib)
 !vllm/benchmarks/lib/
 tau_batch_trace*
+
+# Local tau trace collection runs and downloaded ShareGPT
+/trace_runs/
+/datasets/sharegpt.json
+/datasets/sharegpt.json.*.part
