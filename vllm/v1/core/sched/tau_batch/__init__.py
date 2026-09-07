@@ -7,6 +7,15 @@ from vllm.v1.core.sched.tau_batch.dispatch import (
     DispatchSlot,
     ListDispatcher,
 )
+from vllm.v1.core.sched.tau_batch.interfaces import (
+    LatencyEstimate,
+    LatencyOracle,
+    OnlinePolicy,
+    PipelineSnapshot,
+    PlanUpdate,
+    RefillProposal,
+    SchedulingEvent,
+)
 from vllm.v1.core.sched.tau_batch.planner import TauBatchPlanner
 from vllm.v1.core.sched.tau_batch.strategy import (
     EosStrategy,
@@ -17,7 +26,6 @@ from vllm.v1.core.sched.tau_batch.strategy import (
 from vllm.v1.core.sched.tau_batch.types import (
     EosEvent,
     MicroBatchList,
-    MicroBatchPlan,
     MicroBatchTask,
     PackContext,
     TaskFeatures,
@@ -39,8 +47,14 @@ __all__ = [
     "GreedyListStrategy",
     "ListDispatcher",
     "ListPackingStrategy",
+    "LatencyEstimate",
+    "LatencyOracle",
+    "OnlinePolicy",
+    "PipelineSnapshot",
+    "PlanUpdate",
+    "RefillProposal",
+    "SchedulingEvent",
     "MicroBatchList",
-    "MicroBatchPlan",
     "MicroBatchTask",
     "NoOpEosStrategy",
     "PackContext",

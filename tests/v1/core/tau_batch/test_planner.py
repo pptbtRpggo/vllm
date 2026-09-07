@@ -387,3 +387,62 @@ def test_greedy_skips_unfittable_and_takes_next():
     _assert_invariants(plan, requests, ctx)
     assert plan.admitted_ids == {"small"}
     assert plan.deferred_ids == {"big"}
+
+
+@pytest.mark.parametrize(
+    "cap,expected",
+    [
+        (1, [("a", "c")]),
+        (2, [("a", "c"), ("b",)]),
+        (0, [("a", "c"), ("b",)]),
+    ],
+)
+def test_token_overflow_scans_later_requests(cap, expected):
+    requests = [_req(rid, prompt_len=n) for rid, n in [("a", 7), ("b", 6), ("c", 3)]]
+    ctx = _ctx(max_microbatches=cap, max_num_batched_tokens=10)
+    plan = TauBatchPlanner().plan(requests, ctx)
+    assert [task.req_ids for task in plan.tasks] == expected
+    assert plan.deferred_ids == ({"b"} if cap == 1 else set())
+
+
+def test_individually_oversized_prompt_is_deferred():
+    requests = [_req("a", prompt_len=11), _req("b", prompt_len=10)]
+    plan = TauBatchPlanner().plan(requests, _ctx(max_num_batched_tokens=10))
+    assert plan.tasks[0].req_ids == ("b",)
+    assert plan.deferred_ids == {"a"}
+    assert TauBatchPlanner().plan(requests[:1], _ctx(max_num_batched_tokens=10)) is None
+
+
+def test_skipped_prompt_does_not_consume_kv_reservation():
+    requests = [
+        _req(rid, prompt_len=n, max_new_tokens=0)
+        for rid, n in [("a", 7), ("b", 6), ("c", 3)]
+    ]
+    ctx = _ctx(
+        max_microbatches=1, max_num_batched_tokens=10, kv_free_blocks=10, block_size=1
+    )
+    plan = TauBatchPlanner().plan(requests, ctx)
+    assert plan.tasks[0].req_ids == ("a", "c")
+
+
+def test_custom_packer_cannot_exceed_token_limit():
+    class Oversized:
+        def pack(self, requests, ctx):
+            from vllm.v1.core.sched.tau_batch import MicroBatchTask
+
+            return MicroBatchList(
+                tasks=(MicroBatchTask(("a", "b"), 0),),
+                admitted_ids=frozenset({"a", "b"}),
+                deferred_ids=frozenset(),
+            )
+
+    with pytest.raises(ValueError, match="prompt tokens"):
+        TauBatchPlanner(strategy=Oversized()).plan(
+            [_req("a", prompt_len=6), _req("b", prompt_len=6)],
+            _ctx(max_num_batched_tokens=10),
+        )
+
+
+def test_invalid_token_limit_rejected():
+    with pytest.raises(ValueError, match="max_num_batched_tokens"):
+        TauBatchPlanner().plan([_req("a")], _ctx(max_num_batched_tokens=0))

@@ -7,8 +7,9 @@ Driver events (emit/done) span the whole pipeline Future. Worker
 ``stage`` is the whole execute_model wall. Inside that, ``recv`` /
 ``compute`` / ``send`` split the PP rank: recv waits for the previous
 send, compute is this stage's forward, send is enqueue-return only
-(NCCL send is async). Plotting still places stage k after stage k-1
-ends. Cross-process alignment uses ``time.time_ns()``, not monotonic.
+(NCCL send is async). Plotting uses measured compute windows when available,
+otherwise the original host stage envelopes. Cross-process alignment uses
+``time.time_ns()``, not monotonic.
 
 Enable with ``--tau-batch-trace PATH`` or env ``TAU_BATCH_TRACE``.
 """
@@ -20,7 +21,7 @@ import os
 import threading
 import time
 from collections.abc import Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
@@ -29,7 +30,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 ENV_TRACE_PATH = "TAU_BATCH_TRACE"
 
 
@@ -57,9 +58,16 @@ class JsonlTracer:
     run can start without restarting the server.
     """
 
-    def __init__(self, path: str, *, write_meta: bool = True) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        write_meta: bool = True,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
         self.path = path
         self._write_meta = write_meta
+        self._metadata = dict(metadata or {})
         self._fp: TextIO | None = None
         self._lock = threading.RLock()
         self._fwd_id = 0
@@ -102,10 +110,8 @@ class JsonlTracer:
                 self._fp.flush()
             finally:
                 if flock is not None:
-                    try:
+                    with suppress(OSError):
                         flock.flock(self._fp.fileno(), flock.LOCK_UN)
-                    except OSError:
-                        pass
 
     def _fd_tracks_path(self, path: Path) -> bool:
         """False if the fd is closed, the path is gone, or it is a new inode.
@@ -129,19 +135,17 @@ class JsonlTracer:
         if self._fd_tracks_path(path):
             return True
         if self._fp is not None and not self._fp.closed:
-            try:
+            with suppress(OSError):
                 self._fp.close()
-            except OSError:
-                pass
             self._fp = None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            created = not path.exists()
-            self._fp = open(path, "a", encoding="utf-8")
-            if created or self._fp.tell() == 0:
-                self._fwd_id = 0
-                if self._write_meta:
-                    self._write_meta_line()
+            # Persistent writer; released by close() or when the inode changes.
+            self._fp = open(path, "a", encoding="utf-8")  # noqa: SIM115
+            # Driver metadata must be present even if a worker recreated
+            # the file first. Keep fwd IDs monotonic across inode changes.
+            if self._write_meta:
+                self._write_meta_line()
         except OSError:
             logger.exception("Failed to open JSONL trace %s", self.path)
             self._fp = None
@@ -154,6 +158,7 @@ class JsonlTracer:
             "mono_ns": time.monotonic_ns(),
             "event": "meta",
             "schema": SCHEMA_VERSION,
+            "config": self._metadata,
         }
         assert self._fp is not None
         self._fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -229,20 +234,14 @@ def pair_forwards(events: Iterable[Mapping[str, Any]]) -> list[ForwardSpan]:
             ForwardSpan(
                 fwd_id=fid,
                 wave_id=_opt_int(emit.get("wave_id", done.get("wave_id"))),
-                batch_idx=_opt_int(
-                    emit.get("batch_idx", done.get("batch_idx"))
-                ),
+                batch_idx=_opt_int(emit.get("batch_idx", done.get("batch_idx"))),
                 phase=str(emit.get("phase") or done.get("phase") or ""),
                 req_ids=req_ids,
                 num_tokens=_opt_int(emit.get("num_tokens", emit.get("tokens"))),
                 emit_mono_ns=int(emit["mono_ns"]),
                 done_mono_ns=int(done["mono_ns"]),
-                enqueue_mono_ns=_opt_int(
-                    (slot.get("enqueue") or {}).get("mono_ns")
-                ),
-                dequeue_mono_ns=_opt_int(
-                    (slot.get("dequeue") or {}).get("mono_ns")
-                ),
+                enqueue_mono_ns=_opt_int((slot.get("enqueue") or {}).get("mono_ns")),
+                dequeue_mono_ns=_opt_int((slot.get("dequeue") or {}).get("mono_ns")),
                 emit_ts_ns=_opt_int(emit.get("ts_ns")),
                 done_ts_ns=_opt_int(done.get("ts_ns")),
             )
@@ -294,11 +293,14 @@ def _ensure_worker_tracer(vllm_config: Any) -> JsonlTracer | None:
         _worker_tracer_ready = True
         cfg_path = ""
         if vllm_config is not None:
-            cfg_path = getattr(
-                getattr(vllm_config, "scheduler_config", None),
-                "tau_batch_trace",
-                "",
-            ) or ""
+            cfg_path = (
+                getattr(
+                    getattr(vllm_config, "scheduler_config", None),
+                    "tau_batch_trace",
+                    "",
+                )
+                or ""
+            )
         path = resolve_trace_path(cfg_path)
         if path:
             try:
@@ -349,7 +351,11 @@ def record_worker_stage(
     req_ids: list[str],
     features: Mapping[str, Any] | None = None,
 ) -> None:
-    """Append one per-rank execute_model envelope. Safe on PP workers."""
+    """Append the host execute_model envelope without another device barrier.
+
+    Device completion is measured by the compute hook where available.
+    This envelope alone is not a device computation duration.
+    """
     _record_worker_event(
         vllm_config,
         "stage",
@@ -357,7 +363,7 @@ def record_worker_stage(
         start_ts_ns=start_ts_ns,
         req_ids=req_ids,
         features=features,
-        sync_end=True,
+        sync_end=False,
     )
 
 
@@ -426,6 +432,7 @@ class StageCell:
     phase: str
     start_ts_ns: int
     end_ts_ns: int
+    kind: str = "stage"
 
     @property
     def duration_ms(self) -> float:
@@ -433,35 +440,32 @@ class StageCell:
 
 
 def pipeline_cells(events: Iterable[Mapping[str, Any]]) -> list[StageCell]:
-    """Build per-stage bars from ``stage`` events.
+    """Use measured compute windows, falling back to host stage envelopes.
 
-    Rank 0 uses its execute_model window. Rank k starts when rank k-1
-    ended (recv unblocks after the previous send).
+    Never manufacture a start timestamp from a different rank's end.
     """
+    events = list(events)
     forwards = {span.fwd_id: span for span in pair_forwards(events)}
     by_fwd: dict[int, dict[int, Mapping[str, Any]]] = {}
     for ev in events:
-        if ev.get("event") != "stage":
+        if ev.get("event") not in ("stage", "compute"):
             continue
         fwd_id = ev.get("fwd_id")
         rank = ev.get("pp_rank")
         if fwd_id is None or rank is None:
             continue
-        by_fwd.setdefault(int(fwd_id), {})[int(rank)] = ev
+        ranks = by_fwd.setdefault(int(fwd_id), {})
+        if ev.get("event") == "compute" or int(rank) not in ranks:
+            ranks[int(rank)] = ev
     cells: list[StageCell] = []
     for fwd_id, ranks in by_fwd.items():
         span = forwards.get(fwd_id)
         job = span.job if span is not None else f"fwd{fwd_id}"
         phase = span.phase if span is not None else ""
-        prev_end: int | None = None
         for rank in sorted(ranks):
             ev = ranks[rank]
-            raw_start = int(ev.get("start_ts_ns") or ev["ts_ns"])
-            raw_end = int(ev.get("end_ts_ns") or ev["ts_ns"])
-            start = raw_start if prev_end is None else prev_end
-            end = raw_end
-            if end < start:
-                start = raw_start
+            start = int(ev["start_ts_ns"])
+            end = int(ev["end_ts_ns"])
             cells.append(
                 StageCell(
                     fwd_id=fwd_id,
@@ -470,8 +474,8 @@ def pipeline_cells(events: Iterable[Mapping[str, Any]]) -> list[StageCell]:
                     phase=phase,
                     start_ts_ns=start,
                     end_ts_ns=end,
+                    kind=str(ev["event"]),
                 )
             )
-            prev_end = end
     cells.sort(key=lambda c: (c.start_ts_ns, c.pp_rank, c.fwd_id))
     return cells

@@ -513,6 +513,14 @@ class VllmConfig:
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
+        # Custom schedulers may constrain the worker execution contract.
+        # Apply it before validation and before any executor sees this config.
+        if self.scheduler_config.scheduler_cls is not None:
+            scheduler_cls = self.scheduler_config.get_scheduler_cls()
+            configure = getattr(scheduler_cls, "configure_vllm_config", None)
+            if configure is not None:
+                configure(self)
+
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
 

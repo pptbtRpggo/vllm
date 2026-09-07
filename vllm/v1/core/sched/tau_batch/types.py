@@ -3,7 +3,10 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.tau_batch.interfaces import LatencyOracle
 
 
 @dataclass(frozen=True)
@@ -99,33 +102,31 @@ class EosEvent:
     waiting_ids: tuple[str, ...]
 
 
-# Older name kept so existing imports keep working.
-MicroBatchPlan = MicroBatchTask
-
-
 @dataclass(frozen=True)
 class PackContext:
     """Shared packing limits for one pack call.
 
     Request-level SLOs live on TauRequestSnapshot. The default greedy
-    strategy uses the caps below (take then split). A later paper
+    strategy scans the entire pool using the caps below. A later paper
     strategy can use the SLOs, wait/slack, and ``oracle``.
 
     Attributes:
         now: Current timestamp in seconds (same clock as arrival_time).
             Used to compute wait and TTFT slack at plan time.
-        max_num_seqs: Take at most this many from the waiting snapshot.
-        max_microbatches: Then pack at most this many micro-batch tasks.
+        max_num_seqs: Current scheduler running-request cap. This does not
+            truncate the candidate pool or constrain the default packer.
+        max_microbatches: Pack at most this many micro-batch tasks; 0 is unlimited.
         max_reqs_per_microbatch: Max n in one micro-batch task. Not
             derived from max_num_seqs or max_microbatches. Overflow is
-            deferred; a short take is packed as-is.
+            deferred; a short pool is packed as-is.
         pp_size: Pipeline-parallel size M. Used for ``τ_max = TPOT / M``.
         kv_free_blocks: Free KV blocks at pack time. None disables the
             KV filter.
         block_size: Tokens per KV block. Required when kv_free_blocks is set.
-        max_num_batched_tokens: Unused. Kept so older callers still construct
-            PackContext.
-        oracle: Latency oracle. Reserved for later strategies.
+        max_num_batched_tokens: Maximum sum of full prompt lengths per task.
+            None disables this limit for standalone callers. The scheduler
+            always supplies its worker token capacity.
+        oracle: Optional per-stage latency predictor, injected by the caller.
     """
 
     now: float
@@ -136,7 +137,7 @@ class PackContext:
     kv_free_blocks: int | None = None
     block_size: int | None = None
     max_num_batched_tokens: int | None = None
-    oracle: Any | None = None
+    oracle: "LatencyOracle | None" = None
 
 
 @dataclass(frozen=True)
@@ -222,9 +223,7 @@ def request_budget_dict(req: TauRequestSnapshot) -> dict[str, Any]:
     }
 
 
-def estimate_kv_blocks(
-    prompt_len: int, max_new_tokens: int, block_size: int
-) -> int:
+def estimate_kv_blocks(prompt_len: int, max_new_tokens: int, block_size: int) -> int:
     """Blocks needed for prompt plus max generate length.
 
     Args:

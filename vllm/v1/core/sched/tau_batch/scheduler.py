@@ -2,18 +2,29 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
+from copy import deepcopy
+from dataclasses import replace
 from typing import Any
 
-from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.tau_batch.config import (
+    configure_tau_batch,
+    validate_tau_batch_config,
+)
 from vllm.v1.core.sched.tau_batch.dispatch import (
     DispatchPhase,
     DispatchPolicy,
     DispatchSlot,
     ListDispatcher,
+)
+from vllm.v1.core.sched.tau_batch.interfaces import (
+    ActiveMicroBatchSnapshot,
+    ActiveRequestSnapshot,
+    LatencyOracle,
+    PipelineSnapshot,
 )
 from vllm.v1.core.sched.tau_batch.planner import TauBatchPlanner
 from vllm.v1.core.sched.tau_batch.trace import JsonlTracer, resolve_trace_path
@@ -46,51 +57,12 @@ def _resolve_max_microbatches(configured: int) -> int:
     return configured
 
 
-def _enforce_slot_runtime_contract(vllm_config: VllmConfig) -> None:
-    """Turn off features that split one Prefill slot across forwards.
-
-    Tau-batch treats one ``schedule()`` as one complete Prefill or Decode
-    slot. Chunked prefill, prefix-cache hits, long-prefill caps,
-    speculative decode, and async scheduling break that contract. This
-    mutates ``vllm_config`` before ``Scheduler.__init__`` so the parent
-    KV manager and token budget see the disabled flags.
-    """
-    disabled: list[str] = []
-    sched = vllm_config.scheduler_config
-    cache = vllm_config.cache_config
-
-    if sched.enable_chunked_prefill:
-        sched.enable_chunked_prefill = False
-        disabled.append("enable_chunked_prefill")
-    if sched.long_prefill_token_threshold != 0:
-        sched.long_prefill_token_threshold = 0
-        disabled.append("long_prefill_token_threshold")
-    if sched.max_num_partial_prefills > 1:
-        sched.max_num_partial_prefills = 1
-        disabled.append("max_num_partial_prefills")
-    if sched.async_scheduling:
-        sched.async_scheduling = False
-        disabled.append("async_scheduling")
-    if cache.enable_prefix_caching:
-        cache.enable_prefix_caching = False
-        disabled.append("enable_prefix_caching")
-    if vllm_config.speculative_config is not None:
-        vllm_config.speculative_config = None
-        disabled.append("speculative_config")
-
-    if disabled:
-        logger.warning(
-            "TauScheduler disabled unsupported features: %s. "
-            "These would split a micro-batch Prefill across forwards.",
-            ", ".join(disabled),
-        )
-
-
 def _request_seq_len(request: Request, phase: DispatchPhase) -> int:
     """Length that enters the SCLS affine model for this phase.
 
-    Prefill uses prompt length L. Decode uses current context length l
-    (tokens already in KV).
+    Prefill uses prompt length L. Called after _update_after_schedule,
+    Decode uses the planned context length including this forward's input
+    token. In-flight work is not necessarily present in device KV yet.
     """
     if phase is DispatchPhase.PREFILL:
         return int(request.num_prompt_tokens)
@@ -146,10 +118,11 @@ class TauScheduler(Scheduler):
     New arrivals stay in waiting until the active list has no unfinished
     admitted requests.
 
-    ``__init__`` disables chunked prefill, prefix caching, long-prefill
-    caps, speculative decode, and async scheduling so a Prefill slot is
-    not split across forwards.
+    ``configure_vllm_config`` disables unsupported features before workers
+    initialize. ``__init__`` only validates that execution contract.
     """
+
+    configure_vllm_config = staticmethod(configure_tau_batch)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         vllm_config = kwargs.get("vllm_config")
@@ -157,9 +130,11 @@ class TauScheduler(Scheduler):
             vllm_config = args[0]
         if vllm_config is None:
             raise TypeError("TauScheduler requires vllm_config")
-        _enforce_slot_runtime_contract(vllm_config)
+        validate_tau_batch_config(vllm_config)
+        planner = kwargs.pop("planner", None)
+        self.latency_oracle: LatencyOracle | None = kwargs.pop("latency_oracle", None)
         super().__init__(*args, **kwargs)
-        self.planner = TauBatchPlanner()
+        self.planner = planner if planner is not None else TauBatchPlanner()
         self.dispatcher = ListDispatcher(DispatchPolicy.OVERLAP)
         self.max_reqs_per_microbatch = (
             self.scheduler_config.tau_batch_max_reqs_per_microbatch
@@ -171,11 +146,13 @@ class TauScheduler(Scheduler):
         self._list: MicroBatchList | None = None
         self._wave_id: int | None = None
         self._next_wave_id = 0
-        self._inflight: dict[int, tuple[DispatchSlot, int, dict[str, Any], int]] = {}
+        self._inflight: dict[
+            int, tuple[DispatchSlot, int, dict[str, Any], int | None]
+        ] = {}
         trace_path = resolve_trace_path(self.scheduler_config.tau_batch_trace)
         self._tracer: JsonlTracer | None = None
         if trace_path:
-            self._tracer = JsonlTracer(trace_path)
+            self._tracer = JsonlTracer(trace_path, metadata=self._model_trace_fields())
             logger.warning(
                 "TauScheduler JSONL trace: %s (created on first write)",
                 trace_path,
@@ -211,18 +188,13 @@ class TauScheduler(Scheduler):
         self._trace(action, fwd_id=fwd_id, queue_depth=depth)
 
     def schedule(self) -> SchedulerOutput:
-        for _ in range(2):
-            self._maybe_start_list()
-            if self._list is None:
-                return SchedulerOutput.make_empty()
-            slot, allowed = self._next_slot()
-            if slot is None:
-                if not self._admitted_unfinished():
-                    self._clear_list()
-                    continue
-                return SchedulerOutput.make_empty()
-            return self._schedule_slot(slot, allowed)
-        return SchedulerOutput.make_empty()
+        self._ensure_active_list()
+        if self._list is None:
+            return SchedulerOutput.make_empty()
+        slot, allowed = self._next_slot()
+        if slot is None:
+            return SchedulerOutput.make_empty()
+        return self._schedule_slot(slot, allowed)
 
     def update_from_output(
         self,
@@ -240,7 +212,7 @@ class TauScheduler(Scheduler):
         result = super().update_from_output(scheduler_output, model_runner_output)
         if slot is not None and slot.phase is DispatchPhase.PREFILL:
             self.dispatcher.on_prefill_complete(slot.microbatch_index)
-        if slot is not None:
+        if slot is not None and self._tracer is not None:
             duration_ms = None
             if emit_mono_ns is not None:
                 duration_ms = (time.monotonic_ns() - emit_mono_ns) / 1e6
@@ -250,14 +222,6 @@ class TauScheduler(Scheduler):
                 wave_id=self._wave_id,
                 batch_idx=slot.microbatch_index,
                 req_ids=list(scheduler_output.num_scheduled_tokens),
-                duration_ms=duration_ms,
-                **features,
-            )
-            self._trace(
-                "task",
-                fwd_id=fwd_id,
-                wave_id=self._wave_id,
-                batch_idx=slot.microbatch_index,
                 duration_ms=duration_ms,
                 **features,
             )
@@ -324,7 +288,8 @@ class TauScheduler(Scheduler):
         self._wave_id = None
         self.dispatcher.reset()
 
-    def _maybe_start_list(self) -> None:
+    def _ensure_active_list(self) -> None:
+        """Keep the unfinished list or replace it from the waiting pool."""
         if self._list is not None and self._admitted_unfinished():
             return
         self._clear_list()
@@ -363,18 +328,14 @@ class TauScheduler(Scheduler):
 
     def _next_slot(self) -> tuple[DispatchSlot | None, set[str]]:
         assert self._list is not None
-        p = len(self._list.tasks)
-        skips = 0
-        while skips < p:
-            slot = self.dispatcher.peek_slot()
-            if slot is None:
-                return None, set()
-            allowed = self._alive_ids(slot)
-            if allowed:
-                return slot, allowed
-            self.dispatcher.commit_slot(slot)
-            skips += 1
-        return None, set()
+        # Retire BEFORE peek: an unissued cancelled Prefill can otherwise
+        # block the readiness gate before we get a slot to skip.
+        for task in self._list.tasks:
+            slot = DispatchSlot(task.index, DispatchPhase.PREFILL)
+            if not self._alive_ids(slot):
+                self.dispatcher.retire(task.index)
+        slot = self.dispatcher.peek_slot()
+        return (None, set()) if slot is None else (slot, self._alive_ids(slot))
 
     def _schedule_slot(self, slot: DispatchSlot, allowed: set[str]) -> SchedulerOutput:
         assert self._list is not None
@@ -383,6 +344,11 @@ class TauScheduler(Scheduler):
             for rid in self._list.tasks[slot.microbatch_index].req_ids
             if rid in allowed
         ]
+        # Validate the complete forward before allocating KV or mutating
+        # request state. The packer skips non-fitting requests; a malformed
+        # custom plan must not silently turn into a partial Prefill.
+        planned_tokens = sum(max(0, self._num_new_tokens(req)) for req in reqs)
+        self._validate_forward_tokens(planned_tokens)
         scheduled_new: list[Request] = []
         scheduled_running: list[Request] = []
         scheduled_resumed: list[Request] = []
@@ -440,11 +406,13 @@ class TauScheduler(Scheduler):
             num_scheduled_tokens,
         )
         self.dispatcher.commit_slot(slot)
+        if self._tracer is None:
+            self._inflight[id(out)] = (slot, 0, {}, None)
+            return out
         scheduled = [req for req in reqs if req.request_id in num_scheduled_tokens]
         features = self._task_features(
             slot, scheduled, int(out.total_num_scheduled_tokens)
         ).as_dict()
-        features.update(self._model_trace_fields())
         now = time.time()
         features["req_waits"] = [
             {
@@ -460,10 +428,8 @@ class TauScheduler(Scheduler):
             for k in ("phase", "n", "s_max", "s_sum", "tokens", "pp_size", "seq_lens")
             if k in features
         }
-        fwd_id = 0
-        if self._tracer is not None:
-            fwd_id = self._tracer.next_fwd_id()
-            out.tau_fwd_id = fwd_id
+        fwd_id = self._tracer.next_fwd_id()
+        out.tau_fwd_id = fwd_id
         self._inflight[id(out)] = (slot, fwd_id, features, time.monotonic_ns())
         self._trace(
             "emit",
@@ -474,6 +440,14 @@ class TauScheduler(Scheduler):
             **features,
         )
         return out
+
+    def _validate_forward_tokens(self, tokens: int) -> None:
+        if tokens > self.max_num_scheduled_tokens:
+            raise ValueError(
+                f"TauScheduler forward has {tokens} tokens, "
+                f"max_num_batched_tokens is {self.max_num_scheduled_tokens}; "
+                "repack complete requests without chunked prefill"
+            )
 
     def _num_new_tokens(self, request: Request) -> int:
         num_new = (
@@ -559,6 +533,7 @@ class TauScheduler(Scheduler):
         req_to_new_blocks: dict[str, KVCacheBlocks],
         num_scheduled_tokens: dict[str, int],
     ) -> SchedulerOutput:
+        self._validate_forward_tokens(sum(num_scheduled_tokens.values()))
         if self.use_v2_model_runner:
             scheduled_new = scheduled_new + scheduled_resumed
             scheduled_resumed = []
@@ -633,12 +608,20 @@ class TauScheduler(Scheduler):
         cfg = getattr(self.vllm_config.model_config, "hf_text_config", None)
         if cfg is None:
             cfg = getattr(self.vllm_config.model_config, "hf_config", None)
-        fields: dict[str, Any] = {}
+        fields: dict[str, Any] = {
+            "model": self.vllm_config.model_config.model,
+            "dtype": str(self.vllm_config.model_config.dtype),
+            "pp_size": self.parallel_config.pipeline_parallel_size,
+            "tp_size": self.parallel_config.tensor_parallel_size,
+            "kv_cache_dtype": self.vllm_config.cache_config.cache_dtype,
+            "worker_cls": str(self.parallel_config.worker_cls),
+        }
         if cfg is None:
             return fields
         for name in (
             "hidden_size",
             "num_attention_heads",
+            "num_key_value_heads",
             "num_hidden_layers",
             "intermediate_size",
         ):
@@ -657,6 +640,63 @@ class TauScheduler(Scheduler):
             pp_size=pp,
             kv_free_blocks=self.kv_cache_manager.block_pool.get_num_free_blocks(),
             block_size=self.block_size,
+            max_num_batched_tokens=self.max_num_scheduled_tokens,
+            oracle=self.latency_oracle,
+        )
+
+    def pipeline_snapshot(self) -> PipelineSnapshot:
+        """Expose the live execution state for future event-driven policies.
+
+        This does not run an online policy or apply refill proposals. The
+        default scheduler still drains a fixed list before packing another.
+        """
+        ctx = self._pack_context()
+        active = []
+        admitted = self._list.admitted_ids if self._list else frozenset()
+        if self._list is not None:
+            for task in self._list.tasks:
+                state = self.dispatcher.task_state(task.index)
+                requests = tuple(
+                    ActiveRequestSnapshot(
+                        request=snapshot_from_request(req, ctx.now, ctx.pp_size),
+                        computed_tokens=req.num_computed_tokens,
+                        output_tokens=req.num_output_tokens,
+                        kv_block_ids=tuple(
+                            tuple(ids)
+                            for ids in self.kv_cache_manager.get_block_ids(rid)
+                        ),
+                    )
+                    for rid in task.req_ids
+                    if (req := self.requests.get(rid)) is not None
+                    and not req.is_finished()
+                )
+                active.append(
+                    ActiveMicroBatchSnapshot(
+                        index=task.index,
+                        requests=requests,
+                        prefill_dispatched=state.prefill_dispatched,
+                        prefill_completed=state.prefill_completed,
+                        retired=state.retired or not requests,
+                        in_flight=sum(
+                            slot.microbatch_index == task.index
+                            for slot, _, _, _ in self._inflight.values()
+                        ),
+                    )
+                )
+        return PipelineSnapshot(
+            context=ctx,
+            wave_id=self._wave_id,
+            active_plan=(
+                replace(self._list, extra=deepcopy(dict(self._list.extra)))
+                if self._list
+                else None
+            ),
+            active=tuple(active),
+            waiting=tuple(
+                snapshot_from_request(req, ctx.now, ctx.pp_size)
+                for req in self.waiting
+                if req.request_id not in admitted
+            ),
         )
 
     def _alive_ids(self, slot: DispatchSlot) -> set[str]:

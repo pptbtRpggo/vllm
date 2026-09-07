@@ -16,9 +16,7 @@ pytestmark = pytest.mark.cpu_test
 
 
 def _list(p: int = 3) -> MicroBatchList:
-    tasks = tuple(
-        MicroBatchTask(req_ids=(f"r{i}",), index=i) for i in range(p)
-    )
+    tasks = tuple(MicroBatchTask(req_ids=(f"r{i}",), index=i) for i in range(p))
     admitted = frozenset(rid for task in tasks for rid in task.req_ids)
     return MicroBatchList(
         tasks=tasks,
@@ -136,3 +134,34 @@ def test_reset_clears_list_and_peek():
     disp.reset()
     assert disp.active_list is None
     assert disp.peek_slot() is None
+
+
+@pytest.mark.parametrize("policy", list(DispatchPolicy))
+def test_retired_unissued_prefill_does_not_block_decode(policy):
+    disp = ListDispatcher(policy)
+    disp.start(_list(2))
+    disp.commit_slot(disp.peek_slot())
+    disp.on_prefill_complete(0)
+    disp.retire(1)
+    assert not disp.task_state(1).prefill_dispatched
+    assert not disp.task_state(1).prefill_completed
+    for _ in range(3):
+        slot = disp.peek_slot()
+        assert slot == DispatchSlot(0, DispatchPhase.DECODE)
+        disp.commit_slot(slot)
+    disp.retire(0)
+    assert disp.peek_slot() is None
+    disp.start(_list(2))
+    assert not disp.task_state(1).retired
+    assert disp.peek_slot() == DispatchSlot(0, DispatchPhase.PREFILL)
+
+
+def test_retire_inflight_preserves_index_and_completion():
+    disp = ListDispatcher()
+    disp.start(_list(2))
+    _commit_prefills(disp, 2)
+    disp.retire(0)
+    disp.on_prefill_complete(0)
+    disp.on_prefill_complete(1)
+    assert disp.task_state(0).prefill_dispatched
+    assert disp.peek_slot() == DispatchSlot(1, DispatchPhase.DECODE)

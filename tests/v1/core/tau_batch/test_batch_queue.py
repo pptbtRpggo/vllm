@@ -22,9 +22,9 @@ from tests.v1.core.tau_batch.test_scheduler import (
     _sampled,
     _tau_scheduler,
 )
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.tau_batch.dispatch import DispatchPhase, DispatchPolicy
 from vllm.v1.core.sched.tau_batch.scheduler import TauScheduler
-from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine.core import EngineCore
 
 pytestmark = pytest.mark.cpu_test
@@ -43,10 +43,7 @@ def _slot_name(out: SchedulerOutput) -> str:
             if ids <= packed:
                 batch = idx
                 break
-    if batch is None:
-        label = ",".join(sorted(ids))
-    else:
-        label = f"B{batch}"
+    label = ",".join(sorted(ids)) if batch is None else f"B{batch}"
     phase = "pre" if out.scheduled_new_reqs else "dec"
     return f"{label}_{phase}"
 
@@ -59,7 +56,7 @@ def _peek_name(sched: TauScheduler) -> str | None:
     return f"B{slot.microbatch_index}_{short}"
 
 
-def _queue_names(core: "_QueueCore") -> tuple[str, ...]:
+def _queue_names(core: _QueueCore) -> tuple[str, ...]:
     return tuple(_slot_name(item[1]) for item in reversed(core.batch_queue))
 
 
@@ -143,9 +140,7 @@ def _run_queue(
             break
         peek = _peek_name(sched)
         before = [id(item[1]) for item in core.batch_queue]
-        before_names = {
-            id(item[1]): _slot_name(item[1]) for item in core.batch_queue
-        }
+        before_names = {id(item[1]): _slot_name(item[1]) for item in core.batch_queue}
         outputs, _executed = core.step_with_batch_queue()
         after_ids = [id(item[1]) for item in core.batch_queue]
         added = [i for i in after_ids if i not in before]
@@ -179,9 +174,7 @@ def _run_queue(
 
 
 def test_overlap_fills_then_pops_oldest_prefill():
-    traces = _run_queue(
-        policy=DispatchPolicy.OVERLAP, queue_size=2, max_tokens=2
-    )
+    traces = _run_queue(policy=DispatchPolicy.OVERLAP, queue_size=2, max_tokens=2)
     assert traces[0].action == "fill"
     assert traces[0].scheduled == "B0_pre"
     assert traces[0].queue_after == ("B0_pre",)
@@ -192,9 +185,7 @@ def test_overlap_fills_then_pops_oldest_prefill():
 
 
 def test_drain_zero_token_does_not_enqueue():
-    traces = _run_queue(
-        policy=DispatchPolicy.DRAIN, queue_size=2, max_tokens=2
-    )
+    traces = _run_queue(policy=DispatchPolicy.DRAIN, queue_size=2, max_tokens=2)
     assert [t.scheduled for t in traces[:2]] == ["B0_pre", "B1_pre"]
     wait_steps = [t for t in traces[2:] if t.action == "wait/pop"]
     assert wait_steps

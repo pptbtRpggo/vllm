@@ -125,7 +125,7 @@ def pipeline_to_html(cells, *, title: str = "τ-Batch PP pipeline") -> str:
             bars.append(
                 f'<rect x="{x:.1f}" y="{y + 6:.1f}" width="{w:.1f}" '
                 f'height="{row_h - 14}" fill="{color}" opacity="0.9" rx="2">'
-                f"<title>{label} PP{rank} {dur}</title></rect>"
+                f"<title>{label} PP{rank} {html.escape(c.kind)} {dur}</title></rect>"
             )
     axis = (
         f'<line x1="{left}" y1="{top - 8}" x2="{left + width}" '
@@ -142,9 +142,9 @@ def pipeline_to_html(cells, *, title: str = "τ-Batch PP pipeline") -> str:
     )
     note = (
         "<p style='font:13px/1.4 system-ui;max-width:72rem'>"
-        "Each row is one PP rank. A bar is that rank's "
-        "<code>execute_model</code> (rank 0) or the interval after the "
-        "previous rank finished (recv unblocks, then this rank computes). "
+        "Each row is one PP rank. Bars use measured <code>compute</code> "
+        "windows when available, otherwise raw host <code>stage</code> "
+        "envelopes (including waits; not device compute time). "
         "Wall clock is <code>time.time_ns()</code> across worker processes."
         "</p>"
     )
@@ -161,9 +161,7 @@ def pipeline_to_html(cells, *, title: str = "τ-Batch PP pipeline") -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Plot τ-Batch JSONL Gantt to HTML."
-    )
+    parser = argparse.ArgumentParser(description="Plot τ-Batch JSONL Gantt to HTML.")
     parser.add_argument("trace", type=Path, help="JSONL from --tau-batch-trace")
     parser.add_argument(
         "-o",
@@ -178,17 +176,13 @@ def main(argv: list[str] | None = None) -> int:
     spans = pair_forwards(events)
     out = args.output or args.trace.with_suffix(".html")
     if cells:
-        out.write_text(
-            pipeline_to_html(cells, title=str(args.trace)), encoding="utf-8"
-        )
+        out.write_text(pipeline_to_html(cells, title=str(args.trace)), encoding="utf-8")
         print(
             f"wrote {out} ({len(cells)} stage cells, "
             f"{len(spans)} forwards, {len(events)} events)"
         )
     else:
-        out.write_text(
-            spans_to_html(spans, title=str(args.trace)), encoding="utf-8"
-        )
+        out.write_text(spans_to_html(spans, title=str(args.trace)), encoding="utf-8")
         print(f"wrote {out} occupancy only ({len(spans)} forwards; no stage events)")
     return 0
 

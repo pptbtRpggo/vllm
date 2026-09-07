@@ -36,6 +36,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 pytestmark = pytest.mark.cpu_test
 
 EOS_TOKEN_ID = 50256
+TEST_MODEL = "facebook/opt-125m"
 _none_hash_initialized = False
 
 
@@ -52,12 +53,11 @@ def _tau_scheduler(
     enable_prefix_caching: bool = False,
     async_scheduling: bool = False,
     long_prefill_token_threshold: int = 0,
-    speculative_config: object | None = None,
     tau_batch_min_waiting: int = 0,
     tau_batch_trace: str = "",
 ) -> TauScheduler:
     model_config = ModelConfig(
-        model="facebook/opt-125m",
+        model=TEST_MODEL,
         trust_remote_code=True,
         dtype="float16",
         seed=42,
@@ -70,6 +70,7 @@ def _tau_scheduler(
         long_prefill_token_threshold=long_prefill_token_threshold,
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,
+        scheduler_cls="vllm.v1.core.sched.tau_batch.TauScheduler",
         is_encoder_decoder=model_config.is_encoder_decoder,
         tau_batch_min_waiting=tau_batch_min_waiting,
         tau_batch_max_reqs_per_microbatch=tau_batch_max_reqs_per_microbatch,
@@ -89,8 +90,6 @@ def _tau_scheduler(
         cache_config=cache_config,
         parallel_config=ParallelConfig(pipeline_parallel_size=pipeline_parallel_size),
     )
-    if speculative_config is not None:
-        vllm_config.speculative_config = speculative_config
     kv_cache_config = KVCacheConfig(
         num_blocks=10000,
         kv_cache_tensors=[],
@@ -323,12 +322,10 @@ def test_allocate_fail_all_returns_empty():
 
 
 def test_init_disables_features_that_split_prefill():
-    spec = SimpleNamespace(num_speculative_tokens=4, use_eagle=lambda: False)
     sched = _tau_scheduler(
         enable_chunked_prefill=True,
         enable_prefix_caching=True,
         long_prefill_token_threshold=4,
-        speculative_config=spec,
     )
     assert sched.scheduler_config.enable_chunked_prefill is False
     assert sched.scheduler_config.long_prefill_token_threshold == 0
@@ -339,9 +336,9 @@ def test_init_disables_features_that_split_prefill():
 
 
 def test_init_disables_async_scheduling():
-    # VllmConfig rejects async scheduling when PP > 1.
+    # Normalize before VllmConfig would reject async scheduling with PP.
     sched = _tau_scheduler(
-        pipeline_parallel_size=1,
+        pipeline_parallel_size=2,
         async_scheduling=True,
     )
     assert sched.scheduler_config.async_scheduling is False
@@ -439,3 +436,142 @@ def test_pack_context_honors_explicit_p():
     ctx = sched._pack_context()
     assert ctx.max_reqs_per_microbatch == 4
     assert ctx.max_microbatches == 2
+
+
+def test_scheduler_packs_full_prompts_within_token_budget():
+    sched = _tau_scheduler(max_reqs_per_microbatch=3)
+    sched.max_num_scheduled_tokens = 10
+    for rid, length in [("a", 7), ("b", 6), ("c", 3)]:
+        sched.add_request(_req(rid, tpot_slo_ms=100, prompt_len=length))
+    first = sched.schedule()
+    second = sched.schedule()
+    assert first.num_scheduled_tokens == {"a": 7, "c": 3}
+    assert second.num_scheduled_tokens == {"b": 6}
+    assert not sched.scheduler_config.enable_chunked_prefill
+
+
+def test_emit_validation_precedes_allocation_and_state_mutation():
+    sched = _tau_scheduler()
+    requests = _add_requests(sched, n=2)
+    sched._ensure_active_list()
+    # Simulate a stale/custom plan after runtime capacity changes.
+    sched.max_num_scheduled_tokens = 12
+    with patch.object(sched.kv_cache_manager, "allocate_slots") as allocate:
+        with pytest.raises(ValueError, match="forward has 16 tokens"):
+            sched.schedule()
+        allocate.assert_not_called()
+    assert all(req.num_computed_tokens == 0 for req in requests)
+    assert len(sched.waiting) == 2
+    assert not sched.running
+    assert sched.dispatcher.peek_slot().phase is DispatchPhase.PREFILL
+
+
+@pytest.mark.parametrize("policy", list(DispatchPolicy))
+def test_cancelled_prefill_batch_cannot_stall_surviving_requests(policy):
+    sched = _tau_scheduler()
+    sched.dispatcher = ListDispatcher(policy)
+    _add_requests(sched, max_tokens=4)
+    pre = sched.schedule()
+    sched.update_from_output(pre, _sampled(pre))
+    sched.finish_requests(["r2", "r3"], RequestStatus.FINISHED_ABORTED)
+    for _ in range(3):
+        out = sched.schedule()
+        assert out.num_scheduled_tokens == {"r0": 1, "r1": 1}
+        sched.update_from_output(out, _sampled(out))
+    assert not sched.requests
+    assert sched._list is None
+
+
+def test_empty_allocation_batch_cannot_stall_other_batches():
+    sched = _tau_scheduler()
+    _add_requests(sched, max_tokens=2)
+    pre = sched.schedule()
+    sched.update_from_output(pre, _sampled(pre))
+    with patch.object(sched.kv_cache_manager, "allocate_slots", return_value=None):
+        assert sched.schedule().total_num_scheduled_tokens == 0
+    out = sched.schedule()
+    assert out.num_scheduled_tokens == {"r0": 1, "r1": 1}
+
+
+def test_config_normalized_before_vllm_validation():
+    original = VllmConfig.try_verify_and_update_config
+    seen = []
+
+    def check(config):
+        seen.append(
+            (
+                config.scheduler_config.enable_chunked_prefill,
+                config.scheduler_config.async_scheduling,
+                config.cache_config.enable_prefix_caching,
+            )
+        )
+        return original(config)
+
+    with patch.object(VllmConfig, "try_verify_and_update_config", check):
+        _tau_scheduler(
+            enable_chunked_prefill=True,
+            async_scheduling=True,
+            enable_prefix_caching=True,
+        )
+    assert seen and all(flags == (False, False, False) for flags in seen)
+
+
+def test_config_clears_speculation_before_worker_initialization():
+    from vllm.v1.core.sched.tau_batch.config import configure_tau_batch
+
+    sched = _tau_scheduler()
+    config = sched.vllm_config
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=4)
+    configure_tau_batch(config)
+    assert config.speculative_config is None
+
+
+def test_late_config_change_rejected_instead_of_silently_mutated():
+    sched = _tau_scheduler()
+    sched.vllm_config.cache_config.enable_prefix_caching = True
+    with pytest.raises(ValueError, match="before worker startup"):
+        TauScheduler(vllm_config=sched.vllm_config)
+    assert sched.vllm_config.cache_config.enable_prefix_caching is True
+
+
+def test_pipeline_snapshot_separates_waiting_and_admitted():
+    sched = _tau_scheduler()
+    _add_requests(sched)
+    first = sched.schedule()
+    sched.add_request(_req("late", tpot_slo_ms=100))
+    snapshot = sched.pipeline_snapshot()
+    assert [r.request_id for r in snapshot.waiting] == ["late"]
+    assert snapshot.active[0].in_flight == 1
+    assert snapshot.active[0].prefill_dispatched
+    assert not snapshot.active[0].prefill_completed
+
+    assert not snapshot.active[1].prefill_dispatched
+    assert snapshot.active[1].requests[0].kv_block_ids == ((),)
+    sched.update_from_output(first, _sampled(first))
+    updated = sched.pipeline_snapshot()
+    assert updated.active[0].prefill_completed
+    assert updated.active[0].in_flight == 0
+    assert updated.active[0].requests[0].output_tokens == 1
+    assert not snapshot.active[0].prefill_completed
+
+
+def test_pipeline_snapshot_does_not_share_nested_strategy_metadata():
+    sched = _tau_scheduler()
+    _add_requests(sched)
+    sched.schedule()
+    sched._list.extra["ceiling"] = {"decode_ms": [10.0]}
+    snapshot = sched.pipeline_snapshot()
+    snapshot.active_plan.extra["ceiling"]["decode_ms"][0] = 20.0
+    assert sched._list.extra["ceiling"]["decode_ms"] == [10.0]
+
+
+def test_latency_oracle_reaches_packing_context():
+    class Oracle:
+        def predict(self, features, *, pp_rank):
+            from vllm.v1.core.sched.tau_batch.interfaces import LatencyEstimate
+
+            return LatencyEstimate(mean_ms=features.n + pp_rank)
+
+    sched = _tau_scheduler()
+    sched.latency_oracle = Oracle()
+    assert sched._pack_context().oracle is sched.latency_oracle

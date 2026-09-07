@@ -96,6 +96,8 @@ class TauBatchPlanner:
                 "max_reqs_per_microbatch must be >= 1, got "
                 f"{ctx.max_reqs_per_microbatch}"
             )
+        if ctx.max_num_batched_tokens is not None and ctx.max_num_batched_tokens < 1:
+            raise ValueError("max_num_batched_tokens must be >= 1")
         if ctx.kv_free_blocks is not None and ctx.kv_free_blocks < 0:
             raise ValueError(f"kv_free_blocks must be >= 0, got {ctx.kv_free_blocks}")
         if ctx.kv_free_blocks is not None and (
@@ -157,6 +159,7 @@ class TauBatchPlanner:
 
         seen: list[str] = []
         seen_set: set[str] = set()
+        prompt_lengths = {req.request_id: req.prompt_len for req in requests}
         for i, task in enumerate(packed.tasks):
             if task.index != i:
                 raise ValueError(f"tasks[{i}].index must be {i}, got {task.index}")
@@ -168,10 +171,19 @@ class TauBatchPlanner:
                     f"max is {ctx.max_reqs_per_microbatch}"
                 )
             for req_id in task.req_ids:
+                if req_id not in input_ids:
+                    raise ValueError(f"unknown request in task: {req_id}")
                 if req_id in seen_set:
                     raise ValueError(f"request {req_id} appears in multiple tasks")
                 seen_set.add(req_id)
                 seen.append(req_id)
+            if ctx.max_num_batched_tokens is not None:
+                tokens = sum(prompt_lengths[rid] for rid in task.req_ids)
+                if tokens > ctx.max_num_batched_tokens:
+                    raise ValueError(
+                        f"tasks[{i}] has {tokens} prompt tokens, "
+                        f"max_num_batched_tokens is {ctx.max_num_batched_tokens}"
+                    )
 
         if frozenset(seen) != admitted:
             raise ValueError("union of task req_ids must equal admitted_ids")

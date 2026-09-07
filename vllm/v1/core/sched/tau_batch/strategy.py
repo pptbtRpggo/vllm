@@ -68,7 +68,8 @@ class GreedyListStrategy:
     Sort by ``(tpot_slo_ms, arrival_time, request_id)``. Walk that order and
     append into the current task while reserved KV fits. A full task starts
     the next one until ``max_microbatches``; 0 means no list-length cap.
-    KV-unfit requests are skipped so a later request can still enter.
+    KV- or token-unfit requests are skipped so a later request can still
+    enter. Token-unfit requests are reconsidered for the next task.
 
     This is the current default. Snapshots carry wait/slack; this strategy
     does not use them. The paper dual-ceiling packer is not here yet.
@@ -113,26 +114,32 @@ def _pack_pool(
 ) -> list[list[TauRequestSnapshot]]:
     """Fill micro-batch tasks from the full ordered waiting pool."""
     batches: list[list[TauRequestSnapshot]] = []
-    current: list[TauRequestSnapshot] = []
     remaining_kv = ctx.kv_free_blocks
     cap = ctx.max_microbatches
-
-    for req in ordered:
-        need = _kv_blocks_if_fits(req, remaining_kv, ctx.block_size)
-        if need is None:
-            continue
-        if current and len(current) >= ctx.max_reqs_per_microbatch:
-            batches.append(current)
-            current = []
-            if cap >= 1 and len(batches) >= cap:
-                break
-        if cap >= 1 and not current and len(batches) >= cap:
+    pending = list(ordered)
+    while pending and (cap == 0 or len(batches) < cap):
+        current: list[TauRequestSnapshot] = []
+        skipped: list[TauRequestSnapshot] = []
+        tokens = 0
+        for req in pending:
+            need = _kv_blocks_if_fits(req, remaining_kv, ctx.block_size)
+            if need is None:
+                # Free capacity only decreases during this pack call.
+                continue
+            if len(current) >= ctx.max_reqs_per_microbatch or (
+                ctx.max_num_batched_tokens is not None
+                and tokens + req.prompt_len > ctx.max_num_batched_tokens
+            ):
+                skipped.append(req)
+                continue
+            current.append(req)
+            tokens += req.prompt_len
+            if remaining_kv is not None:
+                remaining_kv -= need
+        if not current:
             break
-        current.append(req)
-        if remaining_kv is not None:
-            remaining_kv -= need
-    if current:
         batches.append(current)
+        pending = skipped
     return batches
 
 

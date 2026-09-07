@@ -39,6 +39,13 @@ class DispatchSlot:
     phase: DispatchPhase
 
 
+@dataclass(frozen=True)
+class TaskDispatchState:
+    prefill_dispatched: bool
+    prefill_completed: bool
+    retired: bool
+
+
 class ListDispatcher:
     """Issues ordered Prefill then cyclic Decode for one MicroBatchList.
 
@@ -54,13 +61,13 @@ class ListDispatcher:
         policy: OVERLAP or DRAIN. Defaults to OVERLAP.
     """
 
-    def __init__(
-        self, policy: DispatchPolicy = DispatchPolicy.OVERLAP
-    ) -> None:
+    def __init__(self, policy: DispatchPolicy = DispatchPolicy.OVERLAP) -> None:
         self.policy = policy
         self._list: MicroBatchList | None = None
         self._prefills_committed = 0
+        self._prefill_dispatched: set[int] = set()
         self._prefill_done: set[int] = set()
+        self._retired: set[int] = set()
         self._decode_cursor = 0
 
     def start(self, packed: MicroBatchList) -> None:
@@ -73,19 +80,60 @@ class ListDispatcher:
             raise ValueError("MicroBatchList.tasks must be non-empty")
         self._list = packed
         self._prefills_committed = 0
+        self._prefill_dispatched = set()
         self._prefill_done = set()
+        self._retired = set()
         self._decode_cursor = 0
 
     def reset(self) -> None:
         """Drop the active list. peek_slot() is None until the next start()."""
         self._list = None
         self._prefills_committed = 0
+        self._prefill_dispatched = set()
         self._prefill_done = set()
+        self._retired = set()
         self._decode_cursor = 0
 
     @property
     def active_list(self) -> MicroBatchList | None:
         return self._list
+
+    def retire(self, microbatch_index: int) -> None:
+        """Remove a completed/cancelled task from both dispatch phases.
+
+        A task cancelled before Prefill has no completion callback. It must
+        leave the readiness gate as well as the cyclic Decode order.
+        Indices remain stable for outputs that are still in flight.
+        """
+        if self._list is None:
+            return
+        if not 0 <= microbatch_index < len(self._list.tasks):
+            raise ValueError(f"invalid microbatch index: {microbatch_index}")
+        if microbatch_index in self._retired:
+            return
+        self._retired.add(microbatch_index)
+        self._skip_retired()
+
+    def task_state(self, index: int) -> TaskDispatchState:
+        if self._list is None or not 0 <= index < len(self._list.tasks):
+            raise ValueError(f"invalid microbatch index: {index}")
+        return TaskDispatchState(
+            prefill_dispatched=index in self._prefill_dispatched,
+            prefill_completed=index in self._prefill_done,
+            retired=index in self._retired,
+        )
+
+    def _skip_retired(self) -> None:
+        assert self._list is not None
+        p = len(self._list.tasks)
+        while (
+            self._prefills_committed < p and self._prefills_committed in self._retired
+        ):
+            self._prefills_committed += 1
+        for _ in range(p):
+            if self._decode_cursor not in self._retired:
+                break
+            self._decode_cursor = (self._decode_cursor + 1) % p
 
     def peek_slot(self) -> DispatchSlot | None:
         """Return the next slot without advancing.
@@ -119,11 +167,14 @@ class ListDispatcher:
         if slot != expected:
             raise ValueError(f"commit {slot} does not match peek {expected}")
         if slot.phase is DispatchPhase.PREFILL:
+            self._prefill_dispatched.add(slot.microbatch_index)
             self._prefills_committed += 1
+            self._skip_retired()
             return
         packed = self._list
         assert packed is not None
         self._decode_cursor = (slot.microbatch_index + 1) % len(packed.tasks)
+        self._skip_retired()
 
     def on_prefill_complete(self, microbatch_index: int) -> None:
         """Record that Prefill for ``microbatch_index`` has finished.
@@ -141,7 +192,11 @@ class ListDispatcher:
     def _decode_ready(self) -> bool:
         assert self._list is not None
         p = len(self._list.tasks)
-        if self.policy is DispatchPolicy.DRAIN:
-            if len(self._prefill_done) < p:
-                return False
+        if len(self._retired) == p:
+            return False
+        if (
+            self.policy is DispatchPolicy.DRAIN
+            and len(self._prefill_done | self._retired) < p
+        ):
+            return False
         return self._decode_cursor in self._prefill_done

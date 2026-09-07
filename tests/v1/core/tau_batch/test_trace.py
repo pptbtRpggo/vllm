@@ -14,8 +14,8 @@ from tests.v1.core.tau_batch.test_scheduler import (
     _sampled,
     _tau_scheduler,
 )
-from vllm.v1.core.sched.tau_batch.plot_trace import pipeline_to_html, spans_to_html
 from vllm.v1.core.sched.tau_batch import trace as tau_trace
+from vllm.v1.core.sched.tau_batch.plot_trace import pipeline_to_html, spans_to_html
 from vllm.v1.core.sched.tau_batch.trace import (
     JsonlTracer,
     load_events,
@@ -60,8 +60,8 @@ def test_trace_writes_wave_emit_done(tmp_path: Path) -> None:
     assert emit0["tokens"] == 16
     assert emit0["pp_size"] == 2
     assert emit0["phase"] == "prefill"
-    assert kinds.count("task") == 2
-    task0 = next(e for e in events if e["event"] == "task" and e["fwd_id"] == 1)
+    assert "task" not in kinds
+    task0 = next(e for e in events if e["event"] == "done" and e["fwd_id"] == 1)
     assert task0["n"] == 2
     assert task0["duration_ms"] >= 0
     spans = pair_forwards(events)
@@ -109,15 +109,27 @@ def test_worker_phases_record_recv_compute_send(tmp_path: Path) -> None:
     try:
         start = time.time_ns()
         record_worker_phase(
-            cfg, kind="recv", fwd_id=1, start_ts_ns=start, req_ids=["r0"],
+            cfg,
+            kind="recv",
+            fwd_id=1,
+            start_ts_ns=start,
+            req_ids=["r0"],
             sync_end=False,
         )
         record_worker_phase(
-            cfg, kind="compute", fwd_id=1, start_ts_ns=start, req_ids=["r0"],
+            cfg,
+            kind="compute",
+            fwd_id=1,
+            start_ts_ns=start,
+            req_ids=["r0"],
             sync_end=False,
         )
         record_worker_phase(
-            cfg, kind="send", fwd_id=1, start_ts_ns=start, req_ids=["r0"],
+            cfg,
+            kind="send",
+            fwd_id=1,
+            start_ts_ns=start,
+            req_ids=["r0"],
             sync_end=False,
         )
         kinds = [e["event"] for e in _events(path)]
@@ -191,7 +203,7 @@ def test_trace_queue_events_from_batch_queue(tmp_path: Path) -> None:
     assert "B0_pre" in html
 
 
-def test_pipeline_cells_place_rank1_after_rank0() -> None:
+def test_pipeline_cells_preserve_measured_stage_windows() -> None:
     events = [
         {
             "event": "emit",
@@ -233,9 +245,84 @@ def test_pipeline_cells_place_rank1_after_rank0() -> None:
     cells = pipeline_cells(events)
     assert [(c.pp_rank, c.start_ts_ns, c.end_ts_ns) for c in cells] == [
         (0, 10, 30),
-        (1, 30, 45),
+        (1, 11, 45),
     ]
     assert cells[0].job.endswith("B0_pre")
     html = pipeline_to_html(cells)
     assert "PP0" in html
     assert "PP1" in html
+
+
+@pytest.mark.parametrize("compute_first", [True, False])
+def test_plot_prefers_compute_without_moving_timestamps(compute_first):
+    stage = dict(event="stage", fwd_id=1, pp_rank=1, start_ts_ns=1, end_ts_ns=100)
+    compute = dict(event="compute", fwd_id=1, pp_rank=1, start_ts_ns=25, end_ts_ns=75)
+    events = [compute, stage] if compute_first else [stage, compute]
+    # Iterators are supported too; no event stream is consumed twice.
+    cells = pipeline_cells(iter(events))
+    assert len(cells) == 1
+    assert (cells[0].start_ts_ns, cells[0].end_ts_ns) == (25, 75)
+    assert cells[0].kind == "compute"
+
+
+def test_stage_envelope_does_not_add_a_device_barrier(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(
+        scheduler_config=SimpleNamespace(tau_batch_trace=str(tmp_path / "stage.jsonl"))
+    )
+    _reset_worker_tracer()
+
+    def unexpected_sync():
+        raise AssertionError("stage envelope must not synchronize the device")
+
+    monkeypatch.setattr(tau_trace, "_sync_compute_device", unexpected_sync)
+    try:
+        tau_trace.record_worker_stage(
+            cfg, fwd_id=1, start_ts_ns=time.time_ns(), req_ids=["a"]
+        )
+        assert _events(tmp_path / "stage.jsonl")[0]["event"] == "stage"
+    finally:
+        _reset_worker_tracer()
+
+
+def test_metadata_after_worker_open_and_ids_survive_rotation(tmp_path):
+    path = tmp_path / "trace.jsonl"
+    worker = JsonlTracer(str(path), write_meta=False)
+    worker.record("stage", fwd_id=1)
+    driver = JsonlTracer(str(path), metadata={"hidden_size": 768})
+    assert driver.next_fwd_id() == 1
+    meta = next(e for e in _events(path) if e["event"] == "meta")
+    assert meta["config"]["hidden_size"] == 768
+    path.unlink()
+    assert driver.next_fwd_id() == 2
+    driver.close()
+    worker.close()
+
+
+def test_trace_off_does_not_build_latency_features(monkeypatch):
+    sched = _tau_scheduler()
+    _add_requests(sched, n=2)
+
+    def unexpected_features(*args):
+        raise AssertionError("trace features constructed while tracing is disabled")
+
+    monkeypatch.setattr(sched, "_task_features", unexpected_features)
+    out = sched.schedule()
+    assert out.tau_task is None
+    assert out.tau_fwd_id is None
+    sched.update_from_output(out, _sampled(out))
+    assert not sched._inflight
+
+
+def test_decode_features_describe_context_including_input_token(tmp_path):
+    path = tmp_path / "decode.jsonl"
+    sched = _tau_scheduler(tau_batch_trace=str(path))
+    _add_requests(sched, n=2)
+    pre = sched.schedule()
+    sched.update_from_output(pre, _sampled(pre))
+    dec = sched.schedule()
+    assert dec.tau_task["seq_lens"] == [9, 9]
+    assert dec.tau_task["tokens"] == 2
+    assert dec.tau_task["s_sum"] == 18
+    events = _events(path)
+    assert "hidden_size" in events[0]["config"]
+    assert all("hidden_size" not in e for e in events if e["event"] == "emit")
