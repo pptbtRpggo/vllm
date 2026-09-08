@@ -73,8 +73,6 @@ def prepare_serve(args):
     run = run_path.resolve()
     trace = trace_path.resolve()
     settings = {key: os.environ[key] for key in SERVE_SETTING_NAMES}
-    # Preserve the manifest field; the launcher exposes only MAX_NUM_SEQS.
-    settings["MAX_REQS_PER_MB"] = settings["MAX_NUM_SEQS"]
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         raise ValueError("prepare-serve requires the actual server command")

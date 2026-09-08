@@ -114,7 +114,7 @@ def test_defaults_generate_independent_paths_without_side_effects(launch_env):
         assert preview["settings"]["PP"] == "2"
         assert preview["settings"]["TP"] == "1"
         assert preview["settings"]["MAX_NUM_SEQS"] == "4"
-        assert preview["settings"]["MAX_REQS_PER_MB"] == "4"
+        assert "MAX_REQS_PER_MB" not in preview["settings"]
         assert preview["settings"]["MIN_WAITING"] == "0"
     assert previews[0]["run_dir"] != previews[1]["run_dir"]
     assert previews[0]["trace"] != previews[1]["trace"]
@@ -141,11 +141,12 @@ def test_exact_arguments_manifest_logging_and_exit_status(launch_env, tmp_path):
     assert manifest["trace"] == str(trace.resolve())
     assert manifest["command"][1:] == record["argv"]
     assert manifest["vllm_executable"] == str(tmp_path / "bin" / "vllm")
-    assert manifest["settings"]["MAX_REQS_PER_MB"] == "8"
+    assert manifest["settings"]["MAX_NUM_SEQS"] == "8"
+    assert "MAX_REQS_PER_MB" not in manifest["settings"]
     assert manifest["settings"]["PORT"] == "8123"
     assert record["argv"][record["argv"].index("--port") + 1] == "8123"
     assert (
-        record["argv"][record["argv"].index("--tau-batch-max-reqs-per-microbatch") + 1]
+        record["argv"][record["argv"].index("--max-num-seqs") + 1]
         == "8"
     )
     assert record["argv"][record["argv"].index("--worker-cls") + 1].endswith(
@@ -237,4 +238,18 @@ def test_legacy_python_entry_delegates_to_shell_defaults(launch_env, tmp_path):
     assert result.returncode == 0, result.stderr
     preview = json.loads(result.stdout)
     assert preview["command"][:2] == ["vllm", "serve"]
-    assert preview["settings"]["MAX_REQS_PER_MB"] == "6"
+    assert preview["settings"]["MAX_NUM_SEQS"] == "6"
+    assert "MAX_REQS_PER_MB" not in preview["settings"]
+
+
+@pytest.mark.parametrize("request_cap", [1, 4, 64])
+def test_native_request_capacity_is_the_only_cli_limit(launch_env, request_cap):
+    launch_env["MAX_NUM_SEQS"] = str(request_cap)
+    result = launch(launch_env, "/models/example", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    preview = json.loads(result.stdout)
+    command = preview["command"]
+    assert preview["settings"]["MAX_NUM_SEQS"] == str(request_cap)
+    assert "MAX_REQS_PER_MB" not in preview["settings"]
+    assert command[command.index("--max-num-seqs") + 1] == str(request_cap)
+    assert "--tau-batch-max-reqs-per-microbatch" not in command

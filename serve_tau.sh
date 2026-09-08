@@ -80,7 +80,6 @@ VLLM_CMD=(
     --max-num-seqs "$MAX_NUM_SEQS"
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
     --gpu-memory-utilization "$GPU_MEM"
-    --tau-batch-max-reqs-per-microbatch "$MAX_NUM_SEQS"
     --tau-batch-max-microbatches "$MAX_MICROBATCHES"
     --tau-batch-min-waiting "$MIN_WAITING"
     --worker-cls vllm.v1.worker.tau_ascend_worker.TauAscendWorker

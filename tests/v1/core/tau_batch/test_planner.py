@@ -42,9 +42,8 @@ def _req(
 
 def _ctx(
     *,
-    max_num_seqs: int = 16,
+    max_num_seqs: int = 4,
     max_microbatches: int = 4,
-    max_reqs_per_microbatch: int = 4,
     now: float = 0.0,
     kv_free_blocks: int | None = None,
     block_size: int | None = None,
@@ -55,7 +54,6 @@ def _ctx(
         now=now,
         max_num_seqs=max_num_seqs,
         max_microbatches=max_microbatches,
-        max_reqs_per_microbatch=max_reqs_per_microbatch,
         pp_size=pp_size,
         kv_free_blocks=kv_free_blocks,
         block_size=block_size,
@@ -77,7 +75,6 @@ def _assert_invariants(
     for i, task in enumerate(plan.tasks):
         assert task.index == i
         assert task.req_ids
-        assert len(task.req_ids) <= ctx.max_reqs_per_microbatch
         assert len(task.req_ids) <= ctx.max_num_seqs
     if ctx.max_microbatches >= 1:
         assert len(plan.tasks) <= ctx.max_microbatches
@@ -185,14 +182,12 @@ def test_invalid_pack_context_raises():
         planner.plan([_req("a")], _ctx(max_num_seqs=0))
     with pytest.raises(ValueError, match="max_microbatches"):
         planner.plan([_req("a")], _ctx(max_microbatches=-1))
-    with pytest.raises(ValueError, match="max_reqs_per_microbatch"):
-        planner.plan([_req("a")], _ctx(max_reqs_per_microbatch=0))
 
 
 def test_greedy_admits_all_when_capacity_fits():
     planner = TauBatchPlanner()
     requests = [_req("r1"), _req("r2"), _req("r3")]
-    ctx = _ctx(max_num_seqs=8, max_microbatches=2, max_reqs_per_microbatch=4)
+    ctx = _ctx(max_num_seqs=4, max_microbatches=2)
     plan = planner.plan(requests, ctx)
     assert plan is not None
     _assert_invariants(plan, requests, ctx)
@@ -204,7 +199,7 @@ def test_greedy_admits_all_when_capacity_fits():
 def test_greedy_does_not_cut_pool_by_max_num_seqs():
     planner = TauBatchPlanner()
     requests = [_req(f"r{i}", tpot_slo_ms=float(10 + i)) for i in range(5)]
-    ctx = _ctx(max_num_seqs=2, max_microbatches=4, max_reqs_per_microbatch=4)
+    ctx = _ctx(max_num_seqs=2, max_microbatches=4)
     plan = planner.plan(requests, ctx)
     assert plan is not None
     _assert_invariants(plan, requests, ctx)
@@ -220,7 +215,7 @@ def test_greedy_prefers_tighter_tpot_then_earlier_arrival():
         _req("early_loose", tpot_slo_ms=80.0, arrival_time=1.0),
         _req("early_tight", tpot_slo_ms=10.0, arrival_time=1.0),
     ]
-    ctx = _ctx(max_num_seqs=2, max_microbatches=1, max_reqs_per_microbatch=2)
+    ctx = _ctx(max_num_seqs=2, max_microbatches=1)
     plan = planner.plan(requests, ctx)
     assert plan is not None
     _assert_invariants(plan, requests, ctx)
@@ -231,7 +226,7 @@ def test_greedy_prefers_tighter_tpot_then_earlier_arrival():
 def test_greedy_splits_into_microbatches():
     planner = TauBatchPlanner()
     requests = [_req(f"r{i}", tpot_slo_ms=float(i)) for i in range(1, 7)]
-    ctx = _ctx(max_num_seqs=16, max_microbatches=3, max_reqs_per_microbatch=2)
+    ctx = _ctx(max_num_seqs=2, max_microbatches=3)
     plan = planner.plan(requests, ctx)
     assert plan is not None
     _assert_invariants(plan, requests, ctx)
@@ -246,7 +241,7 @@ def test_greedy_splits_into_microbatches():
 def test_greedy_defers_beyond_microbatch_capacity():
     planner = TauBatchPlanner()
     requests = [_req(f"r{i}") for i in range(10)]
-    ctx = _ctx(max_num_seqs=16, max_microbatches=2, max_reqs_per_microbatch=3)
+    ctx = _ctx(max_num_seqs=3, max_microbatches=2)
     plan = planner.plan(requests, ctx)
     assert plan is not None
     _assert_invariants(plan, requests, ctx)
@@ -261,7 +256,7 @@ def test_plan_is_deterministic():
         _req("a", tpot_slo_ms=20.0, arrival_time=1.0),
         _req("c", tpot_slo_ms=10.0, arrival_time=3.0),
     ]
-    ctx = _ctx(max_num_seqs=2, max_microbatches=2, max_reqs_per_microbatch=1)
+    ctx = _ctx(max_num_seqs=1, max_microbatches=2)
     a = TauBatchPlanner().plan(requests, ctx)
     b = TauBatchPlanner().plan(requests, ctx)
     assert a is not None and b is not None
@@ -305,9 +300,8 @@ def test_greedy_defers_when_kv_blocks_exhausted():
         _req("r2", tpot_slo_ms=12.0, prompt_len=16, max_new_tokens=16),
     ]
     ctx = _ctx(
-        max_num_seqs=8,
+        max_num_seqs=4,
         max_microbatches=4,
-        max_reqs_per_microbatch=4,
         kv_free_blocks=4,
         block_size=16,
     )
@@ -322,7 +316,7 @@ def test_greedy_defers_when_kv_blocks_exhausted():
 def test_pack_pool_respects_list_cap():
     planner = TauBatchPlanner()
     requests = [_req(f"r{i}", tpot_slo_ms=float(i + 1)) for i in range(64)]
-    ctx = _ctx(max_num_seqs=32, max_microbatches=8, max_reqs_per_microbatch=4)
+    ctx = _ctx(max_num_seqs=4, max_microbatches=8)
     plan = planner.plan(requests, ctx)
     assert plan is not None
     _assert_invariants(plan, requests, ctx)
@@ -336,7 +330,7 @@ def test_pack_pool_respects_list_cap():
 def test_zero_list_cap_packs_whole_pool():
     planner = TauBatchPlanner()
     requests = [_req(f"r{i}", tpot_slo_ms=float(i + 1)) for i in range(64)]
-    ctx = _ctx(max_num_seqs=32, max_microbatches=0, max_reqs_per_microbatch=4)
+    ctx = _ctx(max_num_seqs=4, max_microbatches=0)
     plan = planner.plan(requests, ctx)
     assert plan is not None
     _assert_invariants(plan, requests, ctx)
@@ -349,7 +343,7 @@ def test_zero_list_cap_packs_whole_pool():
 def test_pack_defers_when_list_cap_is_tight():
     planner = TauBatchPlanner()
     requests = [_req(f"r{i}", tpot_slo_ms=float(i + 1)) for i in range(32)]
-    ctx = _ctx(max_num_seqs=32, max_microbatches=2, max_reqs_per_microbatch=4)
+    ctx = _ctx(max_num_seqs=4, max_microbatches=2)
     plan = planner.plan(requests, ctx)
     assert plan is not None
     _assert_invariants(plan, requests, ctx)
@@ -361,7 +355,7 @@ def test_pack_defers_when_list_cap_is_tight():
 def test_short_pool_is_packed_without_padding():
     planner = TauBatchPlanner()
     requests = [_req(f"r{i}", tpot_slo_ms=float(i + 1)) for i in range(10)]
-    ctx = _ctx(max_num_seqs=32, max_microbatches=8, max_reqs_per_microbatch=4)
+    ctx = _ctx(max_num_seqs=4, max_microbatches=8)
     plan = planner.plan(requests, ctx)
     assert plan is not None
     _assert_invariants(plan, requests, ctx)
@@ -377,9 +371,8 @@ def test_greedy_skips_unfittable_and_takes_next():
         _req("small", tpot_slo_ms=10.0, prompt_len=16, max_new_tokens=16),
     ]
     ctx = _ctx(
-        max_num_seqs=8,
+        max_num_seqs=2,
         max_microbatches=2,
-        max_reqs_per_microbatch=2,
         kv_free_blocks=3,
         block_size=16,
     )
@@ -449,14 +442,14 @@ def test_invalid_token_limit_rejected():
         TauBatchPlanner().plan([_req("a")], _ctx(max_num_batched_tokens=0))
 
 
-@pytest.mark.parametrize("task_cap", [1, 4])
+@pytest.mark.parametrize("task_cap", [1, 2, 4])
 def test_worker_request_capacity_limits_each_task_not_whole_wave(task_cap):
     requests = [_req(str(i)) for i in range(6)]
-    ctx = _ctx(max_num_seqs=2, max_reqs_per_microbatch=task_cap, max_microbatches=0)
+    ctx = _ctx(max_num_seqs=task_cap, max_microbatches=0)
     plan = TauBatchPlanner().plan(requests, ctx)
     _assert_invariants(plan, requests, ctx)
     assert len(plan.admitted_ids) == 6
-    assert all(len(task.req_ids) <= min(task_cap, 2) for task in plan.tasks)
+    assert all(len(task.req_ids) <= task_cap for task in plan.tasks)
 
 
 def test_custom_plan_cannot_exceed_worker_request_capacity():
@@ -473,7 +466,7 @@ def test_custom_plan_cannot_exceed_worker_request_capacity():
     with pytest.raises(ValueError, match="max_num_seqs"):
         TauBatchPlanner(strategy=Oversized()).plan(
             [_req(rid) for rid in "abc"],
-            _ctx(max_num_seqs=2, max_reqs_per_microbatch=4),
+            _ctx(max_num_seqs=2),
         )
 
 
@@ -532,7 +525,7 @@ def test_full_tasks_do_not_rescan_untouched_waiting_tail(monkeypatch):
     requests.insert(0, _req("oversized", prompt_len=1000))
     plan = TauBatchPlanner().plan(
         requests,
-        _ctx(max_microbatches=0, max_reqs_per_microbatch=4, max_num_batched_tokens=32),
+        _ctx(max_microbatches=0, max_num_seqs=4, max_num_batched_tokens=32),
     )
     assert len(plan.tasks) == 250
     assert plan.deferred_ids == {"oversized"}
@@ -547,6 +540,6 @@ def test_token_skips_precede_untouched_tail_in_next_microbatch():
     ]
     plan = TauBatchPlanner().plan(
         requests,
-        _ctx(max_microbatches=0, max_reqs_per_microbatch=2, max_num_batched_tokens=10),
+        _ctx(max_microbatches=0, max_num_seqs=2, max_num_batched_tokens=10),
     )
     assert [task.req_ids for task in plan.tasks] == [("a", "c"), ("b", "d"), ("e",)]

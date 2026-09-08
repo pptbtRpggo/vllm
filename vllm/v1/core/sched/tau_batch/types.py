@@ -115,10 +115,9 @@ class PackContext:
             Used to compute wait and TTFT slack at plan time.
         max_num_seqs: Worker request capacity per forward. Limits each task,
             not the candidate pool or the total number of admitted requests.
+            Overflow is deferred to later tasks or planning calls; a short
+            pool is packed as-is.
         max_microbatches: Pack at most this many micro-batch tasks; 0 is unlimited.
-        max_reqs_per_microbatch: Desired max n in one micro-batch task, also
-            bounded by max_num_seqs. Overflow is deferred to later tasks or
-            planning calls; a short pool is packed as-is.
         pp_size: Pipeline-parallel size M. Used for ``τ_max = TPOT / M``.
         kv_free_blocks: Free KV blocks at pack time. None disables the
             KV filter.
@@ -132,7 +131,6 @@ class PackContext:
     now: float
     max_num_seqs: int
     max_microbatches: int
-    max_reqs_per_microbatch: int
     pp_size: int | None = None
     kv_free_blocks: int | None = None
     block_size: int | None = None

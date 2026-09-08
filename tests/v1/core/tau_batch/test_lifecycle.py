@@ -63,7 +63,7 @@ def _drive(core, *, queued=True):
 @pytest.mark.parametrize("queued", [False, True])
 def test_multiple_waves_finish_cleanup_and_become_idle(queue_size, queued):
     sched = _tau_scheduler(
-        max_num_seqs=2, max_reqs_per_microbatch=4, max_microbatches=0
+        max_num_seqs=2, max_microbatches=0
     )
     core = _QueueCore(sched, queue_size)
     executor = core.model_executor = _TrackingExecutor(max_num_seqs=2)

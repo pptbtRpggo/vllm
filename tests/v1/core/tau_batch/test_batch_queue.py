@@ -128,7 +128,7 @@ def _run_queue(
 ) -> list[QueueStep]:
     sched = _tau_scheduler(
         max_microbatches=2,
-        max_reqs_per_microbatch=2,
+        max_num_seqs=2,
         pipeline_parallel_size=2,
     )
     sched.dispatcher = sched.dispatcher.__class__(policy)

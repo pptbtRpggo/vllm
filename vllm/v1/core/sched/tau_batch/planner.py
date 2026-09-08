@@ -92,11 +92,6 @@ class TauBatchPlanner:
             raise ValueError(
                 f"max_microbatches must be >= 0, got {ctx.max_microbatches}"
             )
-        if ctx.max_reqs_per_microbatch < 1:
-            raise ValueError(
-                "max_reqs_per_microbatch must be >= 1, got "
-                f"{ctx.max_reqs_per_microbatch}"
-            )
         if ctx.max_num_batched_tokens is not None and ctx.max_num_batched_tokens < 1:
             raise ValueError("max_num_batched_tokens must be >= 1")
         if ctx.kv_free_blocks is not None and ctx.kv_free_blocks < 0:
@@ -170,11 +165,6 @@ class TauBatchPlanner:
                 raise ValueError(
                     f"tasks[{i}] has {len(task.req_ids)} reqs, "
                     f"max_num_seqs is {ctx.max_num_seqs}"
-                )
-            if len(task.req_ids) > ctx.max_reqs_per_microbatch:
-                raise ValueError(
-                    f"tasks[{i}] has {len(task.req_ids)} reqs, "
-                    f"max is {ctx.max_reqs_per_microbatch}"
                 )
             for req_id in task.req_ids:
                 if req_id not in input_ids:

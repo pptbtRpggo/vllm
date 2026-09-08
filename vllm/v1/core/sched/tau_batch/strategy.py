@@ -117,7 +117,7 @@ def _pack_pool(
     batches: list[list[TauRequestSnapshot]] = []
     remaining_kv = ctx.kv_free_blocks
     cap = ctx.max_microbatches
-    request_cap = min(ctx.max_reqs_per_microbatch, ctx.max_num_seqs)
+    request_cap = ctx.max_num_seqs
     # Individually oversized prompts cannot fit any task in this plan. The
     # admitted/deferred partition still retains them for the caller.
     token_cap = ctx.max_num_batched_tokens

@@ -153,9 +153,6 @@ class TauScheduler(Scheduler):
         super().__init__(*args, **kwargs)
         self.planner = planner if planner is not None else TauBatchPlanner()
         self.dispatcher = ListDispatcher(DispatchPolicy.OVERLAP)
-        self.max_reqs_per_microbatch = (
-            self.scheduler_config.tau_batch_max_reqs_per_microbatch
-        )
         self.max_microbatches = _resolve_max_microbatches(
             self.scheduler_config.tau_batch_max_microbatches,
         )
@@ -178,7 +175,7 @@ class TauScheduler(Scheduler):
             "TauScheduler: pack the waiting pool into tasks of size <= %d, "
             "list cap %s (0 = whole pool), KV-unfit skipped. "
             "--max-num-seqs=%d limits each forward, not the whole list.",
-            self.max_reqs_per_microbatch,
+            self.max_num_running_reqs,
             self.max_microbatches,
             self.max_num_running_reqs,
         )
@@ -731,7 +728,6 @@ class TauScheduler(Scheduler):
             now=time.time(),
             max_num_seqs=self.max_num_running_reqs,
             max_microbatches=self.max_microbatches,
-            max_reqs_per_microbatch=self.max_reqs_per_microbatch,
             pp_size=pp,
             kv_free_blocks=self.kv_cache_manager.block_pool.get_num_free_blocks(),
             block_size=self.block_size,

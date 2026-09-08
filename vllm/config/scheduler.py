@@ -148,10 +148,6 @@ class SchedulerConfig:
     before packing a micro-batch list. 0 packs as soon as waiting is
     non-empty."""
 
-    tau_batch_max_reqs_per_microbatch: int = Field(default=4, ge=1)
-    """TauScheduler only. Max n in one micro-batch task. Independent of
-    --max-num-seqs and --tau-batch-max-microbatches."""
-
     tau_batch_max_microbatches: int = Field(default=0, ge=0)
     """TauScheduler only. Max micro-batch tasks in one packed list. 0 packs
     the whole waiting pool (KV and per-task size still apply). Extra requests

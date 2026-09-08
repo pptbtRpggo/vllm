@@ -43,9 +43,7 @@ _none_hash_initialized = False
 def _tau_scheduler(
     *,
     max_microbatches: int = 2,
-    max_reqs_per_microbatch: int = 2,
-    max_num_seqs: int = 16,
-    tau_batch_max_reqs_per_microbatch: int = 4,
+    max_num_seqs: int = 2,
     tau_batch_max_microbatches: int = 0,
     override_pack_limits: bool = True,
     pipeline_parallel_size: int = 2,
@@ -73,7 +71,6 @@ def _tau_scheduler(
         scheduler_cls="vllm.v1.core.sched.tau_batch.TauScheduler",
         is_encoder_decoder=model_config.is_encoder_decoder,
         tau_batch_min_waiting=tau_batch_min_waiting,
-        tau_batch_max_reqs_per_microbatch=tau_batch_max_reqs_per_microbatch,
         tau_batch_max_microbatches=tau_batch_max_microbatches,
         tau_batch_trace=tau_batch_trace,
     )
@@ -112,7 +109,6 @@ def _tau_scheduler(
     )
     if override_pack_limits:
         sched.max_microbatches = max_microbatches
-        sched.max_reqs_per_microbatch = max_reqs_per_microbatch
     return sched
 
 
@@ -428,30 +424,46 @@ def test_min_waiting_to_plan_holds_until_threshold():
 def test_pack_context_zero_list_cap_is_unlimited():
     sched = _tau_scheduler(
         max_num_seqs=32,
-        tau_batch_max_reqs_per_microbatch=4,
         tau_batch_max_microbatches=0,
         override_pack_limits=False,
     )
     ctx = sched._pack_context()
     assert ctx.max_num_seqs == 32
-    assert ctx.max_reqs_per_microbatch == 4
     assert ctx.max_microbatches == 0
 
 
 def test_pack_context_honors_explicit_p():
     sched = _tau_scheduler(
         max_num_seqs=32,
-        tau_batch_max_reqs_per_microbatch=4,
         tau_batch_max_microbatches=2,
         override_pack_limits=False,
     )
     ctx = sched._pack_context()
-    assert ctx.max_reqs_per_microbatch == 4
+    assert ctx.max_num_seqs == 32
     assert ctx.max_microbatches == 2
 
 
+@pytest.mark.parametrize("max_num_seqs", [1, 4, 32])
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_vllm_request_capacity_is_the_microbatch_limit(max_num_seqs, pp_size):
+    sched = _tau_scheduler(
+        max_num_seqs=max_num_seqs,
+        max_microbatches=0,
+        pipeline_parallel_size=pp_size,
+    )
+    _add_requests(sched, n=2 * max_num_seqs + 1)
+    out = sched.schedule()
+    assert sched._pack_context().max_num_seqs == sched.scheduler_config.max_num_seqs
+    assert len(out.num_scheduled_tokens) == max_num_seqs
+    assert [len(task.req_ids) for task in sched._list.tasks] == [
+        max_num_seqs,
+        max_num_seqs,
+        1,
+    ]
+
+
 def test_scheduler_packs_full_prompts_within_token_budget():
-    sched = _tau_scheduler(max_reqs_per_microbatch=3)
+    sched = _tau_scheduler(max_num_seqs=3)
     sched.max_num_scheduled_tokens = 10
     for rid, length in [("a", 7), ("b", 6), ("c", 3)]:
         sched.add_request(_req(rid, tpot_slo_ms=100, prompt_len=length))
