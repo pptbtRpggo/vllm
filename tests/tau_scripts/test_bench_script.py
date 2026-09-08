@@ -306,3 +306,39 @@ def test_stop_signal_stops_client_and_prevents_next_phase(bench_setup):
         if child_pid is not None:
             with suppress(ProcessLookupError):
                 os.kill(child_pid, signal.SIGKILL)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_slo_config_snapshot_and_seed_reach_both_phases(bench_setup, legacy):
+    s = bench_setup
+    config = s["tmp"] / "slo groups.json"
+    config.write_text(
+        json.dumps(
+            {
+                "profiles": {"tight": {"ttft_slo_ms": 1000, "tpot_slo_ms": 50}},
+                "ratios": {"tight": 1},
+            }
+        )
+    )
+    target = s["tmp"] / "slo result"
+    result = launch(
+        s,
+        "--mode",
+        "collect",
+        "--result-dir",
+        target,
+        "--slo-config",
+        config,
+        "--seed",
+        "7",
+        legacy=legacy,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    snapshot = target / "slo_config.json"
+    assert snapshot.read_text() == config.read_text()
+    for command in calls(s):
+        assert option(command, "--slo-config") == str(snapshot)
+        assert option(command, "--slo-seed") == "7"
+    metadata = json.loads((target / "slo_config_source.json").read_text())
+    assert metadata["path"] == str(config)
+    assert metadata["slo_seed"] == 7

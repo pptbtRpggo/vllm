@@ -32,6 +32,8 @@ REQUEST_RATE="${REQUEST_RATE:-inf}"   # 目标请求数/秒；inf 表示尽快�
 BURSTINESS="${BURSTINESS:-1}"          # 有限速率时：1 随机指数间隔；<1 更突发；inf 等间隔
 IGNORE_EOS="${IGNORE_EOS:-1}"          # 1 忽略 EOS 以采固定输出长度；0 允许自然 EOS 结束
 SEED="${SEED:-0}"                     # 数据采样和到达间隔的随机种子
+SLO_CONFIG="${SLO_CONFIG:-}"           # 可选：TTFT/TPOT 档位和比例 JSON；空值不启用分组
+SLO_SEED="${SLO_SEED:-}"               # 分组随机种子；留空使用最终的 SEED
 DATASET="${DATASET:-$ROOT/datasets/sharegpt.json}" # ShareGPT JSON 文件
 DOWNLOAD="${DOWNLOAD:-0}"             # 1：文件缺失时下载；0：使用已有文件
 BASE_URL="${BASE_URL:-}"               # 留空从 run.json 读取，例如 http://127.0.0.1:8000
@@ -52,6 +54,8 @@ usage: bash bench_tau.sh [服务运行目录] [选项]
 --request-rate R           目标请求数/秒，默认 inf
 --concurrency N            最多同时未完成的请求数，smoke 默认 8、collect 默认 32
 --burstiness B             到达间隔：1 随机，inf 等间隔
+--slo-config 路径          SLO 档位/比例配置；自动按请求各自阈值统计 goodput
+--slo-seed N               分组种子，默认使用 --seed
 --dataset 路径 --download  数据集；缺失时允许下载
 --seed N --base-url URL --result-dir 新目录 --ready-timeout 秒数
 --dry-run                 只打印命令，不下载数据或发送请求
@@ -66,7 +70,7 @@ while (($#)); do
         -h|--help) usage; exit 0 ;;
         --dry-run) dry_run=1; shift ;;
         --download) DOWNLOAD=1; shift ;;
-        --mode|--num-prompts|--output-len|--concurrency|--request-rate|--burstiness|--seed|--dataset|--base-url|--result-dir|--ready-timeout)
+        --mode|--num-prompts|--output-len|--concurrency|--request-rate|--burstiness|--seed|--slo-config|--slo-seed|--dataset|--base-url|--result-dir|--ready-timeout)
             if (($# < 2)) || [[ -z "$2" || "$2" = --* ]]; then
                 echo "ERROR: $1 需要参数值" >&2; exit 2
             fi
@@ -75,6 +79,7 @@ while (($#)); do
                 --output-len) OUTPUT_LEN="$2" ;; --concurrency) CONCURRENCY="$2" ;;
                 --request-rate) REQUEST_RATE="$2" ;; --burstiness) BURSTINESS="$2" ;;
                 --seed) SEED="$2" ;; --dataset) DATASET="$2" ;;
+                --slo-config) SLO_CONFIG="$2" ;; --slo-seed) SLO_SEED="$2" ;;
                 --base-url) BASE_URL="$2" ;; --result-dir) RESULT_DIR="$2" ;;
                 --ready-timeout) READY_TIMEOUT="$2" ;;
             esac
@@ -93,9 +98,11 @@ fi
 # 固定本次使用的实际目录，避免另一个服务更新 latest 后影响正在执行的 bench。
 RUN_DIR="$(cd "$RUN_DIR" && pwd -P)"
 apply_mode_defaults
+SLO_SEED="${SLO_SEED:-$SEED}"
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export MODE NUM_PROMPTS OUTPUT_LEN CONCURRENCY REQUEST_RATE BURSTINESS IGNORE_EOS
 export SEED DATASET DOWNLOAD BASE_URL RESULT_DIR WARMUP_REQUESTS READY_TIMEOUT
+export SLO_CONFIG SLO_SEED
 if ((dry_run == 0)); then
     command -v vllm >/dev/null || { echo 'ERROR: 当前环境找不到 vllm 命令' >&2; exit 127; }
 fi
@@ -135,6 +142,9 @@ build_command() {
         --result-dir "$RESULT_DIR" --result-filename "$2.json"
     )
     if [[ "$IGNORE_EOS" == 1 ]]; then BENCH_CMD+=(--ignore-eos); fi
+    if [[ -n "$SLO_CONFIG" ]]; then
+        BENCH_CMD+=(--slo-config "$SLO_CONFIG" --slo-seed "$SLO_SEED")
+    fi
 }
 
 run_benchmark() {

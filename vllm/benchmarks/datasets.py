@@ -34,6 +34,7 @@ import numpy as np
 from PIL import Image
 from typing_extensions import deprecated
 
+from vllm.benchmarks.slo import RequestSLO
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
 from vllm.multimodal import MultiModalDataDict
@@ -81,6 +82,8 @@ class SampleRequest:
     multi_modal_data: MultiModalDataDict | dict | list[dict] | None = None
     lora_request: LoRARequest | None = None
     request_id: str | None = None
+    source_index: int | None = None
+    slo: RequestSLO | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -1225,14 +1228,16 @@ class ShareGPTDataset(BenchmarkDataset):
         with open(self.dataset_path, encoding="utf-8") as f:
             self.data = json.load(f)
         # Filter entries with at least two conversation turns.
-        self.data = [
-            entry
-            for entry in self.data
+        indexed = [
+            (index, entry)
+            for index, entry in enumerate(self.data)
             if "conversations" in entry and len(entry["conversations"]) >= 2
         ]
         random.seed(self.random_seed)
         if not getattr(self, "disable_shuffle", False):
-            random.shuffle(self.data)
+            random.shuffle(indexed)
+        self.source_indices = [index for index, _ in indexed]
+        self.data = [entry for _, entry in indexed]
 
     def sample(
         self,
@@ -1248,7 +1253,7 @@ class ShareGPTDataset(BenchmarkDataset):
     ) -> list:
         samples: list = []
         ind = 0
-        for entry in self.data:
+        for source_index, entry in zip(self.source_indices, self.data):
             if len(samples) >= num_requests:
                 break
             prompt, completion = (
@@ -1285,6 +1290,7 @@ class ShareGPTDataset(BenchmarkDataset):
                     lora_request=lora_request,
                     multi_modal_data=mm_content,
                     request_id=request_id_prefix + str(ind),
+                    source_index=source_index,
                 )
             )
             ind += 1

@@ -312,6 +312,8 @@ def prepare_bench(args):
         if os.environ[key] not in ("0", "1"):
             raise ValueError(f"{key} must be 0 or 1")
     int(os.environ["SEED"])
+    if os.environ.get("SLO_CONFIG"):
+        int(os.environ["SLO_SEED"])
     timeout = float(os.environ["READY_TIMEOUT"])
     if timeout < 0 or not math.isfinite(timeout):
         raise ValueError("READY_TIMEOUT must be finite and nonnegative")
@@ -325,6 +327,11 @@ def prepare_bench(args):
         os.environ.get("BASE_URL") or f"http://{host}:{settings['PORT']}"
     ).rstrip("/")
     dataset = Path(os.environ["DATASET"]).expanduser().resolve()
+    slo_config = None
+    if os.environ.get("SLO_CONFIG"):
+        slo_config = Path(os.environ["SLO_CONFIG"]).expanduser().resolve()
+        if not slo_config.is_file():
+            raise ValueError(f"SLO config missing: {slo_config}")
     target = (
         Path(os.environ.get("RESULT_DIR") or run / "bench" / (mode + "_" + stamp()))
         .expanduser()
@@ -344,6 +351,18 @@ def prepare_bench(args):
             while chunk := stream.read(1024 * 1024):
                 digest.update(chunk)
         target.mkdir(parents=True)
+        if slo_config is not None:
+            source = slo_config
+            slo_config = target / "slo_config.json"
+            shutil.copyfile(source, slo_config)
+            write_json(
+                target / "slo_config_source.json",
+                {
+                    "path": str(source),
+                    "sha256": hashlib.sha256(slo_config.read_bytes()).hexdigest(),
+                    "slo_seed": int(os.environ["SLO_SEED"]),
+                },
+            )
         write_json(
             target / "dataset.json",
             {
@@ -361,6 +380,7 @@ def prepare_bench(args):
         BASE_URL=base_url,
         DATASET=str(dataset),
         RESULT_DIR=str(target),
+        SLO_CONFIG=str(slo_config) if slo_config else "",
     )
     Path(args.config_file).write_text(
         "".join(f"{key}={shlex.quote(value)}\n" for key, value in context.items())
@@ -433,6 +453,8 @@ def bench(args):
         "request_rate",
         "burstiness",
         "seed",
+        "slo_config",
+        "slo_seed",
         "base_url",
         "ready_timeout",
     ):
@@ -476,6 +498,8 @@ def main():
     benchmark.add_argument("--request-rate", type=float)
     benchmark.add_argument("--burstiness", type=float)
     benchmark.add_argument("--seed", type=int)
+    benchmark.add_argument("--slo-config")
+    benchmark.add_argument("--slo-seed", type=int)
     benchmark.add_argument("--base-url")
     benchmark.add_argument("--ready-timeout", type=float)
     benchmark.add_argument("--dry-run", action="store_true")

@@ -31,6 +31,7 @@ from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Literal
 
 import aiohttp
@@ -46,6 +47,12 @@ from vllm.benchmarks.lib.endpoint_request_func import (
 )
 from vllm.benchmarks.lib.ready_checker import wait_for_endpoint
 from vllm.benchmarks.lib.utils import convert_to_pytorch_benchmark_format, write_to_json
+from vllm.benchmarks.slo import (
+    assign_slos,
+    evaluate_goodput,
+    load_slo_config,
+    request_body,
+)
 from vllm.tokenizers import TokenizerLike, get_tokenizer
 from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.utils.network_utils import join_host_port
@@ -94,6 +101,7 @@ class BenchmarkMetrics:
     # Max output tokens per second and concurrent requests at that peak
     max_output_tokens_per_s: float
     max_concurrent_requests: int
+    slo_report: dict | None = None
 
 
 @dataclass
@@ -307,10 +315,8 @@ def calculate_metrics(
     actual_output_lens: list[int] = []
     total_input = 0
     completed = 0
-    good_completed = 0
     itls: list[float] = []
     tpots: list[float] = []
-    all_tpots: list[float] = []
     ttfts: list[float] = []
     e2els: list[float] = []
     for i in range(len(outputs)):
@@ -335,8 +341,6 @@ def calculate_metrics(
                 latency_minus_ttft = outputs[i].latency - outputs[i].ttft
                 tpot = latency_minus_ttft / (output_len - 1)
                 tpots.append(tpot)
-            # Note: if output_len <= 1, we regard tpot as 0 for goodput
-            all_tpots.append(tpot)
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
@@ -344,30 +348,9 @@ def calculate_metrics(
         else:
             actual_output_lens.append(0)
 
-    if goodput_config_dict:
-        valid_metrics = []
-        slo_values = []
-
-        if "ttft" in goodput_config_dict:
-            valid_metrics.append(ttfts)
-            slo_values.append(
-                goodput_config_dict["ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION
-            )
-        if "tpot" in goodput_config_dict:
-            valid_metrics.append(all_tpots)
-            slo_values.append(
-                goodput_config_dict["tpot"] / MILLISECONDS_TO_SECONDS_CONVERSION
-            )
-        if "e2el" in goodput_config_dict:
-            valid_metrics.append(e2els)
-            slo_values.append(
-                goodput_config_dict["e2el"] / MILLISECONDS_TO_SECONDS_CONVERSION
-            )
-
-        for req_metric in zip(*valid_metrics):
-            is_good_req = all([s >= r for s, r in zip(slo_values, req_metric)])
-            if is_good_req:
-                good_completed += 1
+    slo_report = evaluate_goodput(
+        input_requests, outputs, actual_output_lens, goodput_config_dict, dur_s
+    )
 
     if completed == 0:
         warnings.warn(
@@ -448,7 +431,7 @@ def calculate_metrics(
         total_input=total_input,
         total_output=sum(actual_output_lens),
         request_throughput=completed / dur_s,
-        request_goodput=good_completed / dur_s,
+        request_goodput=slo_report["request_goodput"] if slo_report else 0.0,
         output_throughput=sum(actual_output_lens) / dur_s,
         total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0)
@@ -478,6 +461,7 @@ def calculate_metrics(
         ],
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
+        slo_report=slo_report,
     )
 
     return metrics, actual_output_lens
@@ -561,7 +545,7 @@ async def benchmark(
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
         extra_headers=extra_headers,
-        extra_body=extra_body,
+        extra_body=request_body(extra_body, input_requests[0]),
     )
 
     if ready_check_timeout_sec > 0:
@@ -716,7 +700,7 @@ async def benchmark(
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
             extra_headers=extra_headers,
-            extra_body=extra_body,
+            extra_body=request_body(extra_body, request),
             request_id=request_id,
         )
         tasks.append(
@@ -766,7 +750,7 @@ async def benchmark(
             "Request throughput (req/s):", metrics.request_throughput
         )
     )
-    if goodput_config_dict:
+    if isinstance(metrics, BenchmarkMetrics) and metrics.slo_report is not None:
         print(
             "{:<40} {:<10.2f}".format(
                 "Request goodput (req/s):", metrics.request_goodput
@@ -802,7 +786,9 @@ async def benchmark(
             "total_input_tokens": metrics.total_input,
             "total_output_tokens": metrics.total_output,
             "request_throughput": metrics.request_throughput,
-            "request_goodput": metrics.request_goodput if goodput_config_dict else None,
+            "request_goodput": metrics.request_goodput
+            if metrics.slo_report is not None
+            else None,
             "output_throughput": metrics.output_throughput,
             "total_token_throughput": metrics.total_token_throughput,
             "input_lens": [output.prompt_len for output in outputs],
@@ -824,6 +810,9 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+
+    if isinstance(metrics, BenchmarkMetrics) and metrics.slo_report is not None:
+        result["slo_evaluation"] = metrics.slo_report
 
     if rps_change_events:
         result["rps_change_events"] = rps_change_events
@@ -1293,6 +1282,19 @@ def add_cli_args(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
+        "--slo-config",
+        type=str,
+        default=None,
+        help="JSON profiles/ratios for per-request ShareGPT TTFT/TPOT SLOs (ms).",
+    )
+    parser.add_argument(
+        "--slo-seed",
+        type=int,
+        default=None,
+        help="Independent SLO assignment seed; defaults to --seed.",
+    )
+
+    parser.add_argument(
         "--extra-body",
         help="A JSON string representing extra body parameters to include "
         "in each request."
@@ -1356,6 +1358,15 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             else:
                 raise ValueError("Invalid header format. Please use KEY=VALUE format.")
 
+    slo_config = None
+    if getattr(args, "slo_config", None):
+        if args.dataset_name != "sharegpt" or args.backend not in ("vllm", "openai"):
+            raise ValueError(
+                "--slo-config requires ShareGPT with the vllm/openai "
+                "completions backend"
+            )
+        slo_config = load_slo_config(args.slo_config)
+
     tokenizer = get_tokenizer(
         tokenizer_id,
         tokenizer_mode=tokenizer_mode,
@@ -1378,6 +1389,23 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
 
     # Load the dataset.
     input_requests = get_samples(args, tokenizer)
+    slo_assignment = None
+    if slo_config is not None:
+        slo_seed = args.slo_seed if args.slo_seed is not None else args.seed
+        slo_assignment = assign_slos(input_requests, slo_config, slo_seed)
+        slo_assignment["dataset_path"] = str(Path(args.dataset_path).resolve())
+        slo_assignment["sampling_seed"] = args.seed
+        # Save before sending traffic, including for interrupted benchmarks.
+        assignment_dir = Path(args.result_dir or ".")
+        assignment_dir.mkdir(parents=True, exist_ok=True)
+        result_name = args.result_filename or ("slo_" + uuid.uuid4().hex + ".json")
+        assignment_path = assignment_dir / Path(result_name).with_suffix(
+            ".slo_assignment.json"
+        )
+        with assignment_path.open("x") as stream:
+            json.dump(slo_assignment, stream, indent=2, allow_nan=False)
+            stream.write("\n")
+        print(f"SLO assignment: {assignment_path}")
     goodput_config_dict = check_goodput_args(args)
 
     backend = args.backend
@@ -1489,6 +1517,9 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         result_json["ramp_up_strategy"] = args.ramp_up_strategy
         result_json["ramp_up_start_rps"] = args.ramp_up_start_rps
         result_json["ramp_up_end_rps"] = args.ramp_up_end_rps
+
+    if slo_assignment is not None:
+        result_json["slo_assignment"] = slo_assignment
 
     # Merge with benchmark result
     result_json = {**result_json, **benchmark_result}

@@ -1,0 +1,7 @@
+{
+  "profiles": {
+    "tight": {"ttft_slo_ms": 1000, "tpot_slo_ms": 50},
+    "loose": {"ttft_slo_ms": 3000, "tpot_slo_ms": 150}
+  },
+  "ratios": {"tight": 0.5, "loose": 0.5}
+}
