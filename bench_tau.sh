@@ -151,7 +151,14 @@ build_command() {
 run_benchmark() {
     local count="$1" name="$2" code=0
     build_command "$count" "$name"
-    if ((dry_run)); then printf '%q ' "${BENCH_CMD[@]}"; printf '\n'; return; fi
+    if [[ "$name" == warmup ]]; then
+        printf '\n[bench warmup 预热：%s 个请求，不计入正式结果]\n' "$count"
+    else
+        printf '\n[bench result 正式压测：%s 个请求]\n' "$count"
+    fi
+    printf '[完整启动命令]\n'
+    printf '%q ' "${BENCH_CMD[@]}"; printf '\n'
+    if ((dry_run)); then return; fi
     # 执行前记录 trace 起点；执行成功后检查请求成功数和各 stage 的 compute 记录。
     "$PYTHON" "$ROOT/tools/tau_batch_run.py" begin-bench \
         "$RUN_DIR" "$RESULT_DIR" "$name" "$count" -- "${BENCH_CMD[@]}"

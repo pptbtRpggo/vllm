@@ -23,7 +23,7 @@ bash serve_tau.sh
 ```
 
 脚本直接调用已配置环境中的 `vllm serve`，自动创建本次运行目录和独立 trace 文件，并打印终端 B 的 benchmark 命令。
-`configs/serve.yaml` 是服务参数入口；`serve_tau.sh` 负责读取配置、构造命令和启动。
+`configs/serve.yaml` 是服务参数入口，Tau 专用参数在 `SCHEDULERS.tau`；`serve_tau.sh` 负责读取配置、构造命令和启动。
 配置读取工具使用项目已有的 PyYAML 依赖，不导入 vLLM/NPU；元信息工具记录最终配置。
 终端 A 保持运行；长时间任务建议在已有 tmux 会话中启动。
 
@@ -52,6 +52,53 @@ MAX_NUM_SEQS=8 bash serve_tau.sh /absolute/path/to/model
 服务输出目录留空时继续自动使用项目 `output/`。自定义配置可复制完整 YAML，再用
 `bash serve_tau.sh --config /path/to/serve.yaml` 或 `bash bench_tau.sh --config /path/to/bench.yaml`。
 `--dry-run` 可以预览，不启动服务、不发送请求。
+正式执行时，两脚本也会打印生效参数、配置来源及覆盖项、输出路径和完整命令。
+bench 额外显示 SLO 档位/比例，并分别标明预热和正式请求数。
+
+### 切换 vLLM 默认调度器
+
+同一份 `configs/serve.yaml` 用 `SCHEDULER` 选择配置区：
+
+```yaml
+SCHEDULER: default  # 改回 tau 即恢复 TauScheduler
+SCHEDULERS:
+  tau:
+    # 保留文件中现有的 Tau 配置
+    MAX_NUM_SEQS: 4
+    MAX_NUM_BATCHED_TOKENS: 8192
+    MAX_MICROBATCHES: 0
+    MIN_WAITING: 0
+    TRACE_ENABLED: true
+  default:
+    MAX_NUM_SEQS: null
+    MAX_NUM_BATCHED_TOKENS: null
+    ENABLE_CHUNKED_PREFILL: null
+    ENABLE_PREFIX_CACHING: null
+    ASYNC_SCHEDULING: null
+    SCHEDULING_POLICY: null
+```
+
+模型、设备、PP/TP、显存比例和输出目录仍使用文件顶部的公共设置。
+`default` 下的 `null` 表示不传对应参数，由当前 vLLM/平台决定；最终解析值看服务启动日志。
+要指定对照条件，例如同样的 batch 预算，把该区的两个上限改为 `4`、`8192`。
+布尔项可设 true/false/null，策略可设 fcfs/priority/null。参数组合仍需满足当前
+vLLM 与 Ascend 平台约束；这些选项可传入，不表示每种组合都可运行。
+
+默认模式不传 `--scheduler-cls`，由 vLLM 选择自身调度器，也不传 Tau 的 worker 或 trace 参数。
+当前 Tau trace 不支持默认调度器；只改 `SCHEDULER` 即会按模式关闭采集，显式 `--trace` 会报错。
+Tau 固定关闭 chunked prefill、prefix caching、async scheduling，这些约束会显示在启动参数中。
+每次切换需关闭旧服务再启动，新运行仍更新 `output/latest`。
+
+```bash
+bash serve_tau.sh                       # 使用 YAML 选择
+bash serve_tau.sh --scheduler default   # 可选的临时覆盖
+bash bench_tau.sh                       # 沿用同一份 bench 配置
+```
+
+bench 继续按每条请求的 SLO 评估 goodput，默认模式跳过 Tau trace 校验。
+SLO 阈值会随请求发送；默认调度器不会因此自动按 TTFT/TPOT SLO 调度。
+普通参数覆盖仍遵循命令行 > 非空环境变量 > 当前配置区；对照实验留意继承的
+`MAX_NUM_SEQS` 等环境变量是否覆盖了 YAML。
 
 ## 3. 终端 B：检查服务并运行 smoke
 

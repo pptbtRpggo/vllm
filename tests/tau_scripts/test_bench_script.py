@@ -241,6 +241,11 @@ def test_smoke_defaults_and_explicit_overrides(bench_setup):
     (command,) = calls(s)
     assert option(command, "--num-prompts") == "16"
     assert option(command, "--max-concurrency") == "3"
+    assert "CONCURRENCY（最多未完成请求数） = 3" in result.stdout
+    assert "NUM_PROMPTS（正式请求数） = 16" in result.stdout
+    assert "0（smoke 跳过预热；配置值 32）" in result.stdout
+    assert "SLO_ENABLED = False" in result.stdout
+    assert "[bench result 正式压测：16 个请求]" in result.stdout
     assert option(command, "--sharegpt-output-len") == "16"
     assert "--ignore-eos" not in command
 
@@ -440,6 +445,17 @@ def test_single_bench_config_includes_slo_and_workload(bench_setup):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     warmup, formal = calls(s)
+    assert "Tau bench 生效参数" in result.stdout
+    assert f"CONFIG = {path}" in result.stdout
+    assert '"ttft_slo_ms": 750' in result.stdout
+    assert '"ratios"' in result.stdout
+    assert "SLO_ENABLED = True" in result.stdout
+    assert "[bench warmup 预热：2 个请求，不计入正式结果]" in result.stdout
+    assert "[bench result 正式压测：6 个请求]" in result.stdout
+    assert result.stdout.count("[完整启动命令]") == 2
+    assert result.stdout.index("Tau bench 生效参数") < result.stdout.index(
+        "fake benchmark"
+    )
     assert option(warmup, "--num-prompts") == "2"
     assert option(formal, "--num-prompts") == "6"
     assert option(formal, "--sharegpt-output-len") == "24"
@@ -456,3 +472,20 @@ def test_single_bench_config_includes_slo_and_workload(bench_setup):
         "requests.jsonl",
         "summary.json",
     }
+
+
+def test_native_scheduler_bench_does_not_require_tau_settings(bench_setup):
+    s = bench_setup
+    path = s["run"] / "server_meta.json"
+    metadata = json.loads(path.read_text())
+    metadata["trace"] = None
+    metadata["settings"].update(SCHEDULER="default", TP="2")
+    del metadata["settings"]["MIN_WAITING"]
+    path.write_text(json.dumps(metadata))
+    target = s["tmp"] / "native_bench"
+    result = launch(s, "--result-dir", target)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SCHEDULER = default" in result.stdout
+    assert (
+        json.loads((target / "summary.json").read_text())["trace"]["enabled"] is False
+    )

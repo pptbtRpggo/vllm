@@ -169,7 +169,8 @@ def campaign(args):
         manifest = json.loads((args.run_dir / "server_meta.json").read_text())
         if not manifest.get("trace"):
             raise ValueError(
-                "Trace collection requires restarting serve_tau.sh with --trace"
+                "Trace collection requires SCHEDULER=tau "
+                "and restarting serve_tau.sh with --trace"
             )
         trace = Path(manifest["trace"])
         initial = trace.stat()

@@ -138,7 +138,8 @@ def main():
         parser.error("The two token IDs must differ")
     if not manifest.get("trace"):
         parser.error(
-            "EOS trace validation requires restarting serve_tau.sh with --trace"
+            "EOS trace validation requires SCHEDULER=tau "
+            "and restarting serve_tau.sh with --trace"
         )
     trace = Path(manifest["trace"])
     pp_size = int(manifest["settings"]["PP"])

@@ -20,14 +20,32 @@ SERVE_KEYS = {
     "HOST",
     "PORT",
     "MAX_MODEL_LEN",
-    "MAX_NUM_SEQS",
-    "MAX_NUM_BATCHED_TOKENS",
-    "MAX_MICROBATCHES",
-    "MIN_WAITING",
     "GPU_MEM",
-    "TRACE_ENABLED",
     "TRACE",
     "RUN_DIR",
+    "SCHEDULER",
+}
+SERVE_PROFILES = {
+    "tau": {
+        "MAX_NUM_SEQS",
+        "MAX_NUM_BATCHED_TOKENS",
+        "MAX_MICROBATCHES",
+        "MIN_WAITING",
+        "TRACE_ENABLED",
+    },
+    "default": {
+        "MAX_NUM_SEQS",
+        "MAX_NUM_BATCHED_TOKENS",
+        "ENABLE_CHUNKED_PREFILL",
+        "ENABLE_PREFIX_CACHING",
+        "ASYNC_SCHEDULING",
+        "SCHEDULING_POLICY",
+    },
+}
+NATIVE_BOOLEANS = {
+    "ENABLE_CHUNKED_PREFILL",
+    "ENABLE_PREFIX_CACHING",
+    "ASYNC_SCHEDULING",
 }
 BENCH_KEYS = {
     "RUN_DIR",
@@ -71,10 +89,32 @@ def load(kind, path, overrides, environ):
     path = Path(path).expanduser().resolve()
     content = path.read_bytes()
     config = yaml.safe_load(content)
-    keys = SERVE_KEYS if kind == "serve" else BENCH_KEYS | {"MODES", "SLO"}
+    keys = (
+        SERVE_KEYS | {"SCHEDULERS"}
+        if kind == "serve"
+        else BENCH_KEYS | {"MODES", "SLO"}
+    )
     exact_keys(config, keys, str(path))
-    values = {k: v for k, v in config.items() if k not in ("MODES", "SLO")}
-    allowed = SERVE_KEYS if kind == "serve" else BENCH_KEYS | MODE_KEYS | {"SLO_CONFIG"}
+    values = {
+        k: v for k, v in config.items() if k not in ("MODES", "SLO", "SCHEDULERS")
+    }
+    allowed = BENCH_KEYS | MODE_KEYS | {"SLO_CONFIG"}
+    if kind == "serve":
+        exact_keys(config["SCHEDULERS"], set(SERVE_PROFILES), "SCHEDULERS")
+        for name, profile in config["SCHEDULERS"].items():
+            exact_keys(profile, SERVE_PROFILES[name], f"SCHEDULERS.{name}")
+        scheduler = (
+            overrides.get("SCHEDULER")
+            or environ.get("SCHEDULER")
+            or values["SCHEDULER"]
+        )
+        if not isinstance(scheduler, str) or scheduler not in SERVE_PROFILES:
+            raise ValueError("SCHEDULER must be tau or default")
+        values.update(config["SCHEDULERS"][scheduler])
+        allowed = SERVE_KEYS | SERVE_PROFILES[scheduler] | {"TRACE_ENABLED"}
+        if scheduler == "default":
+            values["TRACE_ENABLED"] = False
+
     if set(overrides) - allowed:
         raise ValueError("Unknown command-line configuration override")
     inline_slo = ""
@@ -108,6 +148,29 @@ def load(kind, path, overrides, environ):
     if kind == "serve" and not values["RUN_DIR"] and environ.get("RUN"):
         values["RUN_DIR"] = environ["RUN"]
     values.update(overrides)
+    if kind == "serve":
+        if values["TRACE_ENABLED"] not in ("0", "1"):
+            raise ValueError("TRACE_ENABLED must be true/false (environment: 1/0)")
+        for key in ("MAX_NUM_SEQS", "MAX_NUM_BATCHED_TOKENS"):
+            if not values[key] and scheduler == "tau":
+                raise ValueError(f"SCHEDULERS.tau.{key} requires a positive integer")
+            if values[key] and int(values[key]) < 1:
+                raise ValueError(f"{key} must be positive")
+        if scheduler == "default":
+            if values["TRACE_ENABLED"] != "0":
+                raise ValueError(
+                    "Tau trace requires SCHEDULER=tau; default does not support --trace"
+                )
+            for key in NATIVE_BOOLEANS:
+                if values[key] not in ("", "0", "1"):
+                    raise ValueError(
+                        f"{key} must be true/false/null (environment: 1/0)"
+                    )
+            if values["SCHEDULING_POLICY"] not in ("", "fcfs", "priority"):
+                raise ValueError("SCHEDULING_POLICY must be fcfs, priority or null")
+        else:
+            # Fixed Tau contract; these features are unsupported by TauScheduler.
+            values.update({key: "0" for key in NATIVE_BOOLEANS})
     if kind == "bench":
         values["SLO_SEED"] = values["SLO_SEED"] or values["SEED"]
         values["SLO_INLINE"] = "" if values["SLO_CONFIG"] else inline_slo
@@ -132,6 +195,10 @@ def main():
     parser.add_argument("--set", nargs=2, action="append", default=[])
     args = parser.parse_args()
     values = load(args.kind, args.path, dict(args.set), os.environ)
+    if args.kind == "serve":
+        # Clear inactive profile settings inherited from a previous experiment.
+        for key in sorted(set.union(*SERVE_PROFILES.values()) - values.keys()):
+            print(f"unset {key}")
     # Keys are validated against a fixed schema; values are shell-quoted data.
     print("\n".join(f"export {k}={shlex.quote(v)}" for k, v in values.items()))
 

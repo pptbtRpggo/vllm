@@ -34,6 +34,8 @@ bash serve_tau.sh /absolute/path/to/model --dry-run
 应使用与本分支 vLLM 0.13.0 相容的 vllm-ascend 和依赖组合。
 服务参数统一在 `configs/serve.yaml`，包括模型路径、PP/TP、batch 上限和 trace 开关。
 填写后直接 `bash serve_tau.sh`；脚本读取配置并构造 `vllm serve` 命令。
+`SCHEDULER: tau/default` 分别使用 `SCHEDULERS.tau/default` 下的调度参数。
+下文采集/拟合流程使用 tau；默认调度器可运行同一 bench/SLO 测试，但不生成 Tau trace。
 脚本设置仓库 `PYTHONPATH` 来使用当前源码；
 环境仍须有兼容的 vLLM 编译产物、Ascend 插件和模型依赖。
 仅有一个未构建的源码 checkout 不等于环境安装完成。

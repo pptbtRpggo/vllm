@@ -173,6 +173,15 @@ def test_exact_arguments_manifest_logging_and_exit_status(launch_env, tmp_path):
     assert manifest["settings"]["MAX_NUM_SEQS"] == "8"
     assert "MAX_REQS_PER_MB" not in manifest["settings"]
     assert manifest["settings"]["PORT"] == "8123"
+    assert "Tau serve 生效参数" in result.stdout
+    assert f"MODEL = {model.resolve()}" in result.stdout
+    assert "MAX_NUM_SEQS = 8" in result.stdout
+    assert "PORT = 8123" in result.stdout
+    assert str(ROOT / "configs/serve.yaml") in result.stdout
+    assert "[serve 完整启动命令]" in result.stdout
+    assert result.stdout.index("Tau serve 生效参数") < result.stdout.index(
+        "fake vllm output"
+    )
     assert record["argv"][record["argv"].index("--port") + 1] == "8123"
     assert record["argv"][record["argv"].index("--max-num-seqs") + 1] == "8"
     assert record["argv"][record["argv"].index("--worker-cls") + 1].endswith(
@@ -320,4 +329,90 @@ def test_bad_service_config_fails_before_creating_output(launch_env):
     result = launch(launch_env, "/models/test")
     assert result.returncode == 2
     assert "UNKNOWN_OPTION" in result.stderr
+    assert not (ROOT / "output").exists()
+
+
+def test_default_scheduler_uses_native_defaults_and_clears_tau_state(launch_env):
+    config = ROOT / "configs/serve.yaml"
+    config.write_text(
+        config.read_text().replace("SCHEDULER: tau", "SCHEDULER: default")
+    )
+    launch_env.update(
+        TAU_BATCH_TRACE="/tmp/inherited.jsonl", MIN_WAITING="99", MAX_MICROBATCHES="9"
+    )
+    result = launch(launch_env, "/models/test")
+    assert result.returncode == 7, result.stderr
+    run = (ROOT / "output/latest").resolve()
+    meta = json.loads((run / "server_meta.json").read_text())
+    record = json.loads(Path(launch_env["TAU_TEST_RECORD"]).read_text())
+    assert meta["settings"]["SCHEDULER"] == "default"
+    assert meta["settings"]["MAX_NUM_SEQS"] is None
+    assert meta["trace"] is None and record["trace_env"] is None
+    assert "MIN_WAITING" not in meta["settings"]
+    assert "MAX_MICROBATCHES" not in meta["settings"]
+    for flag in (
+        "--scheduler-cls",
+        "--worker-cls",
+        "--max-num-seqs",
+        "--max-num-batched-tokens",
+    ):
+        assert flag not in record["argv"]
+    assert not any("tau-batch" in arg for arg in record["argv"])
+    assert "由 vLLM/平台决定" in result.stdout
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_default_scheduler_specific_options_reach_cli(launch_env, enabled):
+    import yaml
+
+    path = ROOT / "configs/serve.yaml"
+    data = yaml.safe_load(path.read_text())
+    data["SCHEDULER"] = "default"
+    data["SCHEDULERS"]["default"].update(
+        MAX_NUM_SEQS=32,
+        MAX_NUM_BATCHED_TOKENS=4096,
+        ENABLE_CHUNKED_PREFILL=enabled,
+        ENABLE_PREFIX_CACHING=enabled,
+        ASYNC_SCHEDULING=enabled,
+        SCHEDULING_POLICY="fcfs",
+    )
+    path.write_text(yaml.safe_dump(data))
+    result = launch(launch_env, "/models/test", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    cmd = json.loads(result.stdout)["command"]
+    assert cmd[cmd.index("--max-num-seqs") + 1] == "32"
+    assert cmd[cmd.index("--max-num-batched-tokens") + 1] == "4096"
+    assert cmd[cmd.index("--scheduling-policy") + 1] == "fcfs"
+    for flag in ("enable-chunked-prefill", "enable-prefix-caching", "async-scheduling"):
+        assert ("--" if enabled else "--no-") + flag in cmd
+    assert "--scheduler-cls" not in cmd
+
+
+def test_switch_back_to_tau_uses_only_tau_profile(launch_env):
+    config = ROOT / "configs/serve.yaml"
+    config.write_text(
+        config.read_text().replace("SCHEDULER: tau", "SCHEDULER: default")
+    )
+    result = launch(launch_env, "/models/test", "--scheduler", "tau", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    preview = json.loads(result.stdout)
+    assert preview["settings"]["SCHEDULER"] == "tau"
+    assert preview["settings"]["MAX_NUM_SEQS"] == "4"
+    assert preview["settings"]["MAX_NUM_BATCHED_TOKENS"] == "8192"
+    assert preview["trace"]
+    for flag in (
+        "--no-enable-chunked-prefill",
+        "--no-enable-prefix-caching",
+        "--no-async-scheduling",
+    ):
+        assert flag in preview["command"]
+
+
+@pytest.mark.parametrize("scheduler,extra", [("default", ["--trace"]), ("unknown", [])])
+def test_invalid_scheduler_combination_fails_before_launch(
+    launch_env, scheduler, extra
+):
+    result = launch(launch_env, "/models/test", "--scheduler", scheduler, *extra)
+    assert result.returncode == 2
+    assert not Path(launch_env["TAU_TEST_RECORD"]).exists()
     assert not (ROOT / "output").exists()

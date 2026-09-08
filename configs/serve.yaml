@@ -8,11 +8,25 @@ TP: 1                           # 每个 stage 的张量并行数；当前 trace
 HOST: "127.0.0.1"
 PORT: 8000
 MAX_MODEL_LEN: 4096              # 单请求输入 + 输出的 token 上限
-MAX_NUM_SEQS: 4                  # 单个 forward / microbatch 的请求数上限
-MAX_NUM_BATCHED_TOKENS: 8192      # 单个 forward 的总 token 预算；不做 chunked prefill
-MAX_MICROBATCHES: 0              # 一次组建的 list 最多 microbatch 数；0 不限
-MIN_WAITING: 0                  # 等待请求数门槛；0 不阻塞尾部请求
 GPU_MEM: 0.90                   # 每张设备的显存预算比例
-TRACE_ENABLED: true             # false：关闭 trace 及采集额外同步
 TRACE: null                     # 自动生成本机临时 JSONL 路径
 RUN_DIR: null                   # 自动生成项目 output/<运行标识>/，更新 output/latest
+
+# 切换调度器时只修改这一项；其他模型/设备配置由两种模式共用。
+SCHEDULER: tau                  # tau | default
+SCHEDULERS:
+  tau:
+    MAX_NUM_SEQS: 4             # 单个 forward / microbatch 请求数上限
+    MAX_NUM_BATCHED_TOKENS: 8192 # 单个 forward token 预算，不做 chunked prefill
+    MAX_MICROBATCHES: 0         # 一次 list 的 microbatch 数上限；0 不限
+    MIN_WAITING: 0              # 等待请求数门槛；0 不阻塞尾部请求
+    TRACE_ENABLED: true         # false 关闭 Tau trace 及采集额外同步
+  default:
+    # null 表示不传该 CLI 参数，使用当前 vLLM/平台的默认值，不套用 Tau 的限制。
+    MAX_NUM_SEQS: null
+    MAX_NUM_BATCHED_TOKENS: null
+    ENABLE_CHUNKED_PREFILL: null # true / false / null
+    ENABLE_PREFIX_CACHING: null  # true / false / null
+    ASYNC_SCHEDULING: null       # true / false / null；仍受 vLLM/平台兼容性校验约束
+    SCHEDULING_POLICY: null      # fcfs / priority / null
+    # 当前 Tau trace 不支持默认调度器，此模式自动关闭，不加载采集 worker。

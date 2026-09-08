@@ -30,7 +30,9 @@ def test_latest_run_discovery_and_overrides(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "ROOT", root)
     monkeypatch.setattr(runner, "capture", lambda command: "")
     settings = dict.fromkeys(runner.SERVE_SETTING_NAMES, "1")
-    settings.update(PP="2", MIN_WAITING="0", HOST="127.0.0.1", PORT="8000")
+    settings.update(
+        PP="2", MIN_WAITING="0", HOST="127.0.0.1", PORT="8000", SCHEDULER="tau"
+    )
     for key, value in settings.items():
         monkeypatch.setenv(key, value)
     latest = root / "output/latest"

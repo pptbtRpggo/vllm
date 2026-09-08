@@ -69,7 +69,37 @@ SERVE_SETTING_NAMES = (
     "GPU_MEM",
     "ASCEND_RT_VISIBLE_DEVICES",
     "TRACE_ENABLED",
+    "SCHEDULER",
+    "ENABLE_CHUNKED_PREFILL",
+    "ENABLE_PREFIX_CACHING",
+    "ASYNC_SCHEDULING",
+    "SCHEDULING_POLICY",
 )
+
+
+def print_launch_summary(kind, sections):
+    """Display resolved values, after YAML/environment/CLI precedence."""
+    source = json.loads(os.environ.get("TAU_LAUNCH_CONFIG", "null")) or {}
+    print(f"\n========== Tau {kind} 生效参数 ==========", flush=True)
+    print("[配置来源；优先级：命令行 > 非空环境变量 > YAML]")
+    for key, value in (
+        ("CONFIG", source.get("path", "未提供配置文件")),
+        ("CONFIG_SHA256", source.get("sha256", "未提供")),
+        ("环境变量覆盖", ", ".join(source.get("environment_overrides", [])) or "无"),
+        ("命令行覆盖", ", ".join(source.get("cli_overrides", [])) or "无"),
+        ("PYTHON", sys.executable),
+        ("VLLM_EXECUTABLE", shutil.which("vllm") or "未找到"),
+    ):
+        print(f"  {key} = {value}")
+    for title, values in sections:
+        print(f"[{title}]")
+        for key, value in values.items():
+            if value is None:
+                value = "由 vLLM/平台决定（未传参，以服务启动日志为准）"
+            if isinstance(value, dict):
+                value = json.dumps(value, ensure_ascii=False, indent=2)
+            print(f"  {key} = {value}")
+    print("==========================================\n", flush=True)
 
 
 def prepare_serve(args):
@@ -78,7 +108,10 @@ def prepare_serve(args):
     trace_path = Path(args.trace).expanduser() if args.trace else None
     run = run_path.resolve()
     trace = trace_path.resolve() if trace_path else None
-    settings = {key: os.environ[key] for key in SERVE_SETTING_NAMES}
+    settings = {
+        key: os.environ[key] or None for key in SERVE_SETTING_NAMES if key in os.environ
+    }
+    settings.setdefault("SCHEDULER", "tau")
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         raise ValueError("prepare-serve requires the actual server command")
@@ -144,13 +177,36 @@ def prepare_serve(args):
         temporary.replace(latest)
     finally:
         temporary.unlink(missing_ok=True)
-    print(f"RUN_DIR={run}\nTRACE={trace or 'disabled'}", flush=True)
+    print_launch_summary(
+        "serve",
+        [
+            (
+                "服务、设备与组批（长度/预算单位：token；GPU_MEM 为比例）",
+                {"MODEL": args.model, **settings},
+            ),
+            (
+                "输出与采集",
+                {
+                    "RUN_DIR": str(run),
+                    "SERVER_META": str(run / "server_meta.json"),
+                    "SERVER_LOG": str(run / "server.log"),
+                    "LATEST": str(latest),
+                    "TRACE": str(trace)
+                    if trace
+                    else "关闭（不记录 trace，无采集额外同步）",
+                },
+            ),
+        ],
+    )
     print(
-        f"终端 B: bash {shlex.quote(str(ROOT / 'bench_tau.sh'))} --mode smoke",
+        f"终端 B: bash {shlex.quote(str(ROOT / 'bench_tau.sh'))}",
         flush=True,
     )
-    print("启动命令: " + shlex.join(command), flush=True)
-    if int(settings["MIN_WAITING"]) != 0:
+    print("[serve 完整启动命令]\n" + shlex.join(command), flush=True)
+    if (
+        settings.get("SCHEDULER", "tau") == "tau"
+        and int(settings.get("MIN_WAITING") or 0) != 0
+    ):
         print("注意：MIN_WAITING 非零可能阻塞小样本或尾部请求；bench 脚本会拒绝运行。")
     return 0
 
@@ -160,6 +216,8 @@ def serve(args):
     command = ["bash", str(ROOT / "serve_tau.sh")]
     if args.config:
         command.extend(["--config", args.config])
+    if args.scheduler:
+        command.extend(["--scheduler", args.scheduler])
     if args.model:
         command.append(args.model)
     if args.run_dir:
@@ -310,8 +368,15 @@ def prepare_bench(args):
     run = Path(args.run_dir).expanduser().resolve()
     manifest = json.loads((run / "server_meta.json").read_text())
     settings = manifest["settings"]
-    if int(settings["MIN_WAITING"]) != 0:
+    if (
+        settings.get("SCHEDULER", "tau") == "tau"
+        and int(settings.get("MIN_WAITING") or 0) != 0
+    ):
         raise ValueError("Restart the server with MIN_WAITING=0 before benchmarking")
+    if settings.get("SCHEDULER", "tau") == "default" and manifest.get("trace"):
+        raise ValueError(
+            "Default scheduler does not support Tau trace; restart the service"
+        )
     if manifest.get("trace") and int(settings["TP"]) != 1:
         raise ValueError(
             "Current trace lacks TP rank IDs; this collection requires TP=1"
@@ -366,6 +431,65 @@ def prepare_bench(args):
         Path(os.environ.get("RESULT_DIR") or run / "bench" / (mode + "_" + stamp()))
         .expanduser()
         .resolve()
+    )
+    print_launch_summary(
+        "bench",
+        [
+            (
+                "目标服务",
+                {
+                    "RUN_DIR": str(run),
+                    "SERVER_META": str(run / "server_meta.json"),
+                    "MODEL": manifest["model"],
+                    "SCHEDULER": settings.get("SCHEDULER", "tau"),
+                    "BASE_URL": base_url,
+                    "TP": settings["TP"],
+                    "PP": settings["PP"],
+                    "BACKEND": "vllm",
+                    "ENDPOINT": "/v1/completions",
+                    "READY_TIMEOUT (s)": timeout,
+                    "TRACE": manifest.get("trace") or "关闭（跳过 trace 覆盖检查）",
+                },
+            ),
+            (
+                "数据与正式负载",
+                {
+                    "DATASET": str(dataset),
+                    "DOWNLOAD": os.environ["DOWNLOAD"],
+                    "MODE": mode,
+                    "NUM_PROMPTS（正式请求数）": os.environ["NUM_PROMPTS"],
+                    "OUTPUT_LEN（每请求目标输出 token 数）": os.environ["OUTPUT_LEN"],
+                    "CONCURRENCY（最多未完成请求数）": os.environ["CONCURRENCY"],
+                    "REQUEST_RATE (req/s；inf 为不限速率)": os.environ["REQUEST_RATE"],
+                    "BURSTINESS": os.environ["BURSTINESS"],
+                    "IGNORE_EOS（1 忽略，0 自然结束）": os.environ["IGNORE_EOS"],
+                    "SEED": os.environ["SEED"],
+                    "WARMUP_REQUESTS（不计入正式结果）": os.environ["WARMUP_REQUESTS"]
+                    if mode == "collect"
+                    else f"0（smoke 跳过预热；配置值 {os.environ['WARMUP_REQUESTS']}）",
+                },
+            ),
+            (
+                "SLO（TTFT 单位 ms；平均 TPOT 单位 ms/token）",
+                {
+                    "SLO_ENABLED": slo_content is not None,
+                    "SLO_SOURCE": slo_source or "未启用",
+                    "SLO_SEED": os.environ["SLO_SEED"] if slo_content else "未启用",
+                    "SLO": json.loads(slo_content) if slo_content else "未分配档位",
+                },
+            ),
+            (
+                "本轮输出",
+                {
+                    "RESULT_DIR": str(target),
+                    "文件": (
+                        "bench_meta.json、requests.jsonl、summary.json；"
+                        "失败时增加 error.log"
+                    ),
+                    "DRY_RUN": args.dry_run,
+                },
+            ),
+        ],
     )
     if not args.dry_run:
         if target.exists() or target.is_symlink():
@@ -423,8 +547,6 @@ def prepare_bench(args):
             slo_config = Path(os.environ["BENCH_WORK_DIR"]) / "slo_config.json"
             slo_config.write_bytes(content)
         write_json(target / "bench_meta.json", metadata)
-    if args.dry_run and slo_content is not None:
-        print("Effective SLO: " + slo_content.decode(), flush=True)
     # Only fixed variable names and shlex-quoted values are sourced by the shell.
     context = dict(
         RUN_DIR=str(run),
@@ -586,6 +708,7 @@ def main():
     )
     server.add_argument("model", nargs="?")
     server.add_argument("--config")
+    server.add_argument("--scheduler", choices=("tau", "default"))
     server.add_argument("--run-dir")
     server.add_argument("--dry-run", action="store_true")
     server.add_argument(

@@ -14,6 +14,7 @@ usage() {
 usage: bash serve_tau.sh [模型目录] [--config 配置文件] [--run-dir 新目录] [--dry-run]
 
 修改 configs/serve.yaml 后直接运行本脚本；模型可在配置中填写。
+--scheduler tau|default  临时覆盖 YAML 中的 SCHEDULER。
 --config   使用另一份完整服务配置；优先级：命令行 > 环境变量 > 配置文件。
 --dry-run  只查看最终参数，不创建文件、不启动服务。
 --no-trace 关闭 trace 和采集额外的设备同步；仍可运行 bench、统计 SLO。
@@ -30,11 +31,15 @@ while (($#)); do
         --dry-run) dry_run=1; shift ;;
         --no-trace) overrides+=(--set TRACE_ENABLED 0); shift ;;
         --trace) overrides+=(--set TRACE_ENABLED 1); shift ;;
-        --config|--run-dir)
+        --config|--run-dir|--scheduler)
             if (($# < 2)) || [[ -z "$2" ]]; then
                 echo "ERROR: $1 需要参数值" >&2; exit 2
             fi
-            if [[ "$1" == --config ]]; then CONFIG="$2"; else overrides+=(--set RUN_DIR "$2"); fi
+            case "$1" in
+                --config) CONFIG="$2" ;;
+                --scheduler) overrides+=(--set SCHEDULER "$2") ;;
+                --run-dir) overrides+=(--set RUN_DIR "$2") ;;
+            esac
             shift 2 ;;
         -*) echo "ERROR: 未知选项 $1" >&2; exit 2 ;;
         *)
@@ -73,14 +78,26 @@ VLLM_CMD=(
     --pipeline-parallel-size "$PP"
     --tensor-parallel-size "$TP"
     --max-model-len "$MAX_MODEL_LEN"
-    --max-num-seqs "$MAX_NUM_SEQS"
-    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
     --gpu-memory-utilization "$GPU_MEM"
-    --tau-batch-max-microbatches "$MAX_MICROBATCHES"
-    --tau-batch-min-waiting "$MIN_WAITING"
-    --scheduler-cls vllm.v1.core.sched.tau_batch.TauScheduler
     --trust-remote-code
 )
+# 空值交给 vLLM/平台处理，不能把 null 当成 0 或沿用 Tau 的默认值。
+if [[ -n "$MAX_NUM_SEQS" ]]; then VLLM_CMD+=(--max-num-seqs "$MAX_NUM_SEQS"); fi
+if [[ -n "$MAX_NUM_BATCHED_TOKENS" ]]; then VLLM_CMD+=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"); fi
+for setting in ENABLE_CHUNKED_PREFILL ENABLE_PREFIX_CACHING ASYNC_SCHEDULING; do
+    flag="$(printf '%s' "$setting" | tr '[:upper:]_' '[:lower:]-')"
+    case "${!setting}" in
+        1) VLLM_CMD+=("--$flag") ;;
+        0) VLLM_CMD+=("--no-$flag") ;;
+    esac
+done
+if [[ "$SCHEDULER" == tau ]]; then
+    VLLM_CMD+=(--scheduler-cls vllm.v1.core.sched.tau_batch.TauScheduler
+        --tau-batch-max-microbatches "$MAX_MICROBATCHES"
+        --tau-batch-min-waiting "$MIN_WAITING")
+elif [[ -n "$SCHEDULING_POLICY" ]]; then
+    VLLM_CMD+=(--scheduling-policy "$SCHEDULING_POLICY")
+fi
 if [[ "$TRACE_ENABLED" == 1 ]]; then
     VLLM_CMD+=(--worker-cls vllm.v1.worker.tau_ascend_worker.TauAscendWorker
         --tau-batch-trace "$TRACE")
