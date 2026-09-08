@@ -1,21 +1,23 @@
 # ShareGPT 分组 SLO 压测
 
-在现有 Tau 服务运行目录上执行：
+在 `configs/bench.yaml` 中配置数据集和负载，将 `SLO.enabled` 改为 `true`，
+在同一文件修改 `SLO.profiles` 和 `SLO.ratios`。服务启动后直接执行：
 
 ```bash
-bash bench_tau.sh /path/to/run --mode collect \
-  --slo-config tools/tau_slo_profiles.example.json \
-  --slo-seed 42
+bash bench_tau.sh
 ```
 
-`tau_slo_profiles.example.json` 定义两个档位：
+需要一份独立实验配置时，复制完整的 bench YAML，再使用 `--config /path/to/bench.yaml`。
+无需单独配置 SLO JSON；`--slo-config` 仍保留为兼容原生 benchmark 的临时覆盖。
+
+`configs/bench.yaml` 中的 SLO 示例 定义两个档位：
 
 | 档位 | TTFT 上限（ms） | TPOT 上限（ms/token） | 请求比例 |
 | --- | ---: | ---: | ---: |
 | tight | 1000 | 50 | 0.5 |
 | loose | 3000 | 150 | 0.5 |
 
-可以修改档位名称、阈值和比例，也可以增加档位。阈值必须为有限正数，比例非负且总和为 1；`profiles` 和 `ratios` 的名称必须对应。不传 `--slo-config` 时不分配档位，保留原来的压测行为。
+可以修改档位名称、阈值和比例，也可以增加档位。阈值必须为有限正数，比例非负且总和为 1；`profiles` 和 `ratios` 的名称必须对应。`SLO.enabled: false` 且未显式传入外部 SLO 配置时不分配档位。
 
 ## 分配与发送
 
@@ -40,11 +42,13 @@ bash bench_tau.sh /path/to/run --mode collect \
 
 ## 结果文件
 
-脚本的结果目录中保存：
+脚本默认把每轮压测放在 `output/<服务运行目录>/bench/<本轮标识>/`：
 
-- `slo_config.json`：本次使用的配置快照。
-- `slo_config_source.json`：原配置路径、SHA256 和分配种子。
-- `result.slo_assignment.json`：发送流量前保存的正式请求分配表；包含请求 ID、原始 ShareGPT 数组下标（从 0 开始）、长度、档位和阈值。中途压测失败也可检查此文件。
-- `result.json`：`slo_assignment` 保存分配信息；`slo_evaluation` 保存总体及 `by_profile` 分组统计，并在 `requests` 中保存每条请求的阈值、实测指标和 `attained` 判定。
+- `bench_meta.json`：服务引用、数据集路径/大小/SHA256、SLO 配置快照与 SHA256、采样/分配种子和各阶段命令。
+- `requests.jsonl`：发流量前保存正式请求 ID、ShareGPT 原始下标、长度和 SLO；正常测量结束后原子替换为逐条结果，含 TTFT/TPOT/E2EL、success、attained。中途退出保留 planned 行，success 为 null，不推断实际完成情况。
+- `summary.json`：正式统计、总体及 by_profile goodput；trace 字段保存正式区间与校验，warmup 字段仅保存预热摘要。
+- `error.log`：仅失败时保存控制台输出。
 
-若启用预热，会单独生成对应的 `warmup.slo_assignment.json` 和 `warmup.json`。数据文件的路径和 SHA256 沿用脚本已有的 `dataset.json` 记录。
+不保存生成文本；不再额外保存配置、分配表、预热明细和正常运行日志。原始 trace 继续在本机临时目录的单个文件中，路径记录在 `server_meta.json`。
+
+脚本使用新增的原生 `--request-output <JSONL路径>` 输出逐条记录。直接运行 `vllm bench serve` 而不传此选项时，原有结果和 `.slo_assignment.json` 格式保持兼容。

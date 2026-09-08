@@ -47,6 +47,7 @@ from vllm.benchmarks.lib.endpoint_request_func import (
 )
 from vllm.benchmarks.lib.ready_checker import wait_for_endpoint
 from vllm.benchmarks.lib.utils import convert_to_pytorch_benchmark_format, write_to_json
+from vllm.benchmarks.request_records import write_request_records
 from vllm.benchmarks.slo import (
     assign_slos,
     evaluate_goodput,
@@ -494,6 +495,7 @@ async def benchmark(
     ramp_up_start_rps: int | None = None,
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
+    request_output: str | None = None,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -812,7 +814,20 @@ async def benchmark(
         }
 
     if isinstance(metrics, BenchmarkMetrics) and metrics.slo_report is not None:
-        result["slo_evaluation"] = metrics.slo_report
+        result["slo_evaluation"] = {
+            k: v
+            for k, v in metrics.slo_report.items()
+            if not request_output or k != "requests"
+        }
+
+    if request_output is not None:
+        write_request_records(
+            request_output,
+            input_requests,
+            outputs,
+            actual_output_lens,
+            metrics.slo_report,
+        )
 
     if rps_change_events:
         result["rps_change_events"] = rps_change_events
@@ -1096,6 +1111,12 @@ def add_cli_args(parser: argparse.ArgumentParser):
         help="Specify to save benchmark results to a json file",
     )
     parser.add_argument(
+        "--request-output",
+        help="Per-request JSONL: save plan before traffic, replace with outcomes "
+        "after measurement. ShareGPT completions only; omits separate SLO "
+        "assignment files and per-request arrays in SLO summaries.",
+    )
+    parser.add_argument(
         "--save-detailed",
         action="store_true",
         help="When saving the results, whether to include per request "
@@ -1358,6 +1379,11 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             else:
                 raise ValueError("Invalid header format. Please use KEY=VALUE format.")
 
+    request_output = getattr(args, "request_output", None)
+    if request_output and (
+        args.dataset_name != "sharegpt" or args.backend not in ("vllm", "openai")
+    ):
+        raise ValueError("--request-output requires ShareGPT completions")
     slo_config = None
     if getattr(args, "slo_config", None):
         if args.dataset_name != "sharegpt" or args.backend not in ("vllm", "openai"):
@@ -1395,17 +1421,20 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         slo_assignment = assign_slos(input_requests, slo_config, slo_seed)
         slo_assignment["dataset_path"] = str(Path(args.dataset_path).resolve())
         slo_assignment["sampling_seed"] = args.seed
-        # Save before sending traffic, including for interrupted benchmarks.
-        assignment_dir = Path(args.result_dir or ".")
-        assignment_dir.mkdir(parents=True, exist_ok=True)
-        result_name = args.result_filename or ("slo_" + uuid.uuid4().hex + ".json")
-        assignment_path = assignment_dir / Path(result_name).with_suffix(
-            ".slo_assignment.json"
-        )
-        with assignment_path.open("x") as stream:
-            json.dump(slo_assignment, stream, indent=2, allow_nan=False)
-            stream.write("\n")
-        print(f"SLO assignment: {assignment_path}")
+        if not request_output:
+            # Save before sending traffic, including for interrupted benchmarks.
+            assignment_dir = Path(args.result_dir or ".")
+            assignment_dir.mkdir(parents=True, exist_ok=True)
+            result_name = args.result_filename or ("slo_" + uuid.uuid4().hex + ".json")
+            assignment_path = assignment_dir / Path(result_name).with_suffix(
+                ".slo_assignment.json"
+            )
+            with assignment_path.open("x") as stream:
+                json.dump(slo_assignment, stream, indent=2, allow_nan=False)
+                stream.write("\n")
+            print(f"SLO assignment: {assignment_path}")
+    if request_output:
+        write_request_records(request_output, input_requests)
     goodput_config_dict = check_goodput_args(args)
 
     backend = args.backend
@@ -1480,6 +1509,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ramp_up_start_rps=args.ramp_up_start_rps,
         ramp_up_end_rps=args.ramp_up_end_rps,
         ready_check_timeout_sec=args.ready_check_timeout_sec,
+        request_output=request_output,
     )
 
     # Save config and results to json
@@ -1519,7 +1549,11 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         result_json["ramp_up_end_rps"] = args.ramp_up_end_rps
 
     if slo_assignment is not None:
-        result_json["slo_assignment"] = slo_assignment
+        result_json["slo_assignment"] = {
+            k: v
+            for k, v in slo_assignment.items()
+            if not request_output or k != "requests"
+        }
 
     # Merge with benchmark result
     result_json = {**result_json, **benchmark_result}

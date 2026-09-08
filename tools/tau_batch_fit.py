@@ -64,6 +64,7 @@ def load_samples(trace, reports):
     ranges = []
     for path in reports:
         report = json.loads(path.read_text())
+        report = report.get("trace", report)
         if report.get("passed") is not True:
             raise ValueError(f"Unvalidated trace range: {path}")
         start, end = report["trace_start_offset"], report["trace_end_offset"]
@@ -242,7 +243,7 @@ def main():
         type=Path,
         action="append",
         required=True,
-        help="Completed result_trace_check.json; repeat for disjoint ranges",
+        help="Completed summary.json (trace field); repeat for disjoint ranges",
     )
     parser.add_argument("--stage-layers", type=int)
     parser.add_argument("--validation-fraction", type=float, default=0.2)

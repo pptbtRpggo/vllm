@@ -145,7 +145,7 @@ def test_archive_rebases_offsets_and_preserves_samples(tmp_path):
     with trace.open("a") as f:
         f.write('{"event":"compute","fwd_id":-2}\n')
     archived, local_report = campaign.archive(trace, report, tmp_path / "copy", 100)
-    local = json.loads(local_report.read_text())
+    local = json.loads(local_report.read_text())["trace"]
     assert local["trace_start_offset"] == 0
     assert local["trace_end_offset"] == archived.stat().st_size < original_size
     assert (
@@ -190,7 +190,7 @@ def test_campaign_covers_source_once_and_stops_on_failure(
     run.mkdir()
     trace = run / "trace.jsonl"
     trace.write_text("")
-    campaign.save(run / "run.json", {"model": "test", "trace": str(trace)})
+    campaign.save(run / "server_meta.json", {"model": "test", "trace": str(trace)})
     source = tmp_path / "data.json"
     campaign.save(source, [{"id": i} for i in range(5)])
     ids = [4, 1, 3, 0, 2]
@@ -215,7 +215,6 @@ def test_campaign_covers_source_once_and_stops_on_failure(
     )
     monkeypatch.setattr(campaign, "load_index", lambda *args: (ids, {}))
     monkeypatch.setattr(campaign, "ensure_idle", lambda *args: None)
-    monkeypatch.setattr(campaign, "fit", lambda *args: {"fitted": True})
     batches = []
     monkeypatch.setenv("IGNORE_EOS", "0")
 
@@ -232,7 +231,7 @@ def test_campaign_covers_source_once_and_stops_on_failure(
         with trace.open("a") as f:
             f.write('{"example":"record"}\n')
         campaign.save(
-            target / "result_trace_check.json",
+            target / "summary.json",
             {
                 "passed": True,
                 "completed": len(selected),
@@ -259,4 +258,12 @@ def test_campaign_covers_source_once_and_stops_on_failure(
         assert state["status"] == "complete"
         assert state["completed"] == 5
         assert [i for batch in batches for i in batch] == ids
-        assert (args.output_dir / "parameters_all.json").exists()
+        assert not list(args.output_dir.rglob("parameters*.json"))
+
+
+def test_fit_accepts_summary_trace_range(tmp_path):
+    trace, report = trace_fixture(tmp_path)
+    expected = fitter.fit(trace, [report])
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"trace": json.loads(report.read_text())}))
+    assert fitter.fit(trace, [summary])["groups"] == expected["groups"]

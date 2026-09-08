@@ -1,0 +1,33 @@
+# 压测配置：修改这里，然后运行 bash bench_tau.sh。
+# 命令行 > 环境变量 > 本文件；相对文件路径相对于本配置所在目录。
+RUN_DIR: null                   # 默认读取项目 output/latest，不重复配置模型/端口/PP
+BASE_URL: null                  # 默认从服务元信息读取；跨机器压测时可指定可访问的地址
+DATASET: "../datasets/sharegpt.json"
+DOWNLOAD: false                 # 数据不存在时是否下载
+RESULT_DIR: null                # 自动生成服务运行目录下 bench/<本轮标识>/
+READY_TIMEOUT: 300              # 等待服务就绪的秒数
+
+MODE: smoke                     # smoke 不预热；collect 先预热再正式压测
+MODES:
+  smoke:
+    NUM_PROMPTS: 8
+    OUTPUT_LEN: 16
+    CONCURRENCY: 8
+  collect:
+    NUM_PROMPTS: 1000
+    OUTPUT_LEN: 256
+    CONCURRENCY: 32
+WARMUP_REQUESTS: 32             # 仅 collect 使用，不计入正式结果
+REQUEST_RATE: "inf"             # 请求/秒；inf 尽快发送，仍受 CONCURRENCY 限制
+BURSTINESS: 1                   # 有限速率时：1 随机指数间隔，inf 等间隔
+IGNORE_EOS: true                # 固定输出长度；false 允许自然 EOS
+SEED: 0                        # 数据采样和到达间隔种子
+SLO_SEED: null                  # 留空使用 SEED
+
+# SLO 档位直接放在本文件，不需要另外编辑 JSON。
+SLO:
+  enabled: false
+  profiles:
+    tight: {ttft_slo_ms: 1000, tpot_slo_ms: 50}
+    loose: {ttft_slo_ms: 3000, tpot_slo_ms: 150}
+  ratios: {tight: 0.5, loose: 0.5}

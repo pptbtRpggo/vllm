@@ -233,3 +233,6 @@ tau_batch_trace*
 /trace_runs/
 /datasets/sharegpt.json
 /datasets/sharegpt.json.*.part
+
+# Tau service and benchmark outputs
+/output/

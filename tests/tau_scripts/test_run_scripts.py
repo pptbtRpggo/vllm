@@ -25,13 +25,15 @@ def test_latest_run_discovery_and_overrides(tmp_path, monkeypatch):
     (root / "tools").mkdir(parents=True)
     shutil.copy2(ROOT / "bench_tau.sh", root / "bench_tau.sh")
     shutil.copy2(ROOT / "tools/tau_batch_run.py", root / "tools/tau_batch_run.py")
+    shutil.copy2(ROOT / "tools/tau_config.py", root / "tools/tau_config.py")
+    shutil.copytree(ROOT / "configs", root / "configs")
     monkeypatch.setattr(runner, "ROOT", root)
     monkeypatch.setattr(runner, "capture", lambda command: "")
     settings = dict.fromkeys(runner.SERVE_SETTING_NAMES, "1")
     settings.update(PP="2", MIN_WAITING="0", HOST="127.0.0.1", PORT="8000")
     for key, value in settings.items():
         monkeypatch.setenv(key, value)
-    latest = root / "trace_runs/latest"
+    latest = root / "output/latest"
     env = {key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ}
     env.update(PYTHON=sys.executable, TMPDIR=str(tmp_path))
 

@@ -18,6 +18,27 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.parametrize("damage", ["stage_only", "short_count"])
+def test_bench_without_trace_skips_coverage_but_checks_completed(bench_setup, damage):
+    setup = bench_setup
+    manifest_path = setup["run"] / "server_meta.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["trace"] = None
+    manifest_path.write_text(json.dumps(manifest))
+    setup["env"]["TAU_TEST_DAMAGE"] = damage
+    target = setup["tmp"] / "without_trace"
+    result = launch(setup, "--result-dir", target)
+    assert (result.returncode == 0) == (damage != "short_count"), result.stderr
+    assert not json.loads((target / "summary.json").read_text())["trace"]["enabled"]
+    assert (
+        json.loads((target / "bench_meta.json").read_text())["phases"]["result"][
+            "trace"
+        ]
+        is None
+    )
+    assert '"trace_check": "disabled"' in result.stdout
+
+
 @pytest.fixture
 def bench_setup(tmp_path):
     run = tmp_path / "service run"
@@ -55,7 +76,7 @@ def bench_setup(tmp_path):
             MIN_WAITING="0",
         ),
     )
-    (run / "run.json").write_text(json.dumps(manifest))
+    (run / "server_meta.json").write_text(json.dumps(manifest))
     dataset = tmp_path / "data $(touch SHOULD_NOT_EXIST).json"
     dataset.write_text("[]")
     calls = tmp_path / "calls.jsonl"
@@ -71,9 +92,12 @@ args = sys.argv[1:]
 def option(name):
     return args[args.index(name) + 1]
 calls = Path(os.environ["TAU_TEST_CALLS"])
+if "--slo-config" in args:
+    calls.with_suffix(".slo.json").write_text(Path(option("--slo-config")).read_text())
 with calls.open("a") as stream:
     stream.write(json.dumps(args) + "\\n")
 step = len(calls.read_text().splitlines())
+Path(option("--request-output")).write_text('{}\\n')
 print("fake benchmark", flush=True)
 damage = os.environ.get("TAU_TEST_DAMAGE", "")
 if damage == "exit":
@@ -97,6 +121,12 @@ with trace.open("a") as stream:
             event = "stage" if damage == "stage_only" else "compute"
             stream.write(json.dumps(dict(event=event, fwd_id=fid, pp_rank=rank,
                          start_ts_ns=100, end_ts_ns=200, **features)) + "\\n")
+if damage == "replace":
+    replacement = trace.with_suffix(".replacement")
+    replacement.write_text(trace.read_text())
+    replacement.replace(trace)
+if damage == "truncate":
+    trace.write_text("")
 count = int(option("--num-prompts")) - (1 if damage == "short_count" else 0)
 target = Path(option("--result-dir")) / option("--result-filename")
 target.write_text(json.dumps(dict(completed=count)))
@@ -178,17 +208,28 @@ def test_traffic_parameters_and_range_isolation(bench_setup, legacy):
         assert option(command, "--seed") == "7"
         assert option(command, "--sharegpt-output-len") == "256"
         assert "--ignore-eos" in command
-    w = json.loads((target / "warmup_trace_check.json").read_text())
-    r = json.loads((target / "result_trace_check.json").read_text())
+    summary = json.loads((target / "summary.json").read_text())
+    w = summary["warmup"]["trace"]
+    r = summary["trace"]
     assert w["passed"] and r["passed"]
     assert w["trace_end_offset"] == r["trace_start_offset"]
     assert r["events"] == {"emit": 2, "compute": 4}
-    assert json.loads((target / "result_command.json").read_text())["command"] == [
+    assert json.loads((target / "bench_meta.json").read_text())["phases"]["result"][
+        "command"
+    ] == [
         "vllm",
         *measured,
     ]
-    assert "fake benchmark" in (target / "result.log").read_text()
-    assert len(json.loads((target / "dataset.json").read_text())["sha256"]) == 64
+    assert {p.name for p in target.iterdir()} == {
+        "bench_meta.json",
+        "summary.json",
+        "requests.jsonl",
+    }
+    assert (
+        len(json.loads((target / "bench_meta.json").read_text())["dataset"]["sha256"])
+        == 64
+    )
+    assert not Path(option(measured, "--result-dir")).exists()
     assert not (s["tmp"] / "SHOULD_NOT_EXIST").exists()
 
 
@@ -227,9 +268,12 @@ def test_failed_warmup_never_starts_measured_requests(bench_setup, damage):
     assert result.returncode == (7 if damage == "exit" else 2)
     assert len(calls(s)) == 1
     (target,) = (s["run"] / "bench").iterdir()
-    assert not (target / "result_command.json").exists()
+    assert (
+        "result" not in json.loads((target / "bench_meta.json").read_text())["phases"]
+    )
+    assert (target / "error.log").is_file()
     if damage != "exit":
-        assert not json.loads((target / "warmup_trace_check.json").read_text())[
+        assert not json.loads((target / "summary.json").read_text())["warmup"]["trace"][
             "passed"
         ]
 
@@ -263,7 +307,7 @@ def test_invalid_traffic_config_fails_before_sending(bench_setup, key, value):
 
 @pytest.mark.parametrize("key,value", [("TP", "2"), ("MIN_WAITING", "4")])
 def test_unsupported_service_config_fails_before_sending(bench_setup, key, value):
-    manifest = bench_setup["run"] / "run.json"
+    manifest = bench_setup["run"] / "server_meta.json"
     config = json.loads(manifest.read_text())
     config["settings"][key] = value
     manifest.write_text(json.dumps(config))
@@ -334,11 +378,81 @@ def test_slo_config_snapshot_and_seed_reach_both_phases(bench_setup, legacy):
         legacy=legacy,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    snapshot = target / "slo_config.json"
-    assert snapshot.read_text() == config.read_text()
+    metadata = json.loads((target / "bench_meta.json").read_text())["slo"]
+    assert metadata["config"] == json.loads(config.read_text())
     for command in calls(s):
-        assert option(command, "--slo-config") == str(snapshot)
+        snapshot = Path(option(command, "--slo-config"))
+        assert snapshot.name == "slo_config.json"
+        assert snapshot.parent != target
+        assert not snapshot.exists()  # Only the metadata snapshot persists.
         assert option(command, "--slo-seed") == "7"
-    metadata = json.loads((target / "slo_config_source.json").read_text())
     assert metadata["path"] == str(config)
     assert metadata["slo_seed"] == 7
+
+
+@pytest.mark.parametrize("damage", ["replace", "truncate"])
+def test_trace_damage_preserves_measurements_and_failure_log(bench_setup, damage):
+    bench_setup["env"]["TAU_TEST_DAMAGE"] = damage
+    target = bench_setup["tmp"] / "damaged"
+    result = launch(bench_setup, "--result-dir", target)
+    assert result.returncode == 2
+    summary = json.loads((target / "summary.json").read_text())
+    assert summary["completed"] == 8
+    assert not summary["trace"]["passed"]
+    assert damage in summary["trace"]["error"].lower()
+    assert (target / "requests.jsonl").exists()
+    assert (target / "error.log").is_file()
+
+
+def test_readiness_failure_keeps_metadata_and_error_log(bench_setup):
+    target = bench_setup["tmp"] / "not_ready"
+    # The local fixture returns /v1/models only; change expected model.
+    path = bench_setup["run"] / "server_meta.json"
+    meta = json.loads(path.read_text())
+    meta["model"] = "wrong-model"
+    path.write_text(json.dumps(meta))
+    result = launch(bench_setup, "--result-dir", target)
+    assert result.returncode == 2
+    assert (target / "bench_meta.json").is_file()
+    assert "does not match" in (target / "error.log").read_text()
+    assert not bench_setup["calls"].exists()
+
+
+def test_single_bench_config_includes_slo_and_workload(bench_setup):
+    import yaml
+
+    s = bench_setup
+    config = yaml.safe_load((ROOT / "configs/bench.yaml").read_text())
+    config.update(RUN_DIR=str(s["run"]), DATASET=str(s["dataset"]), MODE="collect")
+    config["MODES"]["collect"] = dict(NUM_PROMPTS=6, OUTPUT_LEN=24, CONCURRENCY=3)
+    config["WARMUP_REQUESTS"] = 2
+    config["SLO"]["enabled"] = True
+    config["SLO"]["profiles"]["tight"]["ttft_slo_ms"] = 750
+    path = s["tmp"] / "bench.yaml"
+    path.write_text(yaml.safe_dump(config))
+    result = subprocess.run(
+        ["bash", str(ROOT / "bench_tau.sh"), "--config", str(path)],
+        env=s["env"],
+        cwd=s["tmp"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    warmup, formal = calls(s)
+    assert option(warmup, "--num-prompts") == "2"
+    assert option(formal, "--num-prompts") == "6"
+    assert option(formal, "--sharegpt-output-len") == "24"
+    assert option(formal, "--max-concurrency") == "3"
+    payload = json.loads(s["calls"].with_suffix(".slo.json").read_text())
+    assert payload == {k: v for k, v in config["SLO"].items() if k != "enabled"}
+    (target,) = (s["run"] / "bench").iterdir()
+    meta = json.loads((target / "bench_meta.json").read_text())
+    assert meta["launch_config"]["path"] == str(path)
+    assert meta["slo"]["section"] == "SLO"
+    assert meta["slo"]["config"] == payload
+    assert {p.name for p in target.iterdir()} == {
+        "bench_meta.json",
+        "requests.jsonl",
+        "summary.json",
+    }

@@ -3,7 +3,7 @@
 """Sequential full ShareGPT collection against an ALREADY RUNNING server.
 
 Never starts/restarts a server. Keeps a deterministic source-index manifest,
-archives each validated range, and fits each shard before starting the next.
+archives each validated range. Fitting is a separate, manual step.
 On any failed batch, stops without silently retrying partly completed requests.
 """
 
@@ -18,8 +18,6 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
-
-from tau_batch_fit import fit
 
 
 def save(path, value):
@@ -94,6 +92,7 @@ def load_index(args, manifest, data):
 
 def archive(trace, report_path, destination, count):
     report = json.loads(report_path.read_text())
+    report = report.get("trace", report)
     if not report.get("passed") or report.get("completed") != count:
         raise ValueError(f"Unsuccessful benchmark: {report_path}")
     start, end = report["trace_start_offset"], report["trace_end_offset"]
@@ -115,22 +114,20 @@ def archive(trace, report_path, destination, count):
         dst.flush()
         os.fsync(dst.fileno())
     os.replace(target.with_suffix(".partial"), target)
-    save(destination / "original_report.json", report)
-    save(
-        destination / "archive.json",
-        {
-            "source": str(trace),
-            "source_report": str(report_path),
-            "source_start_offset": start,
-            "source_end_offset": end,
-            "bytes": end - start,
-            "sha256": h.hexdigest(),
-        },
-    )
+    archive_meta = {
+        "source": str(trace),
+        "source_report": str(report_path),
+        "source_start_offset": start,
+        "source_end_offset": end,
+        "bytes": end - start,
+        "sha256": h.hexdigest(),
+    }
     # A range-local report must address the range-local file, not the live file.
-    report.update(trace_start_offset=0, trace_end_offset=end - start)
-    local_report = destination / "trace_check.json"
-    save(local_report, report)
+    report.update(trace_start_offset=0, trace_end_offset=end - start, path=str(target))
+    archived_stat = target.stat()
+    report["identity"] = [archived_stat.st_dev, archived_stat.st_ino]
+    local_report = destination / "summary.json"
+    save(local_report, {"trace": report, "archive": archive_meta})
     return target, local_report
 
 
@@ -152,8 +149,8 @@ def ensure_idle(manifest):
 
 
 def campaign(args):
-    if min(args.shard_size, args.concurrency, args.stage_layers) < 1:
-        raise ValueError("Shard size, concurrency and stage layers must be positive")
+    if min(args.shard_size, args.concurrency) < 1:
+        raise ValueError("Shard size and concurrency must be positive")
     if not 1 <= args.output_len <= 1024:
         raise ValueError("Output length must be 1..1024 to preserve sampler validity")
     if bool(args.adopt_report) != bool(args.adopt_count):
@@ -169,7 +166,11 @@ def campaign(args):
     status_path = args.output_dir / "status.json"
     save(status_path, state)
     try:
-        manifest = json.loads((args.run_dir / "run.json").read_text())
+        manifest = json.loads((args.run_dir / "server_meta.json").read_text())
+        if not manifest.get("trace"):
+            raise ValueError(
+                "Trace collection requires restarting serve_tau.sh with --trace"
+            )
         trace = Path(manifest["trace"])
         initial = trace.stat()
         identity = (initial.st_dev, initial.st_ino)
@@ -186,7 +187,6 @@ def campaign(args):
                 "index_sha256": digest(args.index_dir / "indices.json"),
                 "output_len": args.output_len,
                 "concurrency": args.concurrency,
-                "stage_layers": args.stage_layers,
                 "shard_size": args.shard_size,
                 "tools": {
                     p.name: digest(p)
@@ -207,15 +207,11 @@ def campaign(args):
                 time.sleep(10)
             if json.loads(args.await_exit.read_text())["returncode"] != 0:
                 raise ValueError("Adopted benchmark failed")
-        reports = []
 
         def complete(start, end, report):
             destination = args.output_dir / f"shard_{start:06d}_{end:06d}"
-            archived, local_report = archive(trace, report, destination, end - start)
+            archive(trace, report, destination, end - start)
             save(destination / "source_indices.json", ids[start:end])
-            fitted = fit(archived, [local_report], args.stage_layers)
-            save(destination / "parameters.json", fitted)
-            reports.append(report)
             state["batches"].append(
                 {
                     "start": start,
@@ -232,8 +228,8 @@ def campaign(args):
 
         if args.adopt_report:
             command = json.loads(
-                args.adopt_report.with_name("result_command.json").read_text()
-            )["command"]
+                args.adopt_report.with_name("bench_meta.json").read_text()
+            )["phases"]["result"]["command"]
             for flag, value in {
                 "--num-prompts": args.adopt_count,
                 "--seed": args.seed,
@@ -300,23 +296,13 @@ def campaign(args):
             save(status_path, state)
             # Server is already warm. Smoke mode means no additional warmup;
             # count and output length above explicitly define the formal workload.
-            with (args.output_dir / f"bench_{start:06d}.log").open("x") as log:
-                subprocess.run(
-                    command,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    check=True,
-                    # Campaign samples keep a fixed target output length even
-                    # if the interactive bench environment allows natural EOS.
-                    env={**os.environ, "IGNORE_EOS": "1"},
-                )
-            complete(start, end, target / "result_trace_check.json")
-        state["status"] = "fitting_all"
-        save(status_path, state)
-        save(
-            args.output_dir / "parameters_all.json",
-            fit(trace, reports, args.stage_layers),
-        )
+            subprocess.run(
+                command,
+                check=True,
+                # Keep a fixed target output length for collection shards.
+                env={**os.environ, "IGNORE_EOS": "1"},
+            )
+            complete(start, end, target / "summary.json")
         state.update(status="complete", finished_ns=time.time_ns())
         save(status_path, state)
     except BaseException as exc:
@@ -335,7 +321,6 @@ def main():
     parser.add_argument("--output-len", type=int, default=256)
     parser.add_argument("--concurrency", type=int, default=32)
     parser.add_argument("--shard-size", type=int, default=1000)
-    parser.add_argument("--stage-layers", type=int, required=True)
     parser.add_argument("--adopt-report", type=Path)
     parser.add_argument("--adopt-count", type=int, default=0)
     parser.add_argument("--await-exit", type=Path)

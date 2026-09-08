@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import multiprocessing
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +28,79 @@ from vllm.v1.core.sched.tau_batch.trace import (
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+def _append_many(path, rank):
+    tracer = JsonlTracer(path, write_meta=False)
+    # Exercise the lock-free local-filesystem path even on a macOS test host.
+    tracer._file_lock = False
+    for index in range(200):
+        tracer.record("compute", pp_rank=rank, index=index, payload="中" * 4096)
+    tracer.close()
+
+
+def test_concurrent_large_records_remain_complete(tmp_path):
+    path = tmp_path / "concurrent.jsonl"
+    ctx = multiprocessing.get_context("fork")
+    writers = [ctx.Process(target=_append_many, args=(str(path), r)) for r in range(3)]
+    try:
+        for writer in writers:
+            writer.start()
+        for writer in writers:
+            writer.join(timeout=20)
+            assert writer.exitcode == 0
+        records = _events(path)
+        assert len(records) == 600
+        assert len({(r["pp_rank"], r["index"]) for r in records}) == 600
+        assert all(r["payload"] == "中" * 4096 for r in records)
+    finally:
+        for writer in writers:
+            if writer.is_alive():
+                writer.terminate()
+                writer.join()
+
+
+def test_short_write_is_reported_instead_of_retrying_suffix(tmp_path, monkeypatch):
+    tracer = JsonlTracer(str(tmp_path / "short.jsonl"), write_meta=False)
+    monkeypatch.setattr(os, "write", lambda fd, data: len(data) - 1)
+    try:
+        with pytest.raises(OSError, match="Short tau trace write"):
+            tracer.record("compute")
+    finally:
+        tracer.close()
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/tmp/trace.jsonl", False),
+        ("/home/user/trace.jsonl", True),
+        ("/tmp/shared data/trace.jsonl", True),
+    ],
+)
+def test_network_mount_keeps_lock_and_longest_prefix_wins(monkeypatch, path, expected):
+    mounts = (
+        "1 0 0:1 / / rw - overlay overlay rw\n"
+        "2 1 0:2 / /home rw - nfs server:/home rw\n"
+        "3 1 0:3 / /tmp/shared\\040data rw - nfs server:/data rw\n"
+    )
+    monkeypatch.setattr(Path, "read_text", lambda self: mounts)
+    monkeypatch.setattr(Path, "resolve", lambda self: self)
+    assert tau_trace._requires_file_lock(path) is expected
+
+
+def test_network_writer_locks_each_write(tmp_path, monkeypatch):
+    import fcntl
+
+    calls = []
+    monkeypatch.setattr(tau_trace, "_requires_file_lock", lambda path: True)
+    monkeypatch.setattr(fcntl, "flock", lambda fd, op: calls.append(op))
+    tracer = JsonlTracer(str(tmp_path / "network.jsonl"), write_meta=False)
+    try:
+        tracer.record("compute")
+        assert calls == [fcntl.LOCK_EX, fcntl.LOCK_UN]
+    finally:
+        tracer.close()
 
 
 def _events(path: Path) -> list[dict]:

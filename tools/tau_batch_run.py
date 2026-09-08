@@ -3,8 +3,8 @@
 
 """Ascend trace metadata and benchmark helpers; uses only the Python stdlib.
 
-serve_tau.sh owns all server defaults and launches vllm directly. prepare-serve
-only records its configuration. bench_tau.sh runs the benchmark workflow.
+configs/serve.yaml and configs/bench.yaml own experiment defaults. The shell
+launchers run vllm directly; these helpers record metadata and validate traces.
 """
 
 import argparse
@@ -37,7 +37,12 @@ def stamp():
 
 
 def write_json(path, data):
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex)
+    try:
+        temporary.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def capture(command):
@@ -63,15 +68,16 @@ SERVE_SETTING_NAMES = (
     "MIN_WAITING",
     "GPU_MEM",
     "ASCEND_RT_VISIBLE_DEVICES",
+    "TRACE_ENABLED",
 )
 
 
 def prepare_serve(args):
     """Record the shell's exact configuration without launching a server."""
     run_path = Path(args.run_dir).expanduser()
-    trace_path = Path(args.trace).expanduser()
+    trace_path = Path(args.trace).expanduser() if args.trace else None
     run = run_path.resolve()
-    trace = trace_path.resolve()
+    trace = trace_path.resolve() if trace_path else None
     settings = {key: os.environ[key] for key in SERVE_SETTING_NAMES}
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
@@ -81,27 +87,33 @@ def prepare_serve(args):
             json.dumps(
                 dict(
                     run_dir=str(run),
-                    trace=str(trace),
+                    trace=str(trace) if trace else None,
                     settings=settings,
                     command=command,
+                    launch_config=json.loads(
+                        os.environ.get("TAU_LAUNCH_CONFIG", "null")
+                    ),
                 ),
                 indent=2,
             )
         )
         return 0
-    if any(p.exists() or p.is_symlink() for p in (run_path, trace_path)):
+    paths = [run_path] + ([trace_path] if trace_path else [])
+    if any(p.exists() or p.is_symlink() for p in paths):
         raise ValueError(
             "Use a NEW RUN_DIR and TRACE path; existing runs are not overwritten"
         )
     if run == trace:
         raise ValueError("RUN_DIR and TRACE must be different paths")
-    latest = ROOT / "trace_runs" / "latest"
-    if any(latest == p or latest in p.parents for p in (run, trace)):
-        raise ValueError("trace_runs/latest is reserved for the latest run link")
+    latest = ROOT / "output" / "latest"
+    resolved_paths = [run] + ([trace] if trace else [])
+    if any(latest == p or latest in p.parents for p in resolved_paths):
+        raise ValueError("output/latest is reserved for the latest run link")
     if latest.exists() and not latest.is_symlink():
         raise ValueError(f"{latest} already exists and is not a symlink")
     run.mkdir(parents=True)
-    trace.parent.mkdir(parents=True, exist_ok=True)
+    if trace:
+        trace.parent.mkdir(parents=True, exist_ok=True)
     versions = {}
     for name in ("vllm", "vllm-ascend", "torch", "torch-npu"):
         try:
@@ -109,10 +121,11 @@ def prepare_serve(args):
         except importlib.metadata.PackageNotFoundError:
             versions[name] = "not installed"
     write_json(
-        run / "run.json",
+        run / "server_meta.json",
         {
+            "launch_config": json.loads(os.environ.get("TAU_LAUNCH_CONFIG", "null")),
             "model": args.model,
-            "trace": str(trace),
+            "trace": str(trace) if trace else None,
             "settings": settings,
             "command": command,
             "versions": versions,
@@ -123,8 +136,6 @@ def prepare_serve(args):
             "created_ns": time.time_ns(),
         },
     )
-    (run / "packages.txt").write_text(capture([sys.executable, "-m", "pip", "freeze"]))
-    (run / "npu.txt").write_text(capture(["npu-smi", "info"]))
     # Publish only complete metadata. Atomic replacement also handles a stale link.
     latest.parent.mkdir(parents=True, exist_ok=True)
     temporary = latest.with_name(".latest_" + uuid.uuid4().hex)
@@ -133,7 +144,7 @@ def prepare_serve(args):
         temporary.replace(latest)
     finally:
         temporary.unlink(missing_ok=True)
-    print(f"RUN_DIR={run}\nTRACE={trace}", flush=True)
+    print(f"RUN_DIR={run}\nTRACE={trace or 'disabled'}", flush=True)
     print(
         f"终端 B: bash {shlex.quote(str(ROOT / 'bench_tau.sh'))} --mode smoke",
         flush=True,
@@ -147,12 +158,16 @@ def prepare_serve(args):
 def serve(args):
     """Keep the old CLI entry point, with no second set of server defaults."""
     command = ["bash", str(ROOT / "serve_tau.sh")]
+    if args.config:
+        command.extend(["--config", args.config])
     if args.model:
         command.append(args.model)
     if args.run_dir:
         command.extend(["--run-dir", args.run_dir])
     if args.dry_run:
         command.append("--dry-run")
+    if args.trace_enabled is not None:
+        command.append("--trace" if args.trace_enabled else "--no-trace")
     os.execvpe("bash", command, {**os.environ, "PYTHON": sys.executable})
 
 
@@ -280,7 +295,9 @@ def wait_ready(base_url, model, seconds):
             with urllib.request.urlopen(base_url + "/v1/models", timeout=5) as response:
                 models = json.load(response)
             if model not in [item["id"] for item in models["data"]]:
-                raise ValueError("The endpoint model does not match this run.json")
+                raise ValueError(
+                    "The endpoint model does not match this server_meta.json"
+                )
             return
         except (urllib.error.URLError, TimeoutError):
             if time.monotonic() >= deadline:
@@ -291,11 +308,11 @@ def wait_ready(base_url, model, seconds):
 def prepare_bench(args):
     """Read manifest and prepare artifacts; traffic settings come from shell."""
     run = Path(args.run_dir).expanduser().resolve()
-    manifest = json.loads((run / "run.json").read_text())
+    manifest = json.loads((run / "server_meta.json").read_text())
     settings = manifest["settings"]
     if int(settings["MIN_WAITING"]) != 0:
         raise ValueError("Restart the server with MIN_WAITING=0 before benchmarking")
-    if int(settings["TP"]) != 1:
+    if manifest.get("trace") and int(settings["TP"]) != 1:
         raise ValueError(
             "Current trace lacks TP rank IDs; this collection requires TP=1"
         )
@@ -312,7 +329,7 @@ def prepare_bench(args):
         if os.environ[key] not in ("0", "1"):
             raise ValueError(f"{key} must be 0 or 1")
     int(os.environ["SEED"])
-    if os.environ.get("SLO_CONFIG"):
+    if os.environ.get("SLO_CONFIG") or os.environ.get("SLO_INLINE"):
         int(os.environ["SLO_SEED"])
     timeout = float(os.environ["READY_TIMEOUT"])
     if timeout < 0 or not math.isfinite(timeout):
@@ -332,6 +349,19 @@ def prepare_bench(args):
         slo_config = Path(os.environ["SLO_CONFIG"]).expanduser().resolve()
         if not slo_config.is_file():
             raise ValueError(f"SLO config missing: {slo_config}")
+    slo_source = None
+    slo_content = None
+    if slo_config:
+        slo_content = slo_config.read_bytes()
+        slo_source = {"path": str(slo_config)}
+    elif os.environ.get("SLO_INLINE"):
+        slo_content = os.environ["SLO_INLINE"].encode()
+        source = json.loads(os.environ["TAU_LAUNCH_CONFIG"])
+        slo_source = {"path": source["path"], "section": "SLO"}
+        slo_config = Path(os.environ["BENCH_WORK_DIR"]) / "slo_config.json"
+        # Dry-run also shows the effective inline SLO in its disposable config.
+        if args.dry_run:
+            slo_config.write_bytes(slo_content)
     target = (
         Path(os.environ.get("RESULT_DIR") or run / "bench" / (mode + "_" + stamp()))
         .expanduser()
@@ -351,32 +381,55 @@ def prepare_bench(args):
             while chunk := stream.read(1024 * 1024):
                 digest.update(chunk)
         target.mkdir(parents=True)
-        if slo_config is not None:
-            source = slo_config
-            slo_config = target / "slo_config.json"
-            shutil.copyfile(source, slo_config)
-            write_json(
-                target / "slo_config_source.json",
-                {
-                    "path": str(source),
-                    "sha256": hashlib.sha256(slo_config.read_bytes()).hexdigest(),
-                    "slo_seed": int(os.environ["SLO_SEED"]),
-                },
-            )
-        write_json(
-            target / "dataset.json",
-            {
+        metadata = {
+            "launch_config": json.loads(os.environ.get("TAU_LAUNCH_CONFIG", "null")),
+            "server_meta": str(run / "server_meta.json"),
+            "created_ns": time.time_ns(),
+            "settings": {
+                k: os.environ.get(k, "")
+                for k in (
+                    "MODE",
+                    "NUM_PROMPTS",
+                    "OUTPUT_LEN",
+                    "CONCURRENCY",
+                    "WARMUP_REQUESTS",
+                    "REQUEST_RATE",
+                    "BURSTINESS",
+                    "SEED",
+                    "SLO_SEED",
+                    "IGNORE_EOS",
+                    "READY_TIMEOUT",
+                )
+            },
+            "base_url": base_url,
+            "dataset": {
                 "path": str(dataset),
                 "sha256": digest.hexdigest(),
                 "bytes": dataset.stat().st_size,
             },
-        )
-        wait_ready(base_url, manifest["model"], timeout)
+            "slo": None,
+            "phases": {},
+        }
+        if slo_config is not None:
+            content = slo_content
+            metadata["slo"] = {
+                **slo_source,
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "slo_seed": int(os.environ["SLO_SEED"]),
+                "config": json.loads(content),
+            }
+            # The persistent snapshot is embedded in bench_meta.json. The native
+            # CLI reads an identical, disposable copy from local scratch space.
+            slo_config = Path(os.environ["BENCH_WORK_DIR"]) / "slo_config.json"
+            slo_config.write_bytes(content)
+        write_json(target / "bench_meta.json", metadata)
+    if args.dry_run and slo_content is not None:
+        print("Effective SLO: " + slo_content.decode(), flush=True)
     # Only fixed variable names and shlex-quoted values are sourced by the shell.
     context = dict(
         RUN_DIR=str(run),
         MODEL=manifest["model"],
-        TRACE=str(Path(manifest["trace"]).resolve()),
+        TRACE=str(Path(manifest["trace"]).resolve()) if manifest.get("trace") else "",
         BASE_URL=base_url,
         DATASET=str(dataset),
         RESULT_DIR=str(target),
@@ -385,65 +438,123 @@ def prepare_bench(args):
     Path(args.config_file).write_text(
         "".join(f"{key}={shlex.quote(value)}\n" for key, value in context.items())
     )
+    if not args.dry_run:
+        wait_ready(base_url, manifest["model"], timeout)
     return 0
 
 
 def begin_bench(args):
-    manifest = json.loads((Path(args.run_dir) / "run.json").read_text())
-    trace = Path(manifest["trace"])
-    stat = trace.stat() if trace.exists() else None
+    manifest = json.loads((Path(args.run_dir) / "server_meta.json").read_text())
+    trace = Path(manifest["trace"]) if manifest.get("trace") else None
+    stat = trace.stat() if trace and trace.exists() else None
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
-    write_json(
-        Path(args.result_dir) / (args.name + "_command.json"),
-        {
-            "command": command,
-            "trace": str(trace),
-            "expected": args.count,
-            "trace_start_offset": stat.st_size if stat else 0,
-            "trace_identity": [stat.st_dev, stat.st_ino] if stat else None,
-            "started_ns": time.time_ns(),
-        },
-    )
+    path = Path(args.result_dir) / "bench_meta.json"
+    metadata = json.loads(path.read_text())
+    metadata["phases"][args.name] = {
+        "command": command,
+        "trace": str(trace) if trace else None,
+        "expected": args.count,
+        "trace_start_offset": stat.st_size if stat else 0,
+        "trace_identity": [stat.st_dev, stat.st_ino] if stat else None,
+        "started_ns": time.time_ns(),
+    }
+    write_json(path, metadata)
     return 0
 
 
 def end_bench(args):
     target = Path(args.result_dir)
-    manifest = json.loads((Path(args.run_dir) / "run.json").read_text())
-    metadata = json.loads((target / (args.name + "_command.json")).read_text())
-    result = json.loads((target / (args.name + ".json")).read_text())
-    trace = Path(metadata["trace"])
-    stat = trace.stat() if trace.exists() else None
-    identity = metadata["trace_identity"]
-    if identity is not None and (
-        stat is None or identity != [stat.st_dev, stat.st_ino]
-    ):
-        raise ValueError("Trace file replaced during benchmark")
-    end = stat.st_size if stat else 0
-    if end < metadata["trace_start_offset"]:
-        raise ValueError("Trace file truncated during benchmark")
-    report = check_trace(
-        trace, int(manifest["settings"]["PP"]), metadata["trace_start_offset"], end
+    manifest = json.loads((Path(args.run_dir) / "server_meta.json").read_text())
+    meta_path = target / "bench_meta.json"
+    bench_meta = json.loads(meta_path.read_text())
+    metadata = bench_meta["phases"][args.name]
+    result = json.loads(
+        (Path(os.environ["BENCH_WORK_DIR"]) / (args.name + ".json")).read_text()
     )
-    report["completed"] = result.get("completed")
-    report["expected"] = metadata["expected"]
-    report["passed"] &= report["completed"] == report["expected"]
-    write_json(target / (args.name + "_trace_check.json"), report)
+    report = {
+        "enabled": bool(metadata.get("trace")),
+        "completed": result.get("completed"),
+        "expected": metadata["expected"],
+    }
+    if not report["enabled"]:
+        report["trace_check"] = "disabled"
+    else:
+        try:
+            trace = Path(metadata["trace"])
+            stat = trace.stat() if trace.exists() else None
+            identity = metadata["trace_identity"]
+            if identity is not None and (
+                stat is None or identity != [stat.st_dev, stat.st_ino]
+            ):
+                raise ValueError("Trace file replaced during benchmark")
+            end = stat.st_size if stat else 0
+            if end < metadata["trace_start_offset"]:
+                raise ValueError("Trace file truncated during benchmark")
+            report.update(
+                check_trace(
+                    trace,
+                    int(manifest["settings"]["PP"]),
+                    metadata["trace_start_offset"],
+                    end,
+                )
+            )
+            report["path"] = str(trace)
+            report["identity"] = [stat.st_dev, stat.st_ino] if stat else None
+            report["passed"] &= report["completed"] == report["expected"]
+        except (OSError, ValueError) as exc:
+            report.update(passed=False, error=str(exc))
+    metadata["finished_ns"] = time.time_ns()
+    assignment = result.pop("slo_assignment", None)
+    if assignment is not None:
+        metadata["slo_assignment"] = {
+            k: v
+            for k, v in assignment.items()
+            if k not in ("requests", "config", "dataset_path")
+        }
+    # Keep CLI/run configuration in metadata; only measurements in the summary.
+    for key in (
+        "date",
+        "endpoint_type",
+        "backend",
+        "label",
+        "model_id",
+        "tokenizer_id",
+        "num_prompts",
+        "request_rate",
+        "burstiness",
+        "max_concurrency",
+    ):
+        if key in result:
+            metadata[key] = result.pop(key)
+    write_json(meta_path, bench_meta)
+    summary_path = target / "summary.json"
+    previous = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+    if args.name == "warmup":
+        summary = {"warmup": {**result, "trace": report}}
+    else:
+        summary = {**result, "trace": report}
+        if "warmup" in previous:
+            summary["warmup"] = previous["warmup"]
+    write_json(summary_path, summary)
     print(json.dumps(report, indent=2, ensure_ascii=False), flush=True)
-    if not report["passed"]:
+    if report["completed"] != report["expected"]:
+        raise ValueError("Benchmark did not complete the expected requests")
+    if report["enabled"] and not report["passed"]:
         raise ValueError(
-            f"Trace is not ready for fitting; inspect {target}. "
+            f"{report.get('error', 'Trace is not ready for fitting')}; "
+            f"inspect {summary_path}. "
             "If compute is missing, check TauAscendWorker in server.log."
         )
     return 0
 
 
 def bench(args):
-    """Compatibility entry point; the shell owns defaults and vllm invocation."""
+    """Compatibility entry point; delegates to the configured shell launcher."""
     command = ["bash", str(ROOT / "bench_tau.sh")]
     if args.run_dir:
         command.append(args.run_dir)
     for name in (
+        "config",
         "mode",
         "dataset",
         "num_prompts",
@@ -474,8 +585,15 @@ def main():
         "serve", help="Compatibility entry point: delegates to serve_tau.sh"
     )
     server.add_argument("model", nargs="?")
+    server.add_argument("--config")
     server.add_argument("--run-dir")
     server.add_argument("--dry-run", action="store_true")
+    server.add_argument(
+        "--trace",
+        dest="trace_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     metadata = subs.add_parser(
         "prepare-serve", help="Record serve_tau.sh configuration"
     )
@@ -488,6 +606,7 @@ def main():
         "bench", help="ShareGPT smoke check or measured collection"
     )
     benchmark.add_argument("run_dir", nargs="?")
+    benchmark.add_argument("--config")
     benchmark.add_argument("--mode", choices=("smoke", "collect"))
     benchmark.add_argument("--dataset")
     benchmark.add_argument("--download", action="store_true")

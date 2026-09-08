@@ -124,7 +124,7 @@ def main():
     parser.add_argument("--eos-token-id", type=int)
     parser.add_argument("--other-token-id", type=int)
     args = parser.parse_args()
-    manifest = json.loads((args.run_dir / "run.json").read_text())
+    manifest = json.loads((args.run_dir / "server_meta.json").read_text())
     config = json.loads((Path(manifest["model"]) / "config.json").read_text())
     eos_id = args.eos_token_id
     if eos_id is None:
@@ -136,13 +136,17 @@ def main():
         parser.error("Supply explicit --eos-token-id and --other-token-id")
     if eos_id == other_id:
         parser.error("The two token IDs must differ")
+    if not manifest.get("trace"):
+        parser.error(
+            "EOS trace validation requires restarting serve_tau.sh with --trace"
+        )
     trace = Path(manifest["trace"])
     pp_size = int(manifest["settings"]["PP"])
     base_url = args.base_url.rstrip("/")
     require_idle(base_url)
     served_models = request_json(base_url + "/v1/models")["data"]
     if not any(m["id"] == manifest["model"] for m in served_models):
-        raise RuntimeError("Service model does not match run.json")
+        raise RuntimeError("Service model does not match server_meta.json")
     output = (
         args.run_dir
         / "bench"

@@ -1,0 +1,18 @@
+# 服务配置：修改这里，然后运行 bash serve_tau.sh。
+# 临时覆盖优先级：命令行 > 环境变量 > 本文件。
+# 本文件中的相对文件路径相对于本配置所在目录；模型本地相对路径用 ./ 或 ../。
+MODEL: ""                       # 填写模型绝对路径，或启动时传入模型目录
+ASCEND_RT_VISIBLE_DEVICES: "0,1"
+PP: 2                           # 流水线 stage 数
+TP: 1                           # 每个 stage 的张量并行数；当前 trace 采集要求 1
+HOST: "127.0.0.1"
+PORT: 8000
+MAX_MODEL_LEN: 4096              # 单请求输入 + 输出的 token 上限
+MAX_NUM_SEQS: 4                  # 单个 forward / microbatch 的请求数上限
+MAX_NUM_BATCHED_TOKENS: 8192      # 单个 forward 的总 token 预算；不做 chunked prefill
+MAX_MICROBATCHES: 0              # 一次组建的 list 最多 microbatch 数；0 不限
+MIN_WAITING: 0                  # 等待请求数门槛；0 不阻塞尾部请求
+GPU_MEM: 0.90                   # 每张设备的显存预算比例
+TRACE_ENABLED: true             # false：关闭 trace 及采集额外同步
+TRACE: null                     # 自动生成本机临时 JSONL 路径
+RUN_DIR: null                   # 自动生成项目 output/<运行标识>/，更新 output/latest

@@ -24,7 +24,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
 from vllm.logger import init_logger
 
@@ -32,6 +32,47 @@ logger = init_logger(__name__)
 
 SCHEMA_VERSION = 5
 ENV_TRACE_PATH = "TAU_BATCH_TRACE"
+
+
+def _requires_file_lock(path: str) -> bool:
+    """Only skip flock on recognized local Linux filesystems.
+
+    NFS can emulate O_APPEND; retain serialization there and on unknown hosts.
+    Resolve the longest mount prefix once, outside the per-record path.
+    """
+    local_filesystems = {
+        "ext2",
+        "ext3",
+        "ext4",
+        "xfs",
+        "btrfs",
+        "tmpfs",
+        "overlay",
+        "ramfs",
+        "zfs",
+        "f2fs",
+    }
+    target = Path(path).resolve()
+    best_depth, filesystem = -1, ""
+    try:
+        for line in Path("/proc/self/mountinfo").read_text().splitlines():
+            left, right = line.split(" - ", 1)
+            mount = left.split()[4]
+            for escaped, literal in (
+                (r"\040", " "),
+                (r"\011", "\t"),
+                (r"\012", "\n"),
+                (r"\134", "\\"),
+            ):
+                mount = mount.replace(escaped, literal)
+            parent = Path(mount)
+            if (target == parent or parent in target.parents) and len(
+                parent.parts
+            ) > best_depth:
+                best_depth, filesystem = len(parent.parts), right.split()[0]
+    except (OSError, ValueError, IndexError):
+        return True
+    return filesystem not in local_filesystems
 
 
 def resolve_trace_path(config_path: str | None) -> str | None:
@@ -52,7 +93,13 @@ def resolve_trace_path(config_path: str | None) -> str | None:
 
 
 class JsonlTracer:
-    """Append-only JSONL writer. The file is created on the first write.
+    """Synchronous, single-write O_APPEND JSONL for a local filesystem.
+
+    Each encoded record is appended with one OS write, without a userspace
+    buffer. Recognized local Linux filesystems skip cross-process flock;
+    network/unknown filesystems retain it because append may be emulated.
+    Records are visible before record() returns; no background drain is needed
+    at benchmark boundaries. This does not fsync to durable storage.
 
     If the path is removed later, the next write creates it again so a new
     run can start without restarting the server.
@@ -68,15 +115,23 @@ class JsonlTracer:
         self.path = path
         self._write_meta = write_meta
         self._metadata = dict(metadata or {})
-        self._fp: TextIO | None = None
+        self._fd: int | None = None
         self._lock = threading.RLock()
         self._fwd_id = 0
+        self._file_lock = _requires_file_lock(path)
+        if self._file_lock and write_meta:
+            logger.warning(
+                "Tau trace %s is on a shared or unidentified filesystem; "
+                "retaining file locking. Prefer a local /tmp path to avoid "
+                "high write latency.",
+                path,
+            )
 
     def close(self) -> None:
         with self._lock:
-            if self._fp is not None and not self._fp.closed:
-                self._fp.close()
-            self._fp = None
+            if self._fd is not None:
+                os.close(self._fd)
+            self._fd = None
 
     def next_fwd_id(self) -> int:
         with self._lock:
@@ -92,26 +147,25 @@ class JsonlTracer:
             "event": event,
         }
         rec.update(fields)
-        line = json.dumps(rec, ensure_ascii=False, default=str) + "\n"
+        line = (json.dumps(rec, ensure_ascii=False, default=str) + "\n").encode("utf-8")
         with self._lock:
             if not self._ensure_open():
                 return
-            assert self._fp is not None
-            flock = None
-            try:
-                import fcntl
+            self._write_line(line)
 
-                fcntl.flock(self._fp.fileno(), fcntl.LOCK_EX)
-                flock = fcntl
-            except OSError:
-                pass
-            try:
-                self._fp.write(line)
-                self._fp.flush()
-            finally:
-                if flock is not None:
-                    with suppress(OSError):
-                        flock.flock(self._fp.fileno(), flock.LOCK_UN)
+    def _write_line(self, line: bytes) -> None:
+        assert self._fd is not None
+        if self._file_lock:
+            import fcntl
+
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        try:
+            if os.write(self._fd, line) != len(line):
+                # A suffix retry could interleave with another process's line.
+                raise OSError("Short tau trace write; trace is incomplete")
+        finally:
+            if self._file_lock:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
 
     def _fd_tracks_path(self, path: Path) -> bool:
         """False if the fd is closed, the path is gone, or it is a new inode.
@@ -120,12 +174,11 @@ class JsonlTracer:
         driver write. A worker that only checks ``path.exists()`` keeps the
         old fd and writes stages into the unlinked inode.
         """
-        if self._fp is None or self._fp.closed:
+        if self._fd is None:
             return False
         try:
-            if not path.exists():
-                return False
-            return os.fstat(self._fp.fileno()).st_ino == path.stat().st_ino
+            opened, current = os.fstat(self._fd), path.stat()
+            return (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
         except OSError:
             return False
 
@@ -134,21 +187,21 @@ class JsonlTracer:
         path = Path(self.path)
         if self._fd_tracks_path(path):
             return True
-        if self._fp is not None and not self._fp.closed:
+        if self._fd is not None:
             with suppress(OSError):
-                self._fp.close()
-            self._fp = None
+                os.close(self._fd)
+            self._fd = None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             # Persistent writer; released by close() or when the inode changes.
-            self._fp = open(path, "a", encoding="utf-8")  # noqa: SIM115
+            self._fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o666)
             # Driver metadata must be present even if a worker recreated
             # the file first. Keep fwd IDs monotonic across inode changes.
             if self._write_meta:
                 self._write_meta_line()
         except OSError:
             logger.exception("Failed to open JSONL trace %s", self.path)
-            self._fp = None
+            self.close()
             return False
         return True
 
@@ -160,9 +213,7 @@ class JsonlTracer:
             "schema": SCHEMA_VERSION,
             "config": self._metadata,
         }
-        assert self._fp is not None
-        self._fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        self._fp.flush()
+        self._write_line((json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8"))
 
 
 def load_events(path: str | Path) -> list[dict[str, Any]]:

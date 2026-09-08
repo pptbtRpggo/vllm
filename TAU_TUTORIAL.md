@@ -15,16 +15,16 @@ git pull --ff-only
 
 ## 2. 终端 A：启动服务
 
-只需把下面的路径换成实际模型目录：
+先编辑 `configs/serve.yaml`：把 `MODEL` 填为实际模型路径，其他服务参数也在此文件配置。然后启动：
 
 ```bash
 cd /home/m7zhang/code/vllm
-bash serve_tau.sh /absolute/path/to/model
+bash serve_tau.sh
 ```
 
 脚本直接调用已配置环境中的 `vllm serve`，自动创建本次运行目录和独立 trace 文件，并打印终端 B 的 benchmark 命令。
-打开 `serve_tau.sh`：顶部是全部可调参数及中文说明，下面是完整的 `vllm serve` 参数列表。
-Python 辅助程序只保存配置记录，不负责启动服务。
+`configs/serve.yaml` 是服务参数入口；`serve_tau.sh` 负责读取配置、构造命令和启动。
+配置读取工具使用项目已有的 PyYAML 依赖，不导入 vLLM/NPU；元信息工具记录最终配置。
 终端 A 保持运行；长时间任务建议在已有 tmux 会话中启动。
 
 | 配置 | 默认值 | 用途 |
@@ -33,12 +33,12 @@ Python 辅助程序只保存配置记录，不负责启动服务。
 | `PP` / `TP` | `2` / `1` | 流水线 / 张量并行度；当前采集要求 TP=1 |
 | `MAX_NUM_SEQS` | `4` | 每个 microbatch 最多 4 个请求 |
 | `MIN_WAITING` | `0` | 小批量和尾部请求不受等待数量阈值阻塞 |
-| `RUN_DIR` | 自动生成 `trace_runs/<时间>_<id>/` | 配置、日志和测试结果目录 |
+| `RUN_DIR` | 自动生成 `output/<时间>_<id>/` | 配置、日志和测试结果目录 |
 | `TRACE` | 系统临时目录下的独立 JSONL 文件（Linux 通常为 `/tmp`） | 原始 trace，避免共享文件系统拖慢执行 |
 
 默认监听 `127.0.0.1:8000`，请求总长度上限为 4096 tokens，单次 forward token 预算为 8192。
 
-需要调参时，可以直接修改脚本顶部的默认值，也可以临时覆盖，例如：
+需要调参时，可以直接修改 `configs/serve.yaml`，也可以临时覆盖，例如：
 
 ```bash
 MAX_NUM_SEQS=8 bash serve_tau.sh /absolute/path/to/model
@@ -46,26 +46,36 @@ MAX_NUM_SEQS=8 bash serve_tau.sh /absolute/path/to/model
 
 如果当前终端曾手动 `export RUN_DIR`、`RUN` 或 `TRACE`，先执行一次 `unset RUN_DIR RUN TRACE`，恢复自动路径。
 
+配置优先级为 **命令行 > 非空环境变量 > YAML**。普通使用只编辑 YAML；meta 的
+`launch_config` 记录配置路径、SHA256 和被覆盖的字段，原有字段/命令记录最终生效值。
+配置文件中的相对路径相对于该 YAML 所在目录；命令行/环境变量中的相对路径仍相对于当前目录。
+服务输出目录留空时继续自动使用项目 `output/`。自定义配置可复制完整 YAML，再用
+`bash serve_tau.sh --config /path/to/serve.yaml` 或 `bash bench_tau.sh --config /path/to/bench.yaml`。
+`--dry-run` 可以预览，不启动服务、不发送请求。
+
 ## 3. 终端 B：检查服务并运行 smoke
 
-服务启动时会将运行目录记录到 `trace_runs/latest`，bench 自动读取，无需复制路径。它表示最近一次启动的配置，不代表服务已经就绪；bench 会等待服务就绪。
+先在 `configs/bench.yaml` 填写 `DATASET`；已有数据时保留 `DOWNLOAD: false`，需要下载时改为 true。
+
+服务启动时会将运行目录记录到 `output/latest`，bench 自动读取，无需复制路径。它表示最近一次启动的配置，不代表服务已经就绪；bench 会等待服务就绪。
 
 同时启动多个服务时，可用 `bash bench_tau.sh /指定运行目录 --mode smoke` 选择服务；显式目录优先于 `RUN_DIR` 环境变量，最后才使用 `latest`。
 
 ```bash
 cd /home/m7zhang/code/vllm
-bash bench_tau.sh --mode smoke --download
+bash bench_tau.sh
 ```
 
 脚本自动读取模型和端口、等待服务就绪，然后发送 8 个请求，每个生成 16 tokens。
-默认读取 `datasets/sharegpt.json`；文件已存在时直接复用，否则下载 ShareGPT。
+默认读取 `datasets/sharegpt.json`；文件缺失时仅在 `DOWNLOAD: true` 或传 `--download` 时下载。
 使用其他数据文件时加 `--dataset /实际路径/sharegpt.json`。
 
-**通过标志：**检查报告显示 `"passed": true`，末尾打印“采集及覆盖检查完成”。结果保存在打印的 `bench/smoke_…/` 目录。
+**通过标志：**检查报告显示 `"passed": true`，末尾打印“压测完成”。结果保存在打印的 `bench/smoke_…/` 目录。
 
 同一服务上，各项测试和采集依次执行，不要同时运行多个客户端。
 
-`bench_tau.sh` 顶部分别列出 smoke 和 collect 配置，可直接修改对应数值；下面直接调用 `vllm bench serve`。
+`configs/bench.yaml` 集中配置数据集、流量、预热和 SLO；`MODES.smoke`、`MODES.collect` 分别配置请求数、输出长度和并发数。
+设置 `SLO.enabled: true` 即按同文件中的档位/比例发送请求，省去独立 SLO JSON。
 它读取 ShareGPT prompt，通过 HTTP 请求 `/v1/completions`；microbatch 由服务端组建。
 
 | 参数 | 默认值 | 控制什么 |
@@ -107,22 +117,22 @@ bash bench_tau.sh --mode collect
 
 | 文件 | 内容 |
 | --- | --- |
-| `$RUN_DIR/run.json` | 模型、服务参数、trace 路径与代码版本 |
+| `$RUN_DIR/server_meta.json` | 模型、服务参数、trace 路径与代码版本 |
 | `$RUN_DIR/server.log` | 服务日志 |
-| `run.json` 中的 `trace` 路径 | 实时原始 trace |
-| `$RESULT_DIR/result.json` | 正式请求的 benchmark 指标 |
-| `$RESULT_DIR/result_trace_check.json` | 正式采集是否通过，以及对应的 trace 字节区间 |
-| `$RESULT_DIR/warmup_trace_check.json` | 独立的预热区间，不用于拟合 |
+| `server_meta.json` 中的 `trace` 路径 | 实时原始 trace |
+| `$RESULT_DIR/bench_meta.json` | 数据来源/SLO 配置快照、种子、命令与服务引用 |
+| `$RESULT_DIR/requests.jsonl` | 正式请求分配、长度、实测 TTFT/TPOT、success/attained |
+| `$RESULT_DIR/summary.json` | 正式统计、分组 goodput、trace 检查及字节区间；warmup 为独立字段 |
+| `$RESULT_DIR/error.log` | 仅失败时生成 |
 
-只有 `result_trace_check.json` 中 `passed=true` 才继续拟合。
+只有 `summary.json` 中 `trace.passed=true` 才继续拟合。
 
 ### 可选：分批采集全部有效样本
 
 这是独立的一次采集，会重新遍历数据集，不会自动接续上面的 1000 个请求。
-下面的 `16` 仅适用于每个 stage 分配 16 层的模型，换模型时必须修改。
 
 ```bash
-RUN_DIR="$(cd trace_runs/latest && pwd -P)"
+RUN_DIR="$(cd output/latest && pwd -P)"
 export CAMPAIGN_DIR="$RUN_DIR/campaign_01"
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
@@ -131,12 +141,11 @@ python tools/tau_batch_campaign.py "$RUN_DIR" \
   --dataset "$PWD/datasets/sharegpt.json" \
   --index-dir "$RUN_DIR/sharegpt_index_seed0" \
   --output-dir "$CAMPAIGN_DIR" \
-  --stage-layers 16 \
   --shard-size 1000 --output-len 256 --concurrency 32 \
   > "$RUN_DIR/campaign_01.log" 2>&1
 ```
 
-每批归档 trace 并自动拟合。“全部”指采样器接受的样本：使用前两轮对话，prompt 长度为 4–1024 tokens。
+每批归档 trace，不自动拟合。“全部”指采样器接受的样本：使用前两轮对话，prompt 长度为 4–1024 tokens。
 
 在另一个终端将 `RUN_DIR` 设为同一运行目录后，查看进度，或让采集在当前批结束后停止：
 
@@ -147,19 +156,19 @@ cat "$RUN_DIR/campaign_01/status.json"
 touch "$RUN_DIR/campaign_01/STOP_AFTER_BATCH"
 ```
 
-每批结果在 `campaign_01/shard_*/`；全部完成后生成 `campaign_01/parameters_all.json`。
+每批 trace 在 `campaign_01/shard_*/`；不生成 parameters 文件。
 
-## 5. 拟合 stage 耗时预测模型
+## 5. 可选：手动拟合 stage 耗时预测模型
 
 对第 4 节的单批正式采集执行；将 `RESULT_DIR` 替换为该次 bench 打印的结果目录：
 
 ```bash
-RUN_DIR="$(cd trace_runs/latest && pwd -P)"
+RUN_DIR="$(cd output/latest && pwd -P)"
 RESULT_DIR="/本次bench打印的结果目录"
-TRACE=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["trace"])' "$RUN_DIR/run.json")
+TRACE=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["trace"])' "$RUN_DIR/server_meta.json")
 python tools/tau_batch_fit.py \
   --trace "$TRACE" \
-  --report "$RESULT_DIR/result_trace_check.json" \
+  --report "$RESULT_DIR/summary.json" \
   --output "$RESULT_DIR/parameters.json"
 ```
 
@@ -221,7 +230,7 @@ npu-smi info
 服务完全停止后，在保留第 3 节变量的终端 B 备份本地 trace：
 
 ```bash
-TRACE=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["trace"])' "$RUN_DIR/run.json")
+TRACE=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["trace"])' "$RUN_DIR/server_meta.json")
 cp -n -- "$TRACE" "$RUN_DIR/trace.jsonl"
 ```
 

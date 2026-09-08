@@ -24,6 +24,8 @@ def launch_env(tmp_path, monkeypatch):
     (root / "tools").mkdir(parents=True)
     shutil.copy2(ROOT / "serve_tau.sh", root / "serve_tau.sh")
     shutil.copy2(ROOT / "tools/tau_batch_run.py", root / "tools/tau_batch_run.py")
+    shutil.copy2(ROOT / "tools/tau_config.py", root / "tools/tau_config.py")
+    shutil.copytree(ROOT / "configs", root / "configs")
     monkeypatch.setattr(sys.modules[__name__], "ROOT", root)
     env = {
         key: os.environ[key]
@@ -59,7 +61,8 @@ import json, os, signal, subprocess, sys
 from pathlib import Path
 record = Path(os.environ["TAU_TEST_RECORD"])
 record.write_text(json.dumps(dict(pid=os.getpid(), argv=sys.argv[1:],
-                                 pythonpath=os.environ.get("PYTHONPATH"))))
+                                 pythonpath=os.environ.get("PYTHONPATH"),
+                                 trace_env=os.environ.get("TAU_BATCH_TRACE"))))
 print("fake vllm output", flush=True)
 if os.environ.get("TAU_TEST_MODE") != "signal":
     sys.exit(7)
@@ -107,6 +110,7 @@ def test_defaults_generate_independent_paths_without_side_effects(launch_env):
         assert result.returncode == 0, result.stderr
         preview = json.loads(result.stdout)
         previews.append(preview)
+        assert Path(preview["run_dir"]).parent == ROOT / "output"
         assert not Path(preview["run_dir"]).exists()
         assert not Path(preview["trace"]).exists()
         assert Path(preview["trace"]).parent == Path(launch_env["TMPDIR"]).resolve()
@@ -119,6 +123,31 @@ def test_defaults_generate_independent_paths_without_side_effects(launch_env):
     assert previews[0]["run_dir"] != previews[1]["run_dir"]
     assert previews[0]["trace"] != previews[1]["trace"]
     assert not Path(launch_env["TAU_TEST_RECORD"]).exists()
+
+
+def test_trace_off_omits_worker_and_clears_inherited_path(launch_env, tmp_path):
+    path = tmp_path / "must_not_be_touched.jsonl"
+    path.write_text("keep")
+    launch_env.update(TRACE=str(path), TAU_BATCH_TRACE=str(path))
+    run = tmp_path / "disabled"
+    result = launch(launch_env, "/models/example", "--run-dir", run, "--no-trace")
+    assert result.returncode == 7, result.stderr
+    manifest = json.loads((run / "server_meta.json").read_text())
+    record = json.loads(Path(launch_env["TAU_TEST_RECORD"]).read_text())
+    assert manifest["trace"] is None
+    assert manifest["settings"]["TRACE_ENABLED"] == "0"
+    assert "--tau-batch-trace" not in record["argv"]
+    assert "--worker-cls" not in record["argv"]
+    assert record["trace_env"] is None
+    assert path.read_text() == "keep"
+
+
+def test_trace_flag_overrides_environment(launch_env):
+    launch_env["TRACE_ENABLED"] = "0"
+    result = launch(launch_env, "/models/example", "--trace", "--dry-run")
+    preview = json.loads(result.stdout)
+    assert preview["trace"]
+    assert "--tau-batch-trace" in preview["command"]
 
 
 def test_exact_arguments_manifest_logging_and_exit_status(launch_env, tmp_path):
@@ -135,7 +164,7 @@ def test_exact_arguments_manifest_logging_and_exit_status(launch_env, tmp_path):
     )
     result = launch(launch_env, model.name, "--run-dir", run, cwd=tmp_path)
     assert result.returncode == 7, result.stderr
-    manifest = json.loads((run / "run.json").read_text())
+    manifest = json.loads((run / "server_meta.json").read_text())
     record = json.loads(Path(launch_env["TAU_TEST_RECORD"]).read_text())
     assert manifest["model"] == str(model.resolve())
     assert manifest["trace"] == str(trace.resolve())
@@ -145,17 +174,13 @@ def test_exact_arguments_manifest_logging_and_exit_status(launch_env, tmp_path):
     assert "MAX_REQS_PER_MB" not in manifest["settings"]
     assert manifest["settings"]["PORT"] == "8123"
     assert record["argv"][record["argv"].index("--port") + 1] == "8123"
-    assert (
-        record["argv"][record["argv"].index("--max-num-seqs") + 1]
-        == "8"
-    )
+    assert record["argv"][record["argv"].index("--max-num-seqs") + 1] == "8"
     assert record["argv"][record["argv"].index("--worker-cls") + 1].endswith(
         "TauAscendWorker"
     )
     assert record["pythonpath"].split(os.pathsep)[0] == str(ROOT)
     assert "fake vllm output" in (run / "server.log").read_text()
-    assert (run / "packages.txt").exists()
-    assert (run / "npu.txt").exists()
+    assert {p.name for p in run.iterdir()} == {"server_meta.json", "server.log"}
     assert not (tmp_path / "SHOULD_NOT_EXIST").exists()
     assert not (tmp_path / "ignored_run").exists()
 
@@ -253,3 +278,46 @@ def test_native_request_capacity_is_the_only_cli_limit(launch_env, request_cap):
     assert "MAX_REQS_PER_MB" not in preview["settings"]
     assert command[command.index("--max-num-seqs") + 1] == str(request_cap)
     assert "--tau-batch-max-reqs-per-microbatch" not in command
+
+
+def test_default_restart_preserves_previous_run_and_updates_latest(launch_env):
+    runs = []
+    for _ in range(2):
+        result = launch(launch_env, "/models/example", "--no-trace")
+        assert result.returncode == 7
+        latest = ROOT / "output" / "latest"
+        assert latest.is_symlink()
+        runs.append(latest.resolve())
+    assert runs[0] != runs[1]
+    for run in runs:
+        assert run.parent == ROOT / "output"
+        assert (run / "server_meta.json").is_file()
+        assert "fake vllm output" in (run / "server.log").read_text()
+
+
+def test_edit_service_config_then_launch_without_arguments(launch_env):
+    config = ROOT / "configs/serve.yaml"
+    config.write_text(
+        config.read_text()
+        .replace('MODEL: ""', 'MODEL: "/models/configured"')
+        .replace("MAX_NUM_SEQS: 4", "MAX_NUM_SEQS: 7")
+        .replace("TRACE_ENABLED: true", "TRACE_ENABLED: false")
+    )
+    result = launch(launch_env)
+    assert result.returncode == 7, result.stderr
+    run = (ROOT / "output/latest").resolve()
+    meta = json.loads((run / "server_meta.json").read_text())
+    assert meta["model"] == "/models/configured"
+    assert meta["settings"]["MAX_NUM_SEQS"] == "7"
+    assert meta["trace"] is None
+    assert meta["launch_config"]["path"] == str(config)
+    assert meta["launch_config"]["cli_overrides"] == []
+
+
+def test_bad_service_config_fails_before_creating_output(launch_env):
+    config = ROOT / "configs/serve.yaml"
+    config.write_text(config.read_text() + "UNKNOWN_OPTION: 7\n")
+    result = launch(launch_env, "/models/test")
+    assert result.returncode == 2
+    assert "UNKNOWN_OPTION" in result.stderr
+    assert not (ROOT / "output").exists()

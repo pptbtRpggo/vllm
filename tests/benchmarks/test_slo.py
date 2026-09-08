@@ -13,6 +13,7 @@ from aiohttp import web
 from vllm.benchmarks import serve
 from vllm.benchmarks.datasets import SampleRequest, ShareGPTDataset
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncOutput
+from vllm.benchmarks.request_records import write_request_records
 from vllm.benchmarks.slo import (
     RequestSLO,
     assign_slos,
@@ -144,7 +145,8 @@ def test_global_goodput_remains_available_and_e2el_still_applies():
     assert report["good_requests"] == 0
 
 
-def test_actual_http_requests_carry_distinct_slos():
+@pytest.mark.parametrize("compact", [False, True])
+def test_actual_http_requests_carry_distinct_slos(tmp_path, compact):
     async def run():
         reqs = requests(4)
         assign_slos(reqs, config(), 7)
@@ -194,10 +196,25 @@ def test_actual_http_requests_carry_distinct_slos():
                 extra_headers=None,
                 extra_body={"vllm_xargs": {"other": 3}},
                 ready_check_timeout_sec=0,
+                request_output=str(tmp_path / "requests.jsonl") if compact else None,
             )
             assert result["completed"] == 4
             assert result["request_goodput"] is not None
-            assert len(result["slo_evaluation"]["requests"]) == 4
+            if compact:
+                assert "requests" not in result["slo_evaluation"]
+                records = [
+                    json.loads(line)
+                    for line in (tmp_path / "requests.jsonl").read_text().splitlines()
+                ]
+                assert len(records) == 4
+                assert all(r["success"] and r["status"] == "completed" for r in records)
+                assert not any("generated_text" in r for r in records)
+                assert (
+                    sum(r["attained"] for r in records)
+                    == result["slo_evaluation"]["good_requests"]
+                )
+            else:
+                assert len(result["slo_evaluation"]["requests"]) == 4
             for req in reqs:
                 body = captured[req.request_id]
                 assert body["vllm_xargs"] == {
@@ -211,7 +228,8 @@ def test_actual_http_requests_carry_distinct_slos():
     asyncio.run(run())
 
 
-def test_assignment_is_saved_before_traffic(tmp_path, monkeypatch):
+@pytest.mark.parametrize("compact", [False, True])
+def test_assignment_is_saved_before_traffic(tmp_path, monkeypatch, compact):
     path = tmp_path / "slo.json"
     path.write_text(json.dumps(config()))
     parser = FlexibleArgumentParser()
@@ -238,16 +256,57 @@ def test_assignment_is_saved_before_traffic(tmp_path, monkeypatch):
             "result.json",
         ]
     )
+    if compact:
+        args.request_output = str(tmp_path / "requests.jsonl")
     monkeypatch.setattr(serve, "get_tokenizer", lambda *a, **kw: None)
     monkeypatch.setattr(serve, "get_samples", lambda *a: requests(7))
     monkeypatch.setattr(serve, "freeze_gc_heap", lambda: None)
 
     async def interrupted(**kwargs):
-        saved = json.loads((tmp_path / "result.slo_assignment.json").read_text())
-        assert saved["counts"] == {"loose": 4, "tight": 3}
+        if compact:
+            records = [
+                json.loads(line)
+                for line in (tmp_path / "requests.jsonl").read_text().splitlines()
+            ]
+            assert Counter(r["slo"]["profile"] for r in records) == {
+                "loose": 4,
+                "tight": 3,
+            }
+            assert all(
+                r["status"] == "planned" and r["success"] is None for r in records
+            )
+            assert not (tmp_path / "result.slo_assignment.json").exists()
+        else:
+            saved = json.loads((tmp_path / "result.slo_assignment.json").read_text())
+            assert saved["counts"] == {"loose": 4, "tight": 3}
         assert all(r.slo is not None for r in kwargs["input_requests"])
         raise RuntimeError("simulated interruption")
 
     monkeypatch.setattr(serve, "benchmark", interrupted)
     with pytest.raises(RuntimeError, match="simulated interruption"):
         asyncio.run(serve.main_async(args))
+
+
+def test_request_records_without_slo_and_atomic_failure(tmp_path):
+    path = tmp_path / "requests.jsonl"
+    reqs = requests(2)
+    write_request_records(path, reqs)
+    planned = path.read_bytes()
+    with pytest.raises(FileExistsError):
+        write_request_records(path, reqs)
+    outputs = [
+        RequestFuncOutput(success=True, ttft=0.1, latency=0.1, output_tokens=1),
+        RequestFuncOutput(success=False, error="connection lost"),
+    ]
+    # A serialization/indexing failure leaves the previously saved plan intact.
+    with pytest.raises(IndexError):
+        write_request_records(path, reqs, outputs, [1])
+    assert path.read_bytes() == planned
+    assert not list(tmp_path.glob(".requests_*"))
+    write_request_records(path, reqs, outputs, [1, 0])
+    first, second = [json.loads(line) for line in path.read_text().splitlines()]
+    assert first["slo"] is None and first["attained"] is None
+    assert first["observed_ms"]["tpot"] == 0
+    assert not second["success"]
+    assert second["error"] == "connection lost"
+    assert all(v is None for v in second["observed_ms"].values())
