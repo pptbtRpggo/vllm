@@ -82,6 +82,7 @@ VLLM_CMD=(
     --trust-remote-code
 )
 # 空值交给 vLLM/平台处理，不能把 null 当成 0 或沿用 Tau 的默认值。
+if [[ -n "$DTYPE" ]]; then VLLM_CMD+=(--dtype "$DTYPE"); fi
 if [[ -n "$MAX_NUM_SEQS" ]]; then VLLM_CMD+=(--max-num-seqs "$MAX_NUM_SEQS"); fi
 if [[ -n "$MAX_NUM_BATCHED_TOKENS" ]]; then VLLM_CMD+=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"); fi
 for setting in ENABLE_CHUNKED_PREFILL ENABLE_PREFIX_CACHING ASYNC_SCHEDULING; do

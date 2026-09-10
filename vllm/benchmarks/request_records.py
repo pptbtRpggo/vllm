@@ -30,15 +30,17 @@ def write_request_records(path, requests, outputs=None, output_lens=None, report
                 "slo": asdict(request.slo) if request.slo else None,
                 "status": "planned" if outputs is None else "completed",
                 "success": None,
-                "attained": None,
+                "attained": {"ttft": None, "tpot": None, "all": None},
             }
             if outputs is not None:
                 output, length = outputs[i], output_lens[i]
                 observed = {
                     "ttft": output.ttft * 1000,
-                    "tpot": (output.latency - output.ttft) * 1000 / (length - 1)
-                    if length > 1
-                    else 0.0,
+                    "tpot": (
+                        (output.latency - output.ttft) * 1000 / (length - 1)
+                        if length > 1
+                        else 0.0
+                    ),
                     "e2el": output.latency * 1000,
                 }
                 record.update(

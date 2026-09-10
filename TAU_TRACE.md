@@ -63,6 +63,7 @@ Python 辅助命令只保存配置和环境记录，不监护服务；不再生�
 
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
+| `DTYPE` | `null` | 不传 `--dtype`，沿用 vLLM 默认；采集 FP16 参数时设为 `float16` |
 | `ASCEND_RT_VISIBLE_DEVICES` | `0,1` | 两张 NPU |
 | `TP` / `PP` | `1` / `2` | 张量/流水线并行度 |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | 本机访问地址；跨机访问时自行设置 HOST |
@@ -78,6 +79,11 @@ HOST 改为本机地址；trace 默认使用每次启动的独立本地临时文
 8192 是本轮采集的预算选择，并非 Ascend 的强制要求，也不是 KV cache 容量。
 当改变 microbatch 上限时，仍可能因 token 预算或 KV 余量而形成更小的 microbatch。
 EOS 回调策略没有变化。
+
+拟合前应显式固定精度：在 `configs/serve.yaml` 设置 `DTYPE: float16`。
+`DTYPE` 是 Tau/default 共用的模型参数，会打印并记录到 `server_meta.json`，
+实际解析出的精度仍以 trace 的 `meta.config.dtype` 为准。
+省略该项的旧 YAML 继续使用 vLLM 默认精度；`auto` 可能随模型配置选择 FP16 或 BF16。
 
 ## 3. 终端 B：先 smoke
 
@@ -281,20 +287,40 @@ python tools/tau_batch_campaign.py "$RUN_DIR" \
 python tools/tau_batch_fit.py \
   --trace /tmp/tau_<唯一名称>.jsonl \
   --report "$RUN_DIR/bench/collect_<时间>_<id>/summary.json" \
-  --stage-layers 16 --output "$RUN_DIR/parameters_01.json"
+  --output "$RUN_DIR/parameters_01.json"
 ```
 
-输出单位为毫秒。每个 PP rank、prefill/decode 分别拟合：
+输出单位为毫秒。默认只按 prefill/decode 分组，将同一阶段的所有 PP rank 样本
+一起做最小二乘拟合，每条 compute 记录等权重。预测目标是单个 stage 的 compute
+耗时；stage 编号不是输入特征，也不会相加或取最大值来构造标签。
+每个模型得到以下两种公式各自的 prefill/decode 参数，共四组：
 
-- τ-Batch 有效形式：`a*n*s_max + b*n + c`。
 - SCLS 四参数形式：`p1*n*s_max + p2*n + p3*s_max + p4`；decode 对应 `d1..d4`。
 - 对照形式：`u1*s_sum + u2*n + u3*s_max + u4`，用于检验未 padding 的实际 token 总量是否更合适。
 
+`groups` 仅含 `prefill`、`decode`。`validation_by_stage` 用同一套训练参数分别检查
+各 stage 的留出误差，不单独拟合；`mean_error_ms` 为预测减实测的平均偏差。
+因此可以发现共享参数对慢 stage 的系统性低估。模型、精度和 PP/TP 划分应固定，
+不同模型或划分的数据不能混合。原始 trace 的 `pp_rank` 继续保留。
+输出 schema 为 2；若需要旧的独立 rank 分组，可使用 `--group-by stage-phase`。
+
+可用 `--models tau_affine scls_bilinear unpadded_comparison` 额外拟合旧的
+τ-Batch 有效形式 `a*n*s_max + b*n + c`；仅该形式使用可选的 `--stage-layers`。
 固定模型宽度时，τ-Batch 公式的 `alpha_proj*d_model²` 与 `beta` 都乘同一变量 `n`，
 无法分别辨识。脚本只报告其和，以及除以每 stage 层数后的有效参数。
 若设计矩阵秩不足，则输出 `rank_deficient`，不输出任意一组系数冒充唯一解。
-最后 20% 的完整 wave 留作验证，并与训练集平均耗时这一常数基线比较。
+默认最后 20% 的完整 wave 留作验证，wave 内所有 stage 和 decode 步一起划分，
+并与训练集平均耗时这一常数基线比较。
 `all_data_fit` 是使用全部样本的最终拟合，验证指标使用独立的 `training_fit`。
+`s_sum_range` 记录实际总上下文 token 覆盖；`validation_outside_training_bounds`
+按各公式实际使用的设计特征逐列检查边界，包括 unpadded 的 `s_sum`。
+这只是各列范围检查，不保证训练覆盖了范围内的所有特征组合或所有 batch 大小。
+
+多档负载实验可重复传入 `--validation-report <验证轮次/summary.json>`，
+用完整 bench 轮次替代默认的时间切分。这些文件也必须列在 `--report` 中，
+且必须留有训练轮次；工具拒绝训练/验证之间共享同一个 wave。
+建议验证轮次使用另一个采样 seed，并覆盖训练时的各档 concurrency 和输出长度，
+不要仅把最后一档最大 concurrency 留出。不同 seed 本身不保证源 prompt 完全不重叠。
 结构检查通过不等于计时口径已经校准：标签仍是含主机执行和结束同步的 runner 耗时。
 
 ## NPU 上验证 EOS 触发

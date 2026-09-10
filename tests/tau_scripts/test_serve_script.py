@@ -309,6 +309,7 @@ def test_edit_service_config_then_launch_without_arguments(launch_env):
     config.write_text(
         config.read_text()
         .replace('MODEL: ""', 'MODEL: "/models/configured"')
+        .replace("DTYPE: null", "DTYPE: float16")
         .replace("MAX_NUM_SEQS: 4", "MAX_NUM_SEQS: 7")
         .replace("TRACE_ENABLED: true", "TRACE_ENABLED: false")
     )
@@ -317,6 +318,9 @@ def test_edit_service_config_then_launch_without_arguments(launch_env):
     run = (ROOT / "output/latest").resolve()
     meta = json.loads((run / "server_meta.json").read_text())
     assert meta["model"] == "/models/configured"
+    assert meta["settings"]["DTYPE"] == "float16"
+    assert meta["command"][meta["command"].index("--dtype") + 1] == "float16"
+    assert "DTYPE = float16" in result.stdout
     assert meta["settings"]["MAX_NUM_SEQS"] == "7"
     assert meta["trace"] is None
     assert meta["launch_config"]["path"] == str(config)
@@ -351,6 +355,7 @@ def test_default_scheduler_uses_native_defaults_and_clears_tau_state(launch_env)
     assert "MIN_WAITING" not in meta["settings"]
     assert "MAX_MICROBATCHES" not in meta["settings"]
     for flag in (
+        "--dtype",
         "--scheduler-cls",
         "--worker-cls",
         "--max-num-seqs",

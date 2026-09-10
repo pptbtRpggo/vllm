@@ -423,7 +423,8 @@ def test_readiness_failure_keeps_metadata_and_error_log(bench_setup):
     assert not bench_setup["calls"].exists()
 
 
-def test_single_bench_config_includes_slo_and_workload(bench_setup):
+@pytest.mark.parametrize("sampled", [False, True])
+def test_single_bench_config_includes_slo_and_workload(bench_setup, sampled):
     import yaml
 
     s = bench_setup
@@ -433,6 +434,18 @@ def test_single_bench_config_includes_slo_and_workload(bench_setup):
     config["WARMUP_REQUESTS"] = 2
     config["SLO"]["enabled"] = True
     config["SLO"]["profiles"]["tight"]["ttft_slo_ms"] = 750
+    if sampled:
+        config["SLO"]["profiles"]["sampled"] = {
+            "ttft_slo_ms": {"distribution": "uniform", "min": 1000, "max": 3000},
+            "tpot_slo_ms": {
+                "distribution": "normal",
+                "mean": 100,
+                "std": 10,
+                "min": 80,
+                "max": 120,
+            },
+        }
+        config["SLO"]["ratios"] = dict(tight=0.2, loose=0.3, sampled=0.5)
     path = s["tmp"] / "bench.yaml"
     path.write_text(yaml.safe_dump(config))
     result = subprocess.run(

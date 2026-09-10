@@ -4,6 +4,7 @@
 
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -85,7 +86,13 @@ def trace_fixture(tmp_path):
 
 def test_recover_coefficients_with_whole_wave_validation(tmp_path):
     trace, report = trace_fixture(tmp_path)
-    result = fitter.fit(trace, [report], stage_layers=16)
+    result = fitter.fit(
+        trace,
+        [report],
+        stage_layers=16,
+        group_by="stage-phase",
+        models=("tau_affine",),
+    )
     assert result["split"]["training_waves"] == list(range(8))
     assert result["split"]["validation_waves"] == [8, 9]
     for name, group in result["groups"].items():
@@ -101,6 +108,65 @@ def test_recover_coefficients_with_whole_wave_validation(tmp_path):
         assert model["layer_normalized"]["gamma_effective"] == pytest.approx(
             expected[2] / 16
         )
+
+
+def test_shared_phase_coefficients_and_stage_bias(tmp_path):
+    trace, report = trace_fixture(tmp_path)
+    result = fitter.fit(trace, [report])
+    assert result["schema_version"] == 2
+    assert result["group_by"] == "phase"
+    assert result["prediction_target"] == "single_stage_compute_ms"
+    assert set(result["groups"]) == {"prefill", "decode"}
+    assert result["split"]["training_waves"] == list(range(8))
+    assert result["split"]["validation_waves"] == [8, 9]
+    for phase, group in result["groups"].items():
+        assert group["pp_ranks"] == [0, 1]
+        # All ranks of a wave stay on the same side of the validation split.
+        assert group["samples"] == 100
+        assert group["train_samples"] == 80
+        assert group["validation_samples"] == 20
+        assert set(group["models"]) == {"scls_bilinear", "unpadded_comparison"}
+        intercept = 4.5 if phase == "prefill" else 1.5
+        for model in group["models"].values():
+            # Joint least squares fits the mean stage cost, not a sum or max.
+            expected = [0.015, 0.3, 0, intercept]
+            for fit_key in ("all_data_fit", "training_fit"):
+                np.testing.assert_allclose(
+                    model[fit_key]["coefficients"], expected, atol=1e-10
+                )
+            diagnostics = model["validation_by_stage"]
+            assert set(diagnostics) == {"pp0", "pp1"}
+            assert diagnostics["pp0"]["n"] == diagnostics["pp1"]["n"] == 10
+            # Stage 1 is slower in this fixture. Shared parameters expose bias,
+            # instead of hiding it behind separately fitted stage coefficients.
+            assert diagnostics["pp0"]["mean_error_ms"] > 0
+            assert diagnostics["pp1"]["mean_error_ms"] < 0
+            assert diagnostics["pp1"]["underprediction_fraction"] == 1
+            assert model["validation"]["rmse_ms"] > 0
+
+
+def test_cli_defaults_to_shared_phase_models(tmp_path):
+    trace, report = trace_fixture(tmp_path)
+    output = tmp_path / "parameters.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TOOLS / "tau_batch_fit.py"),
+            "--trace",
+            str(trace),
+            "--report",
+            str(report),
+            "--output",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    fitted = json.loads(output.read_text())
+    assert set(fitted["groups"]) == {"prefill", "decode"}
+    assert set(fitted["formulas"]) == {"scls_bilinear", "unpadded_comparison"}
+    assert "pp0/prefill" not in result.stdout
 
 
 def test_constant_batch_cannot_identify_all_parameters():
@@ -125,6 +191,25 @@ def test_scls_four_coefficients_and_nonpadded_design():
     unpadded = fitter.design(rows, "unpadded_comparison")
     np.testing.assert_array_equal(unpadded[:, 0], rows[:, 2])
     assert np.any(unpadded[:, 0] != x[:, 0])
+
+
+def test_validation_bounds_include_formula_specific_token_features():
+    rows = [
+        (1, 10, 10, 10, 0),
+        (2, 10, 14, 12, 1),
+        (1, 20, 20, 13, 2),
+        (2, 20, 25, 16, 3),
+        (2, 20, 40, 20, 4),
+    ]
+    result = fitter.fit_group(rows, [0, 1, 2, 3])
+    assert result["s_sum_range"] == [10, 40]
+    # n and s_max remain in range, but the unpadded model's total exceeds all
+    # training totals. Checking only n/s_max would incorrectly report zero.
+    assert (
+        result["models"]["unpadded_comparison"]["validation_outside_training_bounds"]
+        == 1
+    )
+    assert result["models"]["scls_bilinear"]["validation_outside_training_bounds"] == 0
 
 
 def test_reject_overlapping_or_failed_ranges(tmp_path):
@@ -267,3 +352,38 @@ def test_fit_accepts_summary_trace_range(tmp_path):
     summary = tmp_path / "summary.json"
     summary.write_text(json.dumps({"trace": json.loads(report.read_text())}))
     assert fitter.fit(trace, [summary])["groups"] == expected["groups"]
+
+
+@pytest.mark.parametrize("cross_wave", [False, True])
+def test_explicit_benchmark_holdout_preserves_wave_isolation(tmp_path, cross_wave):
+    trace, original = trace_fixture(tmp_path)
+    metadata = json.loads(original.read_text())
+    with trace.open("rb") as f:
+        f.seek(metadata["trace_start_offset"])
+        while True:
+            offset = f.tell()
+            event = json.loads(f.readline())
+            if event["event"] == "emit" and event["wave_id"] == 2:
+                if cross_wave:
+                    # Cut after one complete forward, but inside the same wave.
+                    f.readline()
+                    f.readline()
+                    offset = f.tell()
+                break
+    held_out, training = tmp_path / "held_out.json", tmp_path / "training.json"
+    held_out.write_text(json.dumps({**metadata, "trace_end_offset": offset}))
+    training.write_text(json.dumps({**metadata, "trace_start_offset": offset}))
+    if cross_wave:
+        with pytest.raises(ValueError, match="wave crosses"):
+            fitter.fit(trace, [held_out, training], validation_reports=[held_out])
+        return
+    result = fitter.fit(trace, [held_out, training], validation_reports=[held_out])
+    assert result["split"]["validation_waves"] == [0, 1]
+    assert result["split"]["training_waves"] == list(range(2, 10))
+    for group in result["groups"].values():
+        assert group["validation_samples"] == 20
+        assert group["train_samples"] == 80
+    with pytest.raises(ValueError, match="proper subset"):
+        fitter.fit(trace, [training], validation_reports=[held_out])
+    with pytest.raises(ValueError, match="proper subset"):
+        fitter.fit(trace, [training], validation_reports=[training])

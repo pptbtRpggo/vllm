@@ -14,6 +14,7 @@ import yaml
 
 SERVE_KEYS = {
     "MODEL",
+    "DTYPE",
     "ASCEND_RT_VISIBLE_DEVICES",
     "PP",
     "TP",
@@ -89,6 +90,9 @@ def load(kind, path, overrides, environ):
     path = Path(path).expanduser().resolve()
     content = path.read_bytes()
     config = yaml.safe_load(content)
+    if kind == "serve" and isinstance(config, dict):
+        # Existing complete configs predate explicit precision selection.
+        config.setdefault("DTYPE", None)
     keys = (
         SERVE_KEYS | {"SCHEDULERS"}
         if kind == "serve"

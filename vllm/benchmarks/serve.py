@@ -1306,7 +1306,8 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "--slo-config",
         type=str,
         default=None,
-        help="JSON profiles/ratios for per-request ShareGPT TTFT/TPOT SLOs (ms).",
+        help="JSON profiles/ratios for per-request ShareGPT TTFT/TPOT SLOs (ms); "
+        "thresholds accept constants, uniform, or bounded normal distributions.",
     )
     parser.add_argument(
         "--slo-seed",

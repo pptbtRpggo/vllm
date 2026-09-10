@@ -15,7 +15,10 @@ git pull --ff-only
 
 ## 2. 终端 A：启动服务
 
-先编辑 `configs/serve.yaml`：把 `MODEL` 填为实际模型路径，其他服务参数也在此文件配置。然后启动：
+先编辑 `configs/serve.yaml`：把 `MODEL` 填为实际模型路径，其他服务参数也在此文件配置。
+
+采集拟合数据时同时设置 `DTYPE: float16`，固定权重和激活的运行精度；
+默认 `null` 不传该参数，由 vLLM 按模型配置决定。Tau 和 default 共用此项。然后启动：
 
 ```bash
 cd /home/m7zhang/code/vllm
@@ -219,17 +222,28 @@ python tools/tau_batch_fit.py \
   --output "$RESULT_DIR/parameters.json"
 ```
 
-终端会打印各 stage 的样本数、参数和验证误差，完整结果保存在 `parameters.json`。
+默认将所有 PP stage 的 compute 样本合并，只区分 prefill/decode；
+每个阶段拟合 SCLS 和 unpadded 两种公式。每条样本的标签仍是一个 stage 的耗时，
+不会把各 stage 的耗时相加，也不改为整条 pipeline 的响应时间。
+终端打印各阶段的样本数、参数和验证误差，完整结果保存在 `parameters.json`。
 输出文件必须尚不存在。
 
 | 结果字段 | 看什么 |
 | --- | --- |
-| `groups` | 分 PP rank、prefill/decode 的结果 |
+| `groups` | 仅 `prefill`、`decode` 两组，每组的参数供所有 PP stage 共用 |
 | `all_data_fit.coefficients` | 使用全部样本拟合的参数 |
 | `validation` | 使用训练集参数在留出数据上的误差，例如 `rmse_ms` |
+| `validation_by_stage` | 同一套参数在各 stage 上的验证误差；不产生新的参数组 |
+| `mean_error_ms` | 预测值减实测值的平均值；负值表示平均低估 |
 | `status=rank_deficient` | 当前样本不足以唯一确定参数，不输出该组系数 |
 
-同时比较 `tau_affine`、`scls_bilinear`、`unpadded_comparison` 三种模型。
+默认比较 `scls_bilinear`、`unpadded_comparison`；每个模型共四组系数。
+两个模型分别拟合，并固定精度、PP/TP 和层划分。stage 标识仍保留在原始 trace，
+用来检查共享参数是否系统性低估某个 stage；即使层数相同，首尾 stage 的额外操作
+也可能让其耗时不同。训练/验证按完整 wave 划分，所有 rank 一起进入同一侧。
+如需旧的独立 stage 拟合，显式加 `--group-by stage-phase`。
+如需包含旧的 τ-Batch 三参数公式，加
+`--models tau_affine scls_bilinear unpadded_comparison`。
 计时单位为毫秒，标签是 **runner 调用开始至返回并完成 NPU 同步的耗时**，不是纯 kernel 时间。
 这是离线拟合，参数不会自动加载到在线调度器中。
 

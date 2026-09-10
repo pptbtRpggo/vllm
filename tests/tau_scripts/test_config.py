@@ -16,6 +16,19 @@ config = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(config)
 
 
+def test_precision_is_optional_and_shared_by_schedulers(tmp_path):
+    data = yaml.safe_load((ROOT / "configs/serve.yaml").read_text())
+    del data["DTYPE"]
+    path = tmp_path / "legacy_serve.yaml"
+    path.write_text(yaml.safe_dump(data))
+    assert config.load("serve", path, {}, {})["DTYPE"] == ""
+    for scheduler in ("tau", "default"):
+        values = config.load(
+            "serve", path, {"SCHEDULER": scheduler}, {"DTYPE": "float16"}
+        )
+        assert values["DTYPE"] == "float16"
+
+
 def test_precedence_selects_mode_before_workload_defaults():
     values = config.load(
         "bench",
@@ -47,6 +60,28 @@ def test_config_paths_and_external_slo_override(tmp_path):
     assert values["SLO_INLINE"] == ""
     assert values["SLO_CONFIG"] == "old.json"
     assert values["DATASET"] == "cwd.json"
+
+
+def test_bench_yaml_accepts_any_group_count_and_sampler_specs(tmp_path):
+    data = yaml.safe_load((ROOT / "configs/bench.yaml").read_text())
+    data["SLO"]["enabled"] = True
+    data["SLO"]["profiles"]["sampled"] = {
+        "ttft_slo_ms": {
+            "distribution": "normal",
+            "mean": 2000,
+            "std": 300,
+            "min": 1000,
+            "max": 3000,
+        },
+        "tpot_slo_ms": {"distribution": "uniform", "min": 80, "max": 120},
+    }
+    data["SLO"]["ratios"] = dict(tight=0.2, loose=0.3, sampled=0.5)
+    path = tmp_path / "bench.yaml"
+    path.write_text(yaml.safe_dump(data))
+    values = config.load("bench", path, {}, {})
+    assert json.loads(values["SLO_INLINE"]) == {
+        k: v for k, v in data["SLO"].items() if k != "enabled"
+    }
 
 
 @pytest.mark.parametrize("fault", ["unknown", "missing", "mode", "slo_bool"])

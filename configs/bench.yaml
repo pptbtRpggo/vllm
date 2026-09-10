@@ -24,7 +24,14 @@ IGNORE_EOS: true                # 固定输出长度；false 允许自然 EOS
 SEED: 0                        # 数据采样和到达间隔种子
 SLO_SEED: null                  # 留空使用 SEED
 
-# SLO 档位直接放在本文件，不需要另外编辑 JSON。
+# SLO 档位直接放在本文件，不需要另外编辑 JSON；组数不限。
+# 增删组时同时修改 profiles 和 ratios；比例非负、合计为 1，0 表示暂停分配。
+# 每次启动 bench 读取一次配置；运行中编辑本文件不热更新。
+# 每个 TTFT/TPOT 可独立使用固定数值，或分布（均以 ms 为单位）：
+#   {distribution: uniform, min: 1000, max: 3000}
+#   {distribution: normal, mean: 2000, std: 300, min: 1000, max: 3000}
+# normal 是在 min/max 之间截断采样，不是将越界样本压到端点。
+# 使用 SLO_SEED 复现每条请求的实际阈值；实际采样值见 requests.jsonl。
 SLO:
   enabled: false
   profiles:

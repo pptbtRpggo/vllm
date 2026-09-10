@@ -20,6 +20,58 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
 
+def test_summary_preserves_slo_statistics_and_separates_warmup(tmp_path, monkeypatch):
+    run = tmp_path / "run"
+    target = run / "bench"
+    scratch = tmp_path / "scratch"
+    target.mkdir(parents=True)
+    scratch.mkdir()
+    monkeypatch.setenv("BENCH_WORK_DIR", str(scratch))
+    (run / "server_meta.json").write_text("{}")
+    (target / "bench_meta.json").write_text(
+        json.dumps(
+            {
+                "phases": {"result": {"expected": 4, "trace": None}},
+            }
+        )
+    )
+    warmup = {"request_goodput": 99, "completed": 10}
+    (target / "summary.json").write_text(json.dumps({"warmup": warmup}))
+    evaluation = {
+        "attainment_rates": {"ttft": 0.75, "tpot": 0.5, "all": 0.25},
+        "request_goodput": 0.5,
+        "by_profile": {
+            "tight": {
+                "attainment_rates": {"ttft": 0.5, "tpot": 0.5, "all": 0},
+                "request_goodput": 0,
+            }
+        },
+    }
+    (scratch / "result.json").write_text(
+        json.dumps(
+            {
+                "completed": 4,
+                "request_goodput": 0.5,
+                "slo_evaluation": evaluation,
+            }
+        )
+    )
+    assert (
+        runner.end_bench(
+            runner.argparse.Namespace(
+                run_dir=str(run),
+                result_dir=str(target),
+                name="result",
+            )
+        )
+        == 0
+    )
+    summary = json.loads((target / "summary.json").read_text())
+    assert summary["slo_evaluation"] == evaluation
+    assert summary["request_goodput"] == 0.5
+    assert summary["warmup"] == warmup
+
+
 def test_latest_run_discovery_and_overrides(tmp_path, monkeypatch):
     root = tmp_path / "repo with spaces"
     (root / "tools").mkdir(parents=True)

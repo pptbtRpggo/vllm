@@ -126,7 +126,12 @@ def test_per_request_goodput_keeps_failed_request_alignment():
     metrics, lengths = serve.calculate_metrics(reqs, outputs, 2, None, [], {})
     report = metrics.slo_report
     assert lengths == [0, 3, 3, 1]
-    assert [r["attained"] for r in report["requests"]] == [False, True, False, True]
+    assert [r["attained"]["all"] for r in report["requests"]] == [
+        False,
+        True,
+        False,
+        True,
+    ]
     assert report["by_profile"]["tight"]["total_requests"] == 2
     assert report["by_profile"]["loose"]["attainment_rate"] == 1
     assert report["attainment_rate"] == 0.5
@@ -146,10 +151,23 @@ def test_global_goodput_remains_available_and_e2el_still_applies():
 
 
 @pytest.mark.parametrize("compact", [False, True])
-def test_actual_http_requests_carry_distinct_slos(tmp_path, compact):
+@pytest.mark.parametrize("sampled", [False, True])
+def test_actual_http_requests_carry_distinct_slos(tmp_path, compact, sampled):
     async def run():
         reqs = requests(4)
-        assign_slos(reqs, config(), 7)
+        slo_config = config()
+        if sampled:
+            slo_config["profiles"]["tight"] = {
+                "ttft_slo_ms": {
+                    "distribution": "normal",
+                    "mean": 100,
+                    "std": 8,
+                    "min": 80,
+                    "max": 120,
+                },
+                "tpot_slo_ms": {"distribution": "uniform", "min": 8, "max": 12},
+            }
+        assign_slos(reqs, slo_config, 7)
         captured = {}
 
         async def handler(http):
@@ -200,6 +218,12 @@ def test_actual_http_requests_carry_distinct_slos(tmp_path, compact):
             )
             assert result["completed"] == 4
             assert result["request_goodput"] is not None
+            evaluation = result["slo_evaluation"]
+            assert set(evaluation["attainment_rates"]) == {"ttft", "tpot", "all"}
+            assert (
+                evaluation["attainment_rates"]["all"] == evaluation["attainment_rate"]
+            )
+            assert result["request_goodput"] == evaluation["request_goodput"]
             if compact:
                 assert "requests" not in result["slo_evaluation"]
                 records = [
@@ -210,9 +234,13 @@ def test_actual_http_requests_carry_distinct_slos(tmp_path, compact):
                 assert all(r["success"] and r["status"] == "completed" for r in records)
                 assert not any("generated_text" in r for r in records)
                 assert (
-                    sum(r["attained"] for r in records)
+                    sum(r["attained"]["all"] for r in records)
                     == result["slo_evaluation"]["good_requests"]
                 )
+                for metric in ("ttft", "tpot", "all"):
+                    assert evaluation["attainment_rates"][metric] == (
+                        sum(r["attained"][metric] for r in records) / len(records)
+                    )
             else:
                 assert len(result["slo_evaluation"]["requests"]) == 4
             for req in reqs:
@@ -305,7 +333,8 @@ def test_request_records_without_slo_and_atomic_failure(tmp_path):
     assert not list(tmp_path.glob(".requests_*"))
     write_request_records(path, reqs, outputs, [1, 0])
     first, second = [json.loads(line) for line in path.read_text().splitlines()]
-    assert first["slo"] is None and first["attained"] is None
+    assert first["slo"] is None
+    assert first["attained"] == {"ttft": None, "tpot": None, "all": None}
     assert first["observed_ms"]["tpot"] == 0
     assert not second["success"]
     assert second["error"] == "connection lost"

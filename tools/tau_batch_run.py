@@ -57,6 +57,7 @@ def capture(command):
 
 # Manifest field names, not defaults. serve_tau.sh owns the values.
 SERVE_SETTING_NAMES = (
+    "DTYPE",
     "HOST",
     "PORT",
     "TP",
