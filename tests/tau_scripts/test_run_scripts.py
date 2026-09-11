@@ -40,18 +40,27 @@ def test_summary_preserves_slo_statistics_and_separates_warmup(tmp_path, monkeyp
     evaluation = {
         "attainment_rates": {"ttft": 0.75, "tpot": 0.5, "all": 0.25},
         "request_goodput": 0.5,
+        "ttft_total_requests": 4,
+        "tpot_total_requests": 4,
         "by_profile": {
             "tight": {
                 "attainment_rates": {"ttft": 0.5, "tpot": 0.5, "all": 0},
                 "request_goodput": 0,
             }
         },
+        "tpot_definition": "(latency - ttft) / (output_tokens - 1); 0 for one token",
     }
     (scratch / "result.json").write_text(
         json.dumps(
             {
                 "completed": 4,
                 "request_goodput": 0.5,
+                "total_input_tokens": 100,
+                "total_output_tokens": 200,
+                "total_token_throughput": 12.5,
+                "mean_itl_ms": 8,
+                "p99_itl_ms": 20,
+                "mean_ttft_ms": 80,
                 "slo_evaluation": evaluation,
             }
         )
@@ -67,9 +76,25 @@ def test_summary_preserves_slo_statistics_and_separates_warmup(tmp_path, monkeyp
         == 0
     )
     summary = json.loads((target / "summary.json").read_text())
-    assert summary["slo_evaluation"] == evaluation
+    assert summary["slo_evaluation"] == {
+        "attainment_rates": {"ttft": 0.75, "tpot": 0.5, "all": 0.25},
+        "request_goodput": 0.5,
+        "ttft_total_requests": 4,
+        "tpot_total_requests": 4,
+    }
     assert summary["request_goodput"] == 0.5
+    assert summary["mean_ttft_ms"] == 80
     assert summary["warmup"] == warmup
+    assert "by_profile" not in summary["slo_evaluation"]
+    assert "tpot_definition" not in summary["slo_evaluation"]
+    for key in (
+        "total_input_tokens",
+        "total_output_tokens",
+        "total_token_throughput",
+        "mean_itl_ms",
+        "p99_itl_ms",
+    ):
+        assert key not in summary
 
 
 def test_latest_run_discovery_and_overrides(tmp_path, monkeypatch):

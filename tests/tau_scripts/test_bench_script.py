@@ -208,6 +208,7 @@ def test_traffic_parameters_and_range_isolation(bench_setup, legacy):
         assert option(command, "--seed") == "7"
         assert option(command, "--sharegpt-output-len") == "256"
         assert "--ignore-eos" in command
+        assert option(command, "--percentile-metrics") == "ttft,tpot"
     summary = json.loads((target / "summary.json").read_text())
     w = summary["warmup"]["trace"]
     r = summary["trace"]

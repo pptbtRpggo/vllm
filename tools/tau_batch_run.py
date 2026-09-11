@@ -45,6 +45,31 @@ def write_json(path, data):
         temporary.unlink(missing_ok=True)
 
 
+# Keep CLI configuration in bench_meta; summary only keeps serving measurements.
+_SUMMARY_DROP = {
+    "total_input_tokens",
+    "total_output_tokens",
+    "total_token_throughput",
+}
+_SLO_SUMMARY_DROP = {"by_profile", "tpot_definition"}
+
+
+def summary_measurements(result):
+    measurements = {
+        key: value
+        for key, value in result.items()
+        if key not in _SUMMARY_DROP and not str(key).endswith("_itl_ms")
+    }
+    evaluation = measurements.get("slo_evaluation")
+    if isinstance(evaluation, dict):
+        measurements["slo_evaluation"] = {
+            key: value
+            for key, value in evaluation.items()
+            if key not in _SLO_SUMMARY_DROP
+        }
+    return measurements
+
+
 def capture(command):
     try:
         result = subprocess.run(
@@ -652,10 +677,11 @@ def end_bench(args):
     write_json(meta_path, bench_meta)
     summary_path = target / "summary.json"
     previous = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+    payload = {**summary_measurements(result), "trace": report}
     if args.name == "warmup":
-        summary = {"warmup": {**result, "trace": report}}
+        summary = {"warmup": payload}
     else:
-        summary = {**result, "trace": report}
+        summary = payload
         if "warmup" in previous:
             summary["warmup"] = previous["warmup"]
     write_json(summary_path, summary)

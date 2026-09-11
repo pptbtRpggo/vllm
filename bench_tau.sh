@@ -134,6 +134,7 @@ build_command() {
         --request-rate "$REQUEST_RATE" --max-concurrency "$CONCURRENCY"
         --burstiness "$BURSTINESS" --seed "$SEED"
         --ready-check-timeout-sec 0 --num-warmups 0
+        --percentile-metrics ttft,tpot
         --no-oversample --trust-remote-code --save-result
         --result-dir "$BENCH_WORK_DIR" --result-filename "$2.json"
     )
