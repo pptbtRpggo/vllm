@@ -32,6 +32,12 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
 )
+from vllm.distributed.pp_stage_trace import (
+    PPStageTracer,
+    layer_range_from_runner,
+    maybe_create_pp_stage_tracer,
+    tensor_dict_nbytes,
+)
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
@@ -110,6 +116,7 @@ class Worker(WorkerBase):
             self.profiler = None
 
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        self._pp_stage_tracer: PPStageTracer | None = None
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -228,6 +235,8 @@ class Worker(WorkerBase):
                 self.local_rank,
                 current_platform.dist_backend,
             )
+
+            self._pp_stage_tracer = maybe_create_pp_stage_tracer(self.device)
 
             # Set random seed.
             set_random_seed(self.model_config.seed)
@@ -571,6 +580,117 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
+    def _pp_token_mix(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> tuple[int, int, int, int]:
+        """Approximate prefill vs decode token counts from the scheduler batch."""
+        new_ids = {req.req_id for req in scheduler_output.scheduled_new_reqs}
+        num_ctx_tokens = 0
+        num_gen_tokens = 0
+        for req_id, ntok in scheduler_output.num_scheduled_tokens.items():
+            if req_id in new_ids:
+                num_ctx_tokens += ntok
+            else:
+                num_gen_tokens += ntok
+        return (
+            len(new_ids),
+            num_ctx_tokens,
+            len(scheduler_output.num_scheduled_tokens) - len(new_ids),
+            num_gen_tokens,
+        )
+
+    def _execute_model_with_pp_trace(
+        self,
+        scheduler_output: "SchedulerOutput",
+        all_gather_tensors: dict[str, bool],
+    ) -> ModelRunnerOutput | None:
+        """Execute one PP step with compute/comm timings written to JSONL.
+
+        Recv and send are blocking in v0.13.0, so each JSONL line is
+        self-contained (no send/next-step overlap).
+        """
+        tracer = self._pp_stage_tracer
+        assert tracer is not None
+        start_layer, end_layer = layer_range_from_runner(self.model_runner)
+        n_ctx_req, n_ctx_tok, n_gen_req, n_gen_tok = self._pp_token_mix(
+            scheduler_output
+        )
+
+        recv_ms: float | None = None
+        recv_bytes: int | None = None
+        intermediate_tensors: IntermediateTensors | None = None
+        if not get_pp_group().is_first_rank:
+
+            def _recv() -> IntermediateTensors:
+                tensor_dict = get_pp_group().recv_tensor_dict(
+                    all_gather_group=get_tp_group(),
+                    all_gather_tensors=all_gather_tensors,
+                )
+                assert tensor_dict is not None
+                return IntermediateTensors(tensor_dict)
+
+            intermediate_tensors, recv_ms = tracer.measure_comm(_recv)
+            recv_bytes = tensor_dict_nbytes(intermediate_tensors.tensors)
+
+        def _run_forward() -> (
+            ModelRunnerOutput | IntermediateTensors | None
+        ):
+            with self.annotate_profile(scheduler_output):
+                return self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
+
+        output, compute_ms = tracer.measure_compute(_run_forward)
+
+        send_ms: float | None = None
+        send_bytes: int | None = None
+        if isinstance(output, IntermediateTensors):
+            send_bytes = tensor_dict_nbytes(output.tensors)
+
+            def _send() -> None:
+                get_pp_group().send_tensor_dict(
+                    output.tensors,
+                    all_gather_group=get_tp_group(),
+                    all_gather_tensors=all_gather_tensors,
+                )
+
+            _, send_ms = tracer.measure_comm(_send)
+            tracer.record(
+                num_tokens=scheduler_output.total_num_scheduled_tokens,
+                num_reqs=len(scheduler_output.num_scheduled_tokens),
+                num_ctx_requests=n_ctx_req,
+                num_ctx_tokens=n_ctx_tok,
+                num_generation_requests=n_gen_req,
+                num_generation_tokens=n_gen_tok,
+                compute_ms=compute_ms,
+                recv_ms=recv_ms,
+                send_ms=send_ms,
+                recv_bytes=recv_bytes,
+                send_bytes=send_bytes,
+                start_layer=start_layer,
+                end_layer=end_layer,
+            )
+            return None
+
+        tracer.record(
+            num_tokens=scheduler_output.total_num_scheduled_tokens,
+            num_reqs=len(scheduler_output.num_scheduled_tokens),
+            num_ctx_requests=n_ctx_req,
+            num_ctx_tokens=n_ctx_tok,
+            num_generation_requests=n_gen_req,
+            num_generation_tokens=n_gen_tok,
+            compute_ms=compute_ms,
+            recv_ms=recv_ms,
+            send_ms=None,
+            recv_bytes=recv_bytes,
+            send_bytes=None,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+        if isinstance(output, (ModelRunnerOutput, NoneType)):
+            return output
+        raise TypeError(f"Unexpected traced PP output type: {type(output)}")
+
     @torch.inference_mode()
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
@@ -610,6 +730,11 @@ class Worker(WorkerBase):
                     self.vllm_config, batch_desc.num_tokens
                 )
             }
+
+        if self._pp_stage_tracer is not None and forward_pass:
+            return self._execute_model_with_pp_trace(
+                scheduler_output, all_gather_tensors
+            )
 
         if forward_pass and not get_pp_group().is_first_rank:
             tensor_dict = get_pp_group().recv_tensor_dict(
@@ -922,6 +1047,9 @@ class Worker(WorkerBase):
         if self.profiler is not None:
             self.profiler.shutdown()
 
+        if tracer := getattr(self, "_pp_stage_tracer", None):
+            tracer.close()
+            self._pp_stage_tracer = None
 
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,
