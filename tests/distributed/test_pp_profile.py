@@ -10,6 +10,7 @@ import pytest
 
 from vllm.distributed.pp_profile import (
     build_profile_workload,
+    clear_trace_files,
     prepare_trace_dir,
     profile_pp_partition,
     require_complete_traces,
@@ -185,6 +186,12 @@ def test_prepare_trace_dir_reuses_env_when_unspecified(tmp_path, monkeypatch):
     assert dump_dir == existing.resolve()
 
 
+def test_clear_trace_files_removes_jsonl(tmp_path):
+    _write_two_rank_traces(tmp_path)
+    clear_trace_files(tmp_path)
+    assert list(tmp_path.glob("pp_stage_pp*_tp*.jsonl")) == []
+
+
 def test_require_complete_traces_accepts_contiguous_ranks(tmp_path):
     _write_two_rank_traces(tmp_path)
     records = require_complete_traces(tmp_path, pp_size=2)
@@ -343,6 +350,23 @@ def test_profile_shutdown_runs_when_generate_raises(tmp_path):
             vocab_size=32,
         )
     assert llm.closed is True
+
+
+def test_live_run_ignores_stale_traces(tmp_path):
+    _write_two_rank_traces(tmp_path)
+    llm = FakeLLM(tmp_path, {}, write_traces=False)
+    with pytest.raises(FileNotFoundError):
+        profile_pp_partition(
+            dump_dir=tmp_path,
+            llm_factory=lambda: llm,
+            engine_args=SimpleNamespace(pipeline_parallel_size=2),
+            num_prompts=1,
+            input_len=2,
+            output_len=2,
+            num_iters=1,
+            num_iters_warmup=0,
+            vocab_size=32,
+        )
 
 
 def test_profile_requires_engine_when_not_skipping():

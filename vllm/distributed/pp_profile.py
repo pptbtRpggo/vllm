@@ -225,9 +225,28 @@ def write_profile_result(
     return path
 
 
+def clear_trace_files(dump_dir: str | Path) -> None:
+    """Remove leftover ``pp_stage_pp*_tp*.jsonl`` so a live run cannot reuse them."""
+    dump_dir = Path(dump_dir)
+    for path in dump_dir.glob("pp_stage_pp*_tp*.jsonl"):
+        path.unlink()
+
+
+def _ensure_ascend_pp_worker(engine_args: Any) -> None:
+    """Use the tracing NPUWorker subclass when vllm-ascend is installed."""
+    try:
+        import vllm_ascend  # noqa: F401
+    except ImportError:
+        return
+    current = getattr(engine_args, "worker_cls", None)
+    if current in (None, "", "auto"):
+        engine_args.worker_cls = "vllm.v1.worker.pp_ascend_worker.PPAscendWorker"
+
+
 def _default_llm_factory(engine_args: Any) -> Any:
     from vllm import LLM
 
+    _ensure_ascend_pp_worker(engine_args)
     if hasattr(LLM, "from_engine_args"):
         return LLM.from_engine_args(engine_args)
     return LLM(**vars(engine_args))
@@ -312,6 +331,7 @@ def profile_pp_partition(
                 f"(got {pp_size})"
             )
         dump_dir = prepare_trace_dir(dump_dir)
+        clear_trace_files(dump_dir)
         if workload is None:
             workload = build_profile_workload(
                 num_prompts=num_prompts,

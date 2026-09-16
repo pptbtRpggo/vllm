@@ -126,8 +126,14 @@ class PPStageTracer:
     def path(self) -> str:
         return self._path
 
+    def _sync_device(self) -> None:
+        if self.use_cuda:
+            torch.cuda.synchronize(self.device)
+        elif self.device.type == "npu":
+            torch.npu.synchronize()
+
     def measure_compute(self, fn: Callable[[], T]) -> tuple[T, float]:
-        """Time local GPU compute. Returns ``(result, elapsed_ms)``."""
+        """Time local GPU/NPU compute. Returns ``(result, elapsed_ms)``."""
         if self.use_cuda:
             assert self._start_event is not None and self._end_event is not None
             self._start_event.record()
@@ -137,14 +143,14 @@ class PPStageTracer:
             return result, float(self._start_event.elapsed_time(self._end_event))
         t0 = time.perf_counter()
         result = fn()
+        self._sync_device()
         return result, (time.perf_counter() - t0) * 1000.0
 
     def measure_comm(self, fn: Callable[[], T]) -> tuple[T, float]:
         """Time a blocking send/recv wait. Returns ``(result, elapsed_ms)``."""
         t0 = time.perf_counter()
         result = fn()
-        if self.use_cuda:
-            torch.cuda.synchronize(self.device)
+        self._sync_device()
         return result, (time.perf_counter() - t0) * 1000.0
 
     def record(
