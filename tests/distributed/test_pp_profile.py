@@ -260,6 +260,24 @@ def test_write_profile_result_json(tmp_path):
     assert plan.env_value == "16,16"
 
 
+def test_profile_skip_run_compute_scale_unbalances(tmp_path):
+    _write_two_rank_traces(tmp_path)
+    plan = profile_pp_partition(
+        dump_dir=tmp_path,
+        skip_run=True,
+        warmup_steps=5,
+        min_pp_size=2,
+        max_pp_size=2,
+        compute_scale="1,2",
+        output_json=tmp_path / "scaled_plan.json",
+    )
+    assert sum(plan.partitions) == 32
+    assert plan.partitions[0] > plan.partitions[1]
+    payload = json.loads((tmp_path / "scaled_plan.json").read_text(encoding="utf-8"))
+    assert payload["compute_scale"] == "1,2"
+    assert payload["VLLM_PP_LAYER_PARTITION"] == plan.env_value
+
+
 def test_profile_skip_run_requires_trace_dir():
     with pytest.raises(ValueError, match="trace-dir"):
         profile_pp_partition(skip_run=True)
@@ -276,12 +294,16 @@ def test_profile_rejects_pp1_live_run():
 
 def test_profile_live_run_sets_env_feeds_and_plans(tmp_path, monkeypatch):
     monkeypatch.delenv("VLLM_PP_STAGE_TRACE", raising=False)
+    monkeypatch.delenv("VLLM_PP_COMPUTE_SCALE", raising=False)
+    monkeypatch.delenv("VLLM_PP_COMM_SCALE", raising=False)
     seen: dict[str, str | None] = {}
     traces = _two_rank_recs()
     holder: dict[str, FakeLLM] = {}
 
     def factory() -> FakeLLM:
         seen["env"] = os.environ.get("VLLM_PP_STAGE_TRACE")
+        seen["compute"] = os.environ.get("VLLM_PP_COMPUTE_SCALE")
+        seen["comm"] = os.environ.get("VLLM_PP_COMM_SCALE")
         llm = FakeLLM(seen["env"] or tmp_path, traces)
         holder["llm"] = llm
         return llm
@@ -300,18 +322,25 @@ def test_profile_live_run_sets_env_feeds_and_plans(tmp_path, monkeypatch):
         max_pp_size=2,
         vocab_size=32,
         seed=3,
+        compute_scale="1,2",
+        comm_scale="4",
     )
     assert Path(seen["env"] or "") == tmp_path.resolve()
+    assert seen["compute"] == "1,2"
+    assert seen["comm"] == "4"
     llm = holder["llm"]
     assert llm.closed is True
     assert len(llm.generate_calls) == 2
     assert llm.generate_calls[0]["input_len"] == 4
     assert llm.generate_calls[0]["max_tokens"] == 3
+    # Fake traces are homogeneous; live path must not planner-scale again.
     assert plan.env_value == "16,16"
     payload = json.loads(
         (tmp_path / "pp_partition_plan.json").read_text(encoding="utf-8")
     )
     assert payload["VLLM_PP_LAYER_PARTITION"] == "16,16"
+    assert payload["compute_scale"] == "1,2"
+    assert payload["comm_scale"] == "4"
 
 
 def test_profile_fails_if_engine_writes_no_traces(tmp_path):

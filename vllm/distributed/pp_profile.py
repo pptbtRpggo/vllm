@@ -24,6 +24,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from vllm.distributed.pp_hetero import PPHeteroConfig
 from vllm.distributed.pp_partition import (
     Objective,
     PPPartitionPlan,
@@ -202,6 +203,9 @@ def write_profile_result(
     plan: PPPartitionPlan,
     dump_dir: str | Path,
     output_json: str | Path | None = None,
+    *,
+    compute_scale: str | None = None,
+    comm_scale: str | None = None,
 ) -> Path:
     """Write ``plan`` as JSON next to the traces (or to ``output_json``).
 
@@ -209,6 +213,8 @@ def write_profile_result(
         plan: DP result.
         dump_dir: Default parent of ``pp_partition_plan.json``.
         output_json: Optional explicit path.
+        compute_scale: Optional per-rank compute stretch recorded for serve.
+        comm_scale: Optional per-hop comm stretch recorded for serve.
 
     Returns:
         Path of the written JSON file.
@@ -220,9 +226,41 @@ def write_profile_result(
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = plan.to_dict()
+    if compute_scale:
+        payload["compute_scale"] = compute_scale
+    if comm_scale:
+        payload["comm_scale"] = comm_scale
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     logger.info("Wrote PP partition plan to %s", path)
     return path
+
+
+def format_serve_command(
+    plan: PPPartitionPlan,
+    *,
+    compute_scale: str | None = None,
+    comm_scale: str | None = None,
+) -> str:
+    """Shell snippet to re-serve with the chosen split and hetero scales."""
+    lines = ["Re-serve with:"]
+    exports = [f"VLLM_PP_LAYER_PARTITION={plan.env_value}"]
+    if compute_scale:
+        exports.append(f"VLLM_PP_COMPUTE_SCALE={compute_scale}")
+    if comm_scale:
+        exports.append(f"VLLM_PP_COMM_SCALE={comm_scale}")
+    worker = ""
+    try:
+        import vllm_ascend  # noqa: F401
+
+        worker = " --worker-cls vllm.v1.worker.pp_ascend_worker.PPAscendWorker"
+    except ImportError:
+        pass
+    for item in exports:
+        lines.append(f"  {item} \\")
+    lines.append(
+        f"    vllm serve <model> --pipeline-parallel-size {plan.pp_size}{worker}"
+    )
+    return "\n".join(lines)
 
 
 def clear_trace_files(dump_dir: str | Path) -> None:
@@ -280,6 +318,8 @@ def profile_pp_partition(
     max_pp_size: int | None = None,
     overlap_comm: bool = True,
     output_json: str | Path | None = None,
+    compute_scale: str | None = None,
+    comm_scale: str | None = None,
 ) -> PPPartitionPlan:
     """Run the profile pipeline and return the DP layer split.
 
@@ -304,6 +344,10 @@ def profile_pp_partition(
         max_pp_size: Largest PP size the DP may choose.
         overlap_comm: Throughput DP uses max(compute, comm) when True.
         output_json: Optional plan JSON path.
+        compute_scale: Per-rank compute stretch (``1,2``). Live runs export
+            it into the worker env; ``--skip-run`` multiplies fitted costs.
+        comm_scale: Per-hop comm stretch (``1,4``). Same live vs skip-run
+            split as ``compute_scale``.
 
     Returns:
         The chosen partition (also written as JSON under ``dump_dir``).
@@ -313,6 +357,9 @@ def profile_pp_partition(
         FileNotFoundError: Traces are missing after the run.
     """
     pp_size = _pipeline_parallel_size(engine_args)
+    PPHeteroConfig.from_text(compute_scale, comm_scale)
+    planner_compute_scale: str | None = None
+    planner_comm_scale: str | None = None
     if not skip_run:
         if llm_factory is None:
             if engine_args is None:
@@ -332,6 +379,10 @@ def profile_pp_partition(
             )
         dump_dir = prepare_trace_dir(dump_dir)
         clear_trace_files(dump_dir)
+        if compute_scale:
+            os.environ["VLLM_PP_COMPUTE_SCALE"] = compute_scale
+        if comm_scale:
+            os.environ["VLLM_PP_COMM_SCALE"] = comm_scale
         if workload is None:
             workload = build_profile_workload(
                 num_prompts=num_prompts,
@@ -353,6 +404,8 @@ def profile_pp_partition(
             raise ValueError("--trace-dir is required with --skip-run")
         dump_dir = Path(dump_dir)
         require_complete_traces(dump_dir, pp_size=pp_size)
+        planner_compute_scale = compute_scale
+        planner_comm_scale = comm_scale
 
     plan = plan_from_trace_dir(
         dump_dir,
@@ -363,8 +416,16 @@ def profile_pp_partition(
         min_pp_size=min_pp_size,
         max_pp_size=max_pp_size,
         overlap_comm=overlap_comm,
+        compute_scale=planner_compute_scale,
+        comm_scale=planner_comm_scale,
     )
-    write_profile_result(plan, dump_dir, output_json=output_json)
+    write_profile_result(
+        plan,
+        dump_dir,
+        output_json=output_json,
+        compute_scale=compute_scale,
+        comm_scale=comm_scale,
+    )
     logger.info("PP profile result:\n%s", format_plan(plan))
     return plan
 
@@ -434,6 +495,24 @@ def add_cli_args(parser: Any) -> Any:
         help="Do not launch the engine; only fit+DP traces in --trace-dir.",
     )
     parser.add_argument(
+        "--compute-scale",
+        type=str,
+        default=None,
+        help=(
+            "Per-PP-rank compute slowdown, e.g. 1,2. Live runs stretch "
+            "workers; --skip-run multiplies fitted t_layer instead."
+        ),
+    )
+    parser.add_argument(
+        "--comm-scale",
+        type=str,
+        default=None,
+        help=(
+            "Per-hop comm slowdown rank i->i+1, e.g. 1,4. Live vs "
+            "--skip-run split matches --compute-scale."
+        ),
+    )
+    parser.add_argument(
         "--vocab-size",
         type=int,
         default=32000,
@@ -475,6 +554,8 @@ def run_from_cli_args(args: Any) -> PPPartitionPlan:
         max_pp_size=args.max_pp_size,
         overlap_comm=not args.no_overlap_comm,
         output_json=args.output_json,
+        compute_scale=args.compute_scale,
+        comm_scale=args.comm_scale,
     )
 
 
@@ -487,9 +568,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     plan = run_from_cli_args(args)
     print(format_plan(plan))
     print()
-    print("Re-serve with:")
-    print(f"  VLLM_PP_LAYER_PARTITION={plan.env_value} \\")
-    print("    vllm serve <model> --pipeline-parallel-size", plan.pp_size)
+    print(
+        format_serve_command(
+            plan,
+            compute_scale=args.compute_scale,
+            comm_scale=args.comm_scale,
+        )
+    )
 
 
 if __name__ == "__main__":

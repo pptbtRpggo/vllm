@@ -191,3 +191,84 @@ def test_plan_from_trace_dir_roundtrip(tmp_path):
     assert payload["partitions"] == [16, 16]
     assert payload["objective"] == "throughput"
     assert len(payload["rank_costs"]) == 2
+
+
+def test_plan_from_trace_dir_compute_scale_unbalances(tmp_path):
+    recs0 = [
+        _rec(
+            pp_rank=0,
+            pp_size=2,
+            step=i,
+            start=0,
+            end=16,
+            compute_ms=16.0,
+            send_ms=0.2,
+        )
+        for i in range(10)
+    ]
+    recs1 = [
+        _rec(
+            pp_rank=1,
+            pp_size=2,
+            step=i,
+            start=16,
+            end=32,
+            compute_ms=16.0,
+            send_ms=None,
+        )
+        for i in range(10)
+    ]
+    _write_rank_jsonl(tmp_path / "pp_stage_pp0_tp0.jsonl", recs0)
+    _write_rank_jsonl(tmp_path / "pp_stage_pp1_tp0.jsonl", recs1)
+
+    plan = plan_from_trace_dir(
+        tmp_path,
+        objective="throughput",
+        warmup_steps=5,
+        min_pp_size=2,
+        max_pp_size=2,
+        compute_scale="1,2",
+    )
+    assert sum(plan.partitions) == 32
+    assert plan.partitions[0] > plan.partitions[1]
+    assert plan.rank_costs[1].t_layer_ms == pytest.approx(2.0)
+
+
+def test_plan_from_trace_dir_comm_scale_multiplies_hop(tmp_path):
+    recs0 = [
+        _rec(
+            pp_rank=0,
+            pp_size=2,
+            step=i,
+            start=0,
+            end=16,
+            compute_ms=16.0,
+            send_ms=0.5,
+        )
+        for i in range(10)
+    ]
+    recs1 = [
+        _rec(
+            pp_rank=1,
+            pp_size=2,
+            step=i,
+            start=16,
+            end=32,
+            compute_ms=16.0,
+            send_ms=None,
+        )
+        for i in range(10)
+    ]
+    _write_rank_jsonl(tmp_path / "pp_stage_pp0_tp0.jsonl", recs0)
+    _write_rank_jsonl(tmp_path / "pp_stage_pp1_tp0.jsonl", recs1)
+
+    plan = plan_from_trace_dir(
+        tmp_path,
+        objective="throughput",
+        warmup_steps=5,
+        min_pp_size=2,
+        max_pp_size=2,
+        comm_scale="4",
+    )
+    assert plan.rank_costs[0].t_comm_out_ms == pytest.approx(2.0)
+    assert plan.env_value == "16,16"

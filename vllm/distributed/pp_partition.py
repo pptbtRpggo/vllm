@@ -35,9 +35,11 @@ import math
 import statistics
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
+
+from vllm.distributed.pp_hetero import parse_scale_list, scale_at
 
 Objective = Literal["latency", "throughput"]
 Workload = Literal["all", "decode", "prefill"]
@@ -217,6 +219,29 @@ def fit_rank_costs(
     return costs
 
 
+def scale_rank_costs(
+    costs: Sequence[RankCost],
+    *,
+    compute_scales: Sequence[float] = (),
+    comm_scales: Sequence[float] = (),
+) -> list[RankCost]:
+    """Multiply fitted ``t_layer`` / ``t_comm`` to emulate slower ranks/hops.
+
+    Used by ``--skip-run`` so a homogeneous trace can be planned as if the
+    devices were heterogeneous, without another engine launch.
+    """
+    if not compute_scales and not comm_scales:
+        return list(costs)
+    scaled: list[RankCost] = []
+    for cost in costs:
+        t_layer = cost.t_layer_ms * scale_at(compute_scales, cost.pp_rank)
+        t_comm = cost.t_comm_out_ms
+        if t_comm is not None:
+            t_comm = t_comm * scale_at(comm_scales, cost.pp_rank)
+        scaled.append(replace(cost, t_layer_ms=t_layer, t_comm_out_ms=t_comm))
+    return scaled
+
+
 def _comm_ms(costs: Sequence[RankCost], from_rank: int) -> float:
     value = costs[from_rank].t_comm_out_ms
     if value is None:
@@ -325,6 +350,8 @@ def plan_from_trace_dir(
     min_pp_size: int = 1,
     max_pp_size: int | None = None,
     overlap_comm: bool = True,
+    compute_scale: str | None = None,
+    comm_scale: str | None = None,
 ) -> PPPartitionPlan:
     records = load_trace_records(dump_dir)
     costs = fit_rank_costs(
@@ -332,6 +359,11 @@ def plan_from_trace_dir(
         workload=workload,
         warmup_steps=warmup_steps,
         num_layers=num_layers,
+    )
+    costs = scale_rank_costs(
+        costs,
+        compute_scales=parse_scale_list(compute_scale),
+        comm_scales=parse_scale_list(comm_scale),
     )
     return partition_layers(
         costs,
@@ -398,6 +430,18 @@ def main(argv: Iterable[str] | None = None) -> None:
         action="store_true",
         help="Throughput DP uses compute+comm instead of max(compute, comm)",
     )
+    parser.add_argument(
+        "--compute-scale",
+        type=str,
+        default=None,
+        help="Per-PP-rank compute slowdown, e.g. 1,2 (rank1 twice as slow).",
+    )
+    parser.add_argument(
+        "--comm-scale",
+        type=str,
+        default=None,
+        help="Per-hop comm slowdown rank i->i+1, e.g. 1,4.",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     min_pp = args.pp_size if args.pp_size is not None else args.min_pp_size
@@ -411,6 +455,8 @@ def main(argv: Iterable[str] | None = None) -> None:
         min_pp_size=min_pp,
         max_pp_size=max_pp,
         overlap_comm=not args.no_overlap_comm,
+        compute_scale=args.compute_scale,
+        comm_scale=args.comm_scale,
     )
     print(format_plan(plan))
 

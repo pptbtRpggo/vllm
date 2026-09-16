@@ -5,7 +5,11 @@ import argparse
 import typing
 
 from vllm.distributed.pp_partition import format_plan
-from vllm.distributed.pp_profile import add_cli_args, run_from_cli_args
+from vllm.distributed.pp_profile import (
+    add_cli_args,
+    format_serve_command,
+    run_from_cli_args,
+)
 from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
 
@@ -32,11 +36,12 @@ class PPProfileSubcommand(CLISubcommand):
         plan = run_from_cli_args(args)
         print(format_plan(plan))
         print()
-        print("Re-serve with:")
-        print(f"  VLLM_PP_LAYER_PARTITION={plan.env_value} \\")
         print(
-            "    vllm serve <model> --pipeline-parallel-size",
-            plan.pp_size,
+            format_serve_command(
+                plan,
+                compute_scale=getattr(args, "compute_scale", None),
+                comm_scale=getattr(args, "comm_scale", None),
+            )
         )
 
     def validate(self, args: argparse.Namespace) -> None:

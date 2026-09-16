@@ -50,6 +50,8 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_PP_STAGE_TRACE: str | None = None
+    VLLM_PP_COMPUTE_SCALE: str | None = None
+    VLLM_PP_COMM_SCALE: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = ""
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -688,6 +690,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
     # Directory to dump per-PP-rank compute/comm JSONL traces. Unset disables.
     "VLLM_PP_STAGE_TRACE": lambda: os.getenv("VLLM_PP_STAGE_TRACE", None),
+    # Comma list of per-PP-rank compute slowdown factors (homogeneous HW).
+    "VLLM_PP_COMPUTE_SCALE": lambda: os.getenv("VLLM_PP_COMPUTE_SCALE", None),
+    # Comma list of per-hop send/recv slowdown factors rank i -> i+1.
+    "VLLM_PP_COMM_SCALE": lambda: os.getenv("VLLM_PP_COMM_SCALE", None),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: int(os.getenv("VLLM_CPU_KVCACHE_SPACE", "0"))
@@ -1648,6 +1654,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PP_STAGE_TRACE",
+        "VLLM_PP_COMPUTE_SCALE",
+        "VLLM_PP_COMM_SCALE",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
         "LD_LIBRARY_PATH",

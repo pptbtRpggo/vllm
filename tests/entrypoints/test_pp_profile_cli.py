@@ -101,6 +101,10 @@ def test_parse_skip_run_and_profile_knobs(pp_profile_parser):
             "16",
             "--num-prompts",
             "4",
+            "--compute-scale",
+            "1,2",
+            "--comm-scale",
+            "4",
         ]
     )
     assert args.skip_run is True
@@ -110,6 +114,8 @@ def test_parse_skip_run_and_profile_knobs(pp_profile_parser):
     assert args.input_len == 128
     assert args.output_len == 16
     assert args.num_prompts == 4
+    assert args.compute_scale == "1,2"
+    assert args.comm_scale == "4"
 
 
 def test_parse_model_tag_and_pp_size(pp_profile_parser):
@@ -162,6 +168,37 @@ def test_cmd_skip_run_prints_partition(pp_profile_parser, tmp_path, capsys):
         (tmp_path / "pp_partition_plan.json").read_text(encoding="utf-8")
     )
     assert payload["VLLM_PP_LAYER_PARTITION"] == "16,16"
+
+
+def test_cmd_skip_run_compute_scale_prints_env(pp_profile_parser, tmp_path, capsys):
+    _write_two_rank_traces(tmp_path)
+    args = pp_profile_parser.parse_args(
+        [
+            "pp-profile",
+            "--skip-run",
+            "--trace-dir",
+            str(tmp_path),
+            "--warmup-steps",
+            "5",
+            "--min-pp-size",
+            "2",
+            "--max-pp-size",
+            "2",
+            "--compute-scale",
+            "1,2",
+        ]
+    )
+    PPProfileSubcommand().validate(args)
+    PPProfileSubcommand.cmd(args)
+    out = capsys.readouterr().out
+    assert "VLLM_PP_COMPUTE_SCALE=1,2" in out
+    payload = json.loads(
+        (tmp_path / "pp_partition_plan.json").read_text(encoding="utf-8")
+    )
+    assert payload["compute_scale"] == "1,2"
+    parts = [int(x) for x in payload["VLLM_PP_LAYER_PARTITION"].split(",")]
+    assert sum(parts) == 32
+    assert parts[0] > parts[1]
 
 
 def test_cli_main_registers_pp_profile():
