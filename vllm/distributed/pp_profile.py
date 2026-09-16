@@ -24,7 +24,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from vllm.distributed.pp_hetero import PPHeteroConfig
+from vllm.distributed.pp_hetero import PPHeteroConfig, hetero_spec_from_text
 from vllm.distributed.pp_partition import (
     Objective,
     PPPartitionPlan,
@@ -226,6 +226,9 @@ def write_profile_result(
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = plan.to_dict()
+    spec = hetero_spec_from_text(compute_scale, comm_scale)
+    if spec:
+        payload["VLLM_PP_HETERO"] = spec
     if compute_scale:
         payload["compute_scale"] = compute_scale
     if comm_scale:
@@ -244,21 +247,13 @@ def format_serve_command(
     """Shell snippet to re-serve with the chosen split and hetero scales."""
     lines = ["Re-serve with:"]
     exports = [f"VLLM_PP_LAYER_PARTITION={plan.env_value}"]
-    if compute_scale:
-        exports.append(f"VLLM_PP_COMPUTE_SCALE={compute_scale}")
-    if comm_scale:
-        exports.append(f"VLLM_PP_COMM_SCALE={comm_scale}")
-    worker = ""
-    try:
-        import vllm_ascend  # noqa: F401
-
-        worker = " --worker-cls vllm.v1.worker.pp_ascend_worker.PPAscendWorker"
-    except ImportError:
-        pass
+    spec = hetero_spec_from_text(compute_scale, comm_scale)
+    if spec:
+        exports.append(f"VLLM_PP_HETERO={spec}")
     for item in exports:
         lines.append(f"  {item} \\")
     lines.append(
-        f"    vllm serve <model> --pipeline-parallel-size {plan.pp_size}{worker}"
+        f"    vllm serve <model> --pipeline-parallel-size {plan.pp_size}"
     )
     return "\n".join(lines)
 
@@ -379,10 +374,9 @@ def profile_pp_partition(
             )
         dump_dir = prepare_trace_dir(dump_dir)
         clear_trace_files(dump_dir)
-        if compute_scale:
-            os.environ["VLLM_PP_COMPUTE_SCALE"] = compute_scale
-        if comm_scale:
-            os.environ["VLLM_PP_COMM_SCALE"] = comm_scale
+        spec = hetero_spec_from_text(compute_scale, comm_scale)
+        if spec:
+            os.environ["VLLM_PP_HETERO"] = spec
         if workload is None:
             workload = build_profile_workload(
                 num_prompts=num_prompts,

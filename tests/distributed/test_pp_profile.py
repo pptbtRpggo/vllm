@@ -294,6 +294,7 @@ def test_profile_rejects_pp1_live_run():
 
 def test_profile_live_run_sets_env_feeds_and_plans(tmp_path, monkeypatch):
     monkeypatch.delenv("VLLM_PP_STAGE_TRACE", raising=False)
+    monkeypatch.delenv("VLLM_PP_HETERO", raising=False)
     monkeypatch.delenv("VLLM_PP_COMPUTE_SCALE", raising=False)
     monkeypatch.delenv("VLLM_PP_COMM_SCALE", raising=False)
     seen: dict[str, str | None] = {}
@@ -302,8 +303,7 @@ def test_profile_live_run_sets_env_feeds_and_plans(tmp_path, monkeypatch):
 
     def factory() -> FakeLLM:
         seen["env"] = os.environ.get("VLLM_PP_STAGE_TRACE")
-        seen["compute"] = os.environ.get("VLLM_PP_COMPUTE_SCALE")
-        seen["comm"] = os.environ.get("VLLM_PP_COMM_SCALE")
+        seen["hetero"] = os.environ.get("VLLM_PP_HETERO")
         llm = FakeLLM(seen["env"] or tmp_path, traces)
         holder["llm"] = llm
         return llm
@@ -326,8 +326,7 @@ def test_profile_live_run_sets_env_feeds_and_plans(tmp_path, monkeypatch):
         comm_scale="4",
     )
     assert Path(seen["env"] or "") == tmp_path.resolve()
-    assert seen["compute"] == "1,2"
-    assert seen["comm"] == "4"
+    assert seen["hetero"] == "1,2/4"
     llm = holder["llm"]
     assert llm.closed is True
     assert len(llm.generate_calls) == 2
@@ -339,6 +338,7 @@ def test_profile_live_run_sets_env_feeds_and_plans(tmp_path, monkeypatch):
         (tmp_path / "pp_partition_plan.json").read_text(encoding="utf-8")
     )
     assert payload["VLLM_PP_LAYER_PARTITION"] == "16,16"
+    assert payload["VLLM_PP_HETERO"] == "1,2/4"
     assert payload["compute_scale"] == "1,2"
     assert payload["comm_scale"] == "4"
 

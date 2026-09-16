@@ -783,6 +783,9 @@ class VllmConfig:
                 "to True to enable."
             )
         current_platform.check_and_update_config(self)
+        from vllm.distributed.pp_hetero import maybe_override_pp_worker
+
+        maybe_override_pp_worker(self.parallel_config)
 
         # If DCP, ensure the block size is right.
         if self.parallel_config.decode_context_parallel_size > 1:

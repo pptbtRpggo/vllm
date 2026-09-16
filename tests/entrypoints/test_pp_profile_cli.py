@@ -191,11 +191,12 @@ def test_cmd_skip_run_compute_scale_prints_env(pp_profile_parser, tmp_path, caps
     PPProfileSubcommand().validate(args)
     PPProfileSubcommand.cmd(args)
     out = capsys.readouterr().out
-    assert "VLLM_PP_COMPUTE_SCALE=1,2" in out
+    assert "VLLM_PP_HETERO=1,2" in out
     payload = json.loads(
         (tmp_path / "pp_partition_plan.json").read_text(encoding="utf-8")
     )
     assert payload["compute_scale"] == "1,2"
+    assert payload["VLLM_PP_HETERO"] == "1,2"
     parts = [int(x) for x in payload["VLLM_PP_LAYER_PARTITION"].split(",")]
     assert sum(parts) == 32
     assert parts[0] > parts[1]

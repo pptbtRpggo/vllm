@@ -2,23 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Emulate heterogeneous PP devices on homogeneous hardware.
 
-EdgeShard's DP only sees per-rank ``t_layer`` and per-hop ``t_comm``.
-On a box of identical NPUs those can be faked by stretching wall-clock
-time after each stage op:
+One env var drives both ``vllm pp-profile`` and ``vllm serve``:
 
-* ``VLLM_PP_COMPUTE_SCALE`` — comma list, one factor per PP rank.
-  Rank ``r`` sleeps extra after forward so compute looks ``scale[r]``
-  times slower.
-* ``VLLM_PP_COMM_SCALE`` — comma list, one factor per hop ``r -> r+1``.
-  The sender sleeps after send and the receiver sleeps after recv, so
-  the next stage cannot start early.
+    VLLM_PP_HETERO=<compute_scales>[/<comm_scales>]
 
-Missing entries default to ``1.0``. Live ``pp-profile`` exports these
-into the worker env so traces already contain the stretched times.
-``--skip-run`` instead multiplies fitted costs (no extra engine run).
+Examples::
 
-Serve with the same env vars, otherwise the partition and the pipeline
-disagree.
+    VLLM_PP_HETERO=1,2          # rank1 compute 2x slower
+    VLLM_PP_HETERO=1,2/4        # plus hop 0->1 comm 4x slower
+    VLLM_PP_HETERO=/4           # comm only
+
+Missing ranks/hops default to ``1.0``. When this (or the legacy
+``VLLM_PP_COMPUTE_SCALE`` / ``VLLM_PP_COMM_SCALE`` aliases) is set,
+engine startup swaps Ascend ``NPUWorker`` for ``PPAscendWorker`` so
+serve does not need ``--worker-cls``.
 """
 
 from __future__ import annotations
@@ -26,9 +23,13 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import torch
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 T = TypeVar("T")
 
@@ -66,6 +67,89 @@ def format_scale_list(scales: Sequence[float]) -> str | None:
         else:
             parts.append(str(value))
     return ",".join(parts)
+
+
+def parse_hetero_spec(text: str | None) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Parse ``compute[/comm]``, e.g. ``1,2/4``, ``1,2``, or ``/4``."""
+    if text is None:
+        return (), ()
+    spec = text.strip()
+    if not spec:
+        return (), ()
+    if "/" in spec:
+        left, right = spec.split("/", 1)
+        return parse_scale_list(left), parse_scale_list(right)
+    return parse_scale_list(spec), ()
+
+
+def format_hetero_spec(
+    compute_scales: Sequence[float] = (),
+    comm_scales: Sequence[float] = (),
+) -> str | None:
+    compute = format_scale_list(compute_scales) or ""
+    comm = format_scale_list(comm_scales) or ""
+    if not compute and not comm:
+        return None
+    if not comm:
+        return compute
+    return f"{compute}/{comm}"
+
+
+def hetero_spec_from_text(
+    compute_scale: str | None = None,
+    comm_scale: str | None = None,
+) -> str | None:
+    """Build a ``VLLM_PP_HETERO`` string from the two CLI lists."""
+    compute = (compute_scale or "").strip()
+    comm = (comm_scale or "").strip()
+    if not compute and not comm:
+        return None
+    if not comm:
+        return compute
+    return f"{compute}/{comm}"
+
+
+PP_ASCEND_WORKER = "vllm.v1.worker.pp_ascend_worker.PPAscendWorker"
+
+
+def hetero_env_requested() -> bool:
+    """True when the user asked for PP hetero emulation or stage tracing."""
+    import os
+
+    return bool(
+        os.environ.get("VLLM_PP_HETERO")
+        or os.environ.get("VLLM_PP_COMPUTE_SCALE")
+        or os.environ.get("VLLM_PP_COMM_SCALE")
+        or os.environ.get("VLLM_PP_STAGE_TRACE")
+    )
+
+
+def maybe_override_pp_worker(parallel_config: Any) -> None:
+    """Use ``PPAscendWorker`` when hetero/trace is on and the platform picked NPUWorker.
+
+    CUDA ``gpu_worker.Worker`` already stretches, so it is left alone.
+    Must run *after* ``Platform.check_and_update_config``.
+    """
+    if not hetero_env_requested():
+        return
+    current = getattr(parallel_config, "worker_cls", None)
+    if current == PP_ASCEND_WORKER:
+        return
+    current_s = "" if current is None else str(current)
+    is_auto = current_s in ("", "auto")
+    is_npu = any(
+        marker in current_s.lower()
+        for marker in ("vllm_ascend", "npuworker", "npu_worker")
+    )
+    if not is_auto and not is_npu:
+        return
+    if is_auto:
+        try:
+            import vllm_ascend  # noqa: F401
+        except ImportError:
+            return
+    parallel_config.worker_cls = PP_ASCEND_WORKER
+    logger.info("PP hetero/trace enabled: worker_cls=%s", PP_ASCEND_WORKER)
 
 
 def stretch_after(elapsed_ms: float, scale: float) -> float:
@@ -114,10 +198,12 @@ class PPHeteroConfig:
     def from_env(cls) -> PPHeteroConfig:
         import vllm.envs as envs
 
-        return cls(
-            compute_scales=parse_scale_list(envs.VLLM_PP_COMPUTE_SCALE),
-            comm_scales=parse_scale_list(envs.VLLM_PP_COMM_SCALE),
-        )
+        compute, comm = parse_hetero_spec(envs.VLLM_PP_HETERO)
+        if envs.VLLM_PP_COMPUTE_SCALE:
+            compute = parse_scale_list(envs.VLLM_PP_COMPUTE_SCALE)
+        if envs.VLLM_PP_COMM_SCALE:
+            comm = parse_scale_list(envs.VLLM_PP_COMM_SCALE)
+        return cls(compute_scales=compute, comm_scales=comm)
 
     @classmethod
     def from_text(
@@ -153,12 +239,9 @@ class PPHeteroConfig:
         return stretch_after(elapsed_ms, self.comm_scale(pp_rank - 1))
 
     def export_env(self) -> None:
-        """Write the scales into ``os.environ`` so PP workers inherit them."""
+        """Write ``VLLM_PP_HETERO`` so profile and serve workers inherit it."""
         import os
 
-        compute = format_scale_list(self.compute_scales)
-        comm = format_scale_list(self.comm_scales)
-        if compute is not None:
-            os.environ["VLLM_PP_COMPUTE_SCALE"] = compute
-        if comm is not None:
-            os.environ["VLLM_PP_COMM_SCALE"] = comm
+        spec = format_hetero_spec(self.compute_scales, self.comm_scales)
+        if spec is not None:
+            os.environ["VLLM_PP_HETERO"] = spec

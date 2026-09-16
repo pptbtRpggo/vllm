@@ -4,7 +4,12 @@
 import pytest
 
 from vllm.distributed.pp_hetero import (
+    PP_ASCEND_WORKER,
     PPHeteroConfig,
+    format_hetero_spec,
+    hetero_spec_from_text,
+    maybe_override_pp_worker,
+    parse_hetero_spec,
     parse_scale_list,
     scale_at,
     stretch_after,
@@ -70,3 +75,58 @@ def test_scale_rank_costs_compute_and_comm():
     assert scaled[0].t_comm_out_ms == pytest.approx(1.5)
     assert scaled[1].t_layer_ms == pytest.approx(2.0)
     assert scaled[1].t_comm_out_ms is None
+
+
+def test_parse_hetero_spec():
+    assert parse_hetero_spec(None) == ((), ())
+    assert parse_hetero_spec("1,2") == ((1.0, 2.0), ())
+    assert parse_hetero_spec("1,2/4") == ((1.0, 2.0), (4.0,))
+    assert parse_hetero_spec("/4") == ((), (4.0,))
+    assert parse_hetero_spec("1,2/") == ((1.0, 2.0), ())
+    assert format_hetero_spec((1.0, 2.0), (4.0,)) == "1,2/4"
+    assert hetero_spec_from_text("1,2", "4") == "1,2/4"
+    assert hetero_spec_from_text("1,2", None) == "1,2"
+    assert hetero_spec_from_text(None, "4") == "/4"
+
+
+def test_from_env_reads_unified_spec(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_HETERO", "1,2/4")
+    monkeypatch.delenv("VLLM_PP_COMPUTE_SCALE", raising=False)
+    monkeypatch.delenv("VLLM_PP_COMM_SCALE", raising=False)
+    cfg = PPHeteroConfig.from_env()
+    assert cfg.compute_scales == (1.0, 2.0)
+    assert cfg.comm_scales == (4.0,)
+    assert cfg.enabled is True
+
+
+def test_from_env_legacy_aliases_override(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_HETERO", "1,2/4")
+    monkeypatch.setenv("VLLM_PP_COMPUTE_SCALE", "1,3")
+    monkeypatch.delenv("VLLM_PP_COMM_SCALE", raising=False)
+    cfg = PPHeteroConfig.from_env()
+    assert cfg.compute_scales == (1.0, 3.0)
+    assert cfg.comm_scales == (4.0,)
+
+
+def test_maybe_override_swaps_npu_worker(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_HETERO", "1,2")
+    cfg = type("PC", (), {"worker_cls": "vllm_ascend.worker.worker.NPUWorker"})()
+    maybe_override_pp_worker(cfg)
+    assert cfg.worker_cls == PP_ASCEND_WORKER
+
+
+def test_maybe_override_leaves_gpu_worker(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_HETERO", "1,2")
+    cfg = type("PC", (), {"worker_cls": "vllm.v1.worker.gpu_worker.Worker"})()
+    maybe_override_pp_worker(cfg)
+    assert cfg.worker_cls == "vllm.v1.worker.gpu_worker.Worker"
+
+
+def test_maybe_override_noop_without_env(monkeypatch):
+    monkeypatch.delenv("VLLM_PP_HETERO", raising=False)
+    monkeypatch.delenv("VLLM_PP_COMPUTE_SCALE", raising=False)
+    monkeypatch.delenv("VLLM_PP_COMM_SCALE", raising=False)
+    monkeypatch.delenv("VLLM_PP_STAGE_TRACE", raising=False)
+    cfg = type("PC", (), {"worker_cls": "vllm_ascend.worker.worker.NPUWorker"})()
+    maybe_override_pp_worker(cfg)
+    assert cfg.worker_cls == "vllm_ascend.worker.worker.NPUWorker"
