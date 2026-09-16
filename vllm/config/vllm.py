@@ -783,7 +783,7 @@ class VllmConfig:
                 "to True to enable."
             )
         current_platform.check_and_update_config(self)
-        from vllm.distributed.pp_hetero import maybe_override_pp_worker
+        from vllm.pp_hetero_env import maybe_override_pp_worker
 
         maybe_override_pp_worker(self.parallel_config)
 
