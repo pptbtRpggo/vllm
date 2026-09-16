@@ -69,6 +69,26 @@ class PPPartitionPlan:
     def pp_size(self) -> int:
         return len(self.partitions)
 
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-serializable view used by ``vllm pp-profile``."""
+        return {
+            "objective": self.objective,
+            "predicted_cost_ms": self.cost_ms,
+            "pp_size": self.pp_size,
+            "VLLM_PP_LAYER_PARTITION": self.env_value,
+            "partitions": list(self.partitions),
+            "rank_costs": [
+                {
+                    "pp_rank": cost.pp_rank,
+                    "n_layers_traced": cost.n_layers,
+                    "t_layer_ms": cost.t_layer_ms,
+                    "t_comm_out_ms": cost.t_comm_out_ms,
+                    "n_steps": cost.n_steps,
+                }
+                for cost in self.rank_costs
+            ],
+        }
+
 
 def load_trace_records(dump_dir: str | Path) -> dict[int, list[dict[str, Any]]]:
     """Load ``pp_stage_pp*_tp0.jsonl`` (or any tp rank if tp0 is absent)."""
@@ -323,7 +343,7 @@ def plan_from_trace_dir(
     )
 
 
-def _format_plan(plan: PPPartitionPlan) -> str:
+def format_plan(plan: PPPartitionPlan) -> str:
     lines = [
         f"objective={plan.objective}",
         f"predicted_cost_ms={plan.cost_ms:.4f}",
@@ -392,7 +412,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         max_pp_size=max_pp,
         overlap_comm=not args.no_overlap_comm,
     )
-    print(_format_plan(plan))
+    print(format_plan(plan))
 
 
 if __name__ == "__main__":

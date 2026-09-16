@@ -186,3 +186,8 @@ def test_plan_from_trace_dir_roundtrip(tmp_path):
     )
     assert plan.env_value == "16,16"
     assert plan.pp_size == 2
+    payload = plan.to_dict()
+    assert payload["VLLM_PP_LAYER_PARTITION"] == "16,16"
+    assert payload["partitions"] == [16, 16]
+    assert payload["objective"] == "throughput"
+    assert len(payload["rank_costs"]) == 2
