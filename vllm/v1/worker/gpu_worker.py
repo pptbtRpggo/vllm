@@ -43,6 +43,12 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
 )
+from vllm.distributed.pp_stage_trace import (
+    PPStageTracer,
+    layer_range_from_runner,
+    maybe_create_pp_stage_tracer,
+    tensor_dict_nbytes,
+)
 from vllm.distributed.weight_transfer import (
     WeightTransferEngine,
     WeightTransferEngineFactory,
@@ -161,6 +167,7 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        self._pp_stage_tracer: PPStageTracer | None = None
 
     def sleep(self, level: int = 1) -> None:
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
@@ -298,6 +305,8 @@ class Worker(WorkerBase):
                 self.local_rank,
                 current_platform.dist_backend,
             )
+
+            self._pp_stage_tracer = maybe_create_pp_stage_tracer(self.device)
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
@@ -802,6 +811,97 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
+    def _execute_model_with_pp_trace(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None,
+        all_gather_tensors: dict[str, bool],
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        """Execute one PP step with compute/comm timings written to JSONL.
+
+        Send is waited in this step so each record is self-contained.
+        """
+        tracer = self._pp_stage_tracer
+        assert tracer is not None
+        details = compute_iteration_details(scheduler_output)
+        start_layer, end_layer = layer_range_from_runner(self.model_runner)
+
+        recv_ms: float | None = None
+        recv_bytes: int | None = None
+        if intermediate_tensors is not None:
+            wait = getattr(intermediate_tensors, "wait_for_comm", None)
+            if wait is not None:
+                _, recv_ms = tracer.measure_comm(wait)
+            recv_bytes = tensor_dict_nbytes(intermediate_tensors.tensors)
+
+        def _run_forward() -> (
+            ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None
+        ):
+            with self.annotate_profile(scheduler_output):
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
+            if (
+                self.use_v2_model_runner
+                and self.model_runner.is_pooling_model
+                and output is None
+            ):
+                output = self.model_runner.pool()  # type: ignore
+            return output
+
+        output, compute_ms = tracer.measure_compute(_run_forward)
+
+        send_ms: float | None = None
+        send_bytes: int | None = None
+        if isinstance(output, IntermediateTensors):
+            send_bytes = tensor_dict_nbytes(output.tensors)
+
+            def _send_and_wait() -> None:
+                handles = get_pp_group().isend_tensor_dict(
+                    output.tensors,
+                    all_gather_group=get_tp_group(),
+                    all_gather_tensors=all_gather_tensors,
+                )
+                for handle in handles:
+                    handle.wait()
+
+            _, send_ms = tracer.measure_comm(_send_and_wait)
+            tracer.record(
+                num_tokens=scheduler_output.total_num_scheduled_tokens,
+                num_reqs=len(scheduler_output.num_scheduled_tokens),
+                num_ctx_requests=details.num_ctx_requests,
+                num_ctx_tokens=details.num_ctx_tokens,
+                num_generation_requests=details.num_generation_requests,
+                num_generation_tokens=details.num_generation_tokens,
+                compute_ms=compute_ms,
+                recv_ms=recv_ms,
+                send_ms=send_ms,
+                recv_bytes=recv_bytes,
+                send_bytes=send_bytes,
+                start_layer=start_layer,
+                end_layer=end_layer,
+            )
+            return None
+
+        tracer.record(
+            num_tokens=scheduler_output.total_num_scheduled_tokens,
+            num_reqs=len(scheduler_output.num_scheduled_tokens),
+            num_ctx_requests=details.num_ctx_requests,
+            num_ctx_tokens=details.num_ctx_tokens,
+            num_generation_requests=details.num_generation_requests,
+            num_generation_tokens=details.num_generation_tokens,
+            compute_ms=compute_ms,
+            recv_ms=recv_ms,
+            send_ms=None,
+            recv_bytes=recv_bytes,
+            send_bytes=None,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+        if isinstance(output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType):
+            return output
+        raise TypeError(f"Unexpected traced PP output type: {type(output)}")
+
     @torch.inference_mode()
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
@@ -860,6 +960,11 @@ class Worker(WorkerBase):
                 tensor_dict,
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
+            )
+
+        if self._pp_stage_tracer is not None and forward_pass:
+            return self._execute_model_with_pp_trace(
+                scheduler_output, intermediate_tensors, all_gather_tensors
             )
 
         with self.annotate_profile(scheduler_output):
@@ -1146,6 +1251,10 @@ class Worker(WorkerBase):
             ensure_ec_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
+
+        if tracer := getattr(self, "_pp_stage_tracer", None):
+            tracer.close()
+            self._pp_stage_tracer = None
 
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
