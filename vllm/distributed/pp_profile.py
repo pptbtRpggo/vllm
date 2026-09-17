@@ -24,11 +24,11 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from vllm.distributed.pp_hetero import PPHeteroConfig, hetero_spec_from_text
 from vllm.distributed.pp_partition import (
     Objective,
     PPPartitionPlan,
     Workload,
+    add_cost_model_args,
     format_plan,
     load_trace_records,
     plan_from_trace_dir,
@@ -203,9 +203,6 @@ def write_profile_result(
     plan: PPPartitionPlan,
     dump_dir: str | Path,
     output_json: str | Path | None = None,
-    *,
-    compute_scale: str | None = None,
-    comm_scale: str | None = None,
 ) -> Path:
     """Write ``plan`` as JSON next to the traces (or to ``output_json``).
 
@@ -213,8 +210,6 @@ def write_profile_result(
         plan: DP result.
         dump_dir: Default parent of ``pp_partition_plan.json``.
         output_json: Optional explicit path.
-        compute_scale: Optional per-rank compute stretch recorded for serve.
-        comm_scale: Optional per-hop comm stretch recorded for serve.
 
     Returns:
         Path of the written JSON file.
@@ -226,30 +221,27 @@ def write_profile_result(
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = plan.to_dict()
-    spec = hetero_spec_from_text(compute_scale, comm_scale)
-    if spec:
-        payload["VLLM_PP_HETERO"] = spec
-    if compute_scale:
-        payload["compute_scale"] = compute_scale
-    if comm_scale:
-        payload["comm_scale"] = comm_scale
+    hetero = os.environ.get("VLLM_PP_HETERO")
+    if hetero:
+        payload["VLLM_PP_HETERO"] = hetero
+    for name in ("VLLM_PP_COMM_BANDWIDTH_GBPS", "VLLM_PP_COMM_LATENCY_MS"):
+        if value := os.environ.get(name):
+            payload[name] = value
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     logger.info("Wrote PP partition plan to %s", path)
     return path
 
 
-def format_serve_command(
-    plan: PPPartitionPlan,
-    *,
-    compute_scale: str | None = None,
-    comm_scale: str | None = None,
-) -> str:
-    """Shell snippet to re-serve with the chosen split and hetero scales."""
+def format_serve_command(plan: PPPartitionPlan) -> str:
+    """Shell snippet to re-serve with the chosen split and hetero env."""
     lines = ["Re-serve with:"]
     exports = [f"VLLM_PP_LAYER_PARTITION={plan.env_value}"]
-    spec = hetero_spec_from_text(compute_scale, comm_scale)
-    if spec:
-        exports.append(f"VLLM_PP_HETERO={spec}")
+    hetero = os.environ.get("VLLM_PP_HETERO")
+    if hetero:
+        exports.append(f"VLLM_PP_HETERO={hetero}")
+    for name in ("VLLM_PP_COMM_BANDWIDTH_GBPS", "VLLM_PP_COMM_LATENCY_MS"):
+        if value := os.environ.get(name):
+            exports.append(f"{name}={value}")
     for item in exports:
         lines.append(f"  {item} \\")
     lines.append(
@@ -311,12 +303,14 @@ def profile_pp_partition(
     num_layers: int | None = None,
     min_pp_size: int = 1,
     max_pp_size: int | None = None,
-    overlap_comm: bool = True,
+    overlap_comm: bool = False,
+    allow_wall_time_comm: bool = False,
     output_json: str | Path | None = None,
-    compute_scale: str | None = None,
-    comm_scale: str | None = None,
 ) -> PPPartitionPlan:
     """Run the profile pipeline and return the DP layer split.
+
+    Hetero emulation is ``VLLM_PP_HETERO`` only. Live runs stretch in the
+    worker; ``--skip-run`` multiplies fitted costs from the same env.
 
     Args:
         dump_dir: Trace directory. Created if missing.
@@ -338,11 +332,8 @@ def profile_pp_partition(
         min_pp_size: Smallest PP size the DP may choose.
         max_pp_size: Largest PP size the DP may choose.
         overlap_comm: Throughput DP uses max(compute, comm) when True.
+        allow_wall_time_comm: Allow legacy send wall times as approximate costs.
         output_json: Optional plan JSON path.
-        compute_scale: Per-rank compute stretch (``1,2``). Live runs export
-            it into the worker env; ``--skip-run`` multiplies fitted costs.
-        comm_scale: Per-hop comm stretch (``1,4``). Same live vs skip-run
-            split as ``compute_scale``.
 
     Returns:
         The chosen partition (also written as JSON under ``dump_dir``).
@@ -352,9 +343,7 @@ def profile_pp_partition(
         FileNotFoundError: Traces are missing after the run.
     """
     pp_size = _pipeline_parallel_size(engine_args)
-    PPHeteroConfig.from_text(compute_scale, comm_scale)
-    planner_compute_scale: str | None = None
-    planner_comm_scale: str | None = None
+    planner_hetero: str | None
     if not skip_run:
         if llm_factory is None:
             if engine_args is None:
@@ -366,6 +355,16 @@ def profile_pp_partition(
                     "pipeline_parallel_size must be > 1 to profile PP stages "
                     f"(got {pp_size})"
                 )
+            if not allow_wall_time_comm:
+                from vllm.distributed.pp_hetero import PPHeteroConfig
+
+                config = PPHeteroConfig.from_env()
+                if len(config.comm_bandwidth_gbps) < pp_size - 1:
+                    raise ValueError(
+                        "Set calibrated VLLM_PP_COMM_BANDWIDTH_GBPS for every "
+                        "PP hop before profiling, or explicitly use "
+                        "--allow-wall-time-comm for an approximate plan"
+                    )
             llm_factory = partial(_default_llm_factory, engine_args)
         elif pp_size is not None and pp_size <= 1:
             raise ValueError(
@@ -374,9 +373,6 @@ def profile_pp_partition(
             )
         dump_dir = prepare_trace_dir(dump_dir)
         clear_trace_files(dump_dir)
-        spec = hetero_spec_from_text(compute_scale, comm_scale)
-        if spec:
-            os.environ["VLLM_PP_HETERO"] = spec
         if workload is None:
             workload = build_profile_workload(
                 num_prompts=num_prompts,
@@ -393,13 +389,14 @@ def profile_pp_partition(
         finally:
             shutdown_llm(llm)
         require_complete_traces(dump_dir, pp_size=pp_size)
+        # Traces already include worker stretch; do not scale again.
+        planner_hetero = ""
     else:
         if dump_dir is None:
             raise ValueError("--trace-dir is required with --skip-run")
         dump_dir = Path(dump_dir)
         require_complete_traces(dump_dir, pp_size=pp_size)
-        planner_compute_scale = compute_scale
-        planner_comm_scale = comm_scale
+        planner_hetero = None
 
     plan = plan_from_trace_dir(
         dump_dir,
@@ -410,16 +407,10 @@ def profile_pp_partition(
         min_pp_size=min_pp_size,
         max_pp_size=max_pp_size,
         overlap_comm=overlap_comm,
-        compute_scale=planner_compute_scale,
-        comm_scale=planner_comm_scale,
+        allow_wall_time_comm=allow_wall_time_comm,
+        hetero=planner_hetero,
     )
-    write_profile_result(
-        plan,
-        dump_dir,
-        output_json=output_json,
-        compute_scale=compute_scale,
-        comm_scale=comm_scale,
-    )
+    write_profile_result(plan, dump_dir, output_json=output_json)
     logger.info("PP profile result:\n%s", format_plan(plan))
     return plan
 
@@ -478,33 +469,11 @@ def add_cli_args(parser: Any) -> Any:
         default=None,
         help="Largest PP size the DP may choose (default: traced ranks).",
     )
-    parser.add_argument(
-        "--no-overlap-comm",
-        action="store_true",
-        help="Throughput DP uses compute+comm instead of max(compute, comm).",
-    )
+    add_cost_model_args(parser)
     parser.add_argument(
         "--skip-run",
         action="store_true",
         help="Do not launch the engine; only fit+DP traces in --trace-dir.",
-    )
-    parser.add_argument(
-        "--compute-scale",
-        type=str,
-        default=None,
-        help=(
-            "Per-PP-rank compute slowdown, e.g. 1,2. Live runs stretch "
-            "workers; --skip-run multiplies fitted t_layer instead."
-        ),
-    )
-    parser.add_argument(
-        "--comm-scale",
-        type=str,
-        default=None,
-        help=(
-            "Per-hop comm slowdown rank i->i+1, e.g. 1,4. Live vs "
-            "--skip-run split matches --compute-scale."
-        ),
     )
     parser.add_argument(
         "--vocab-size",
@@ -546,10 +515,9 @@ def run_from_cli_args(args: Any) -> PPPartitionPlan:
         num_layers=args.num_layers,
         min_pp_size=args.min_pp_size,
         max_pp_size=args.max_pp_size,
-        overlap_comm=not args.no_overlap_comm,
+        overlap_comm=args.overlap_comm,
+        allow_wall_time_comm=args.allow_wall_time_comm,
         output_json=args.output_json,
-        compute_scale=args.compute_scale,
-        comm_scale=args.comm_scale,
     )
 
 
@@ -562,13 +530,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     plan = run_from_cli_args(args)
     print(format_plan(plan))
     print()
-    print(
-        format_serve_command(
-            plan,
-            compute_scale=args.compute_scale,
-            comm_scale=args.comm_scale,
-        )
-    )
+    print(format_serve_command(plan))
 
 
 if __name__ == "__main__":

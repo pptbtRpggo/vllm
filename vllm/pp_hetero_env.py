@@ -21,8 +21,6 @@ def hetero_env_requested() -> bool:
     """True when the user asked for PP hetero emulation or stage tracing."""
     return bool(
         os.environ.get("VLLM_PP_HETERO")
-        or os.environ.get("VLLM_PP_COMPUTE_SCALE")
-        or os.environ.get("VLLM_PP_COMM_SCALE")
         or os.environ.get("VLLM_PP_STAGE_TRACE")
     )
 

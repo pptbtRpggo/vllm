@@ -51,8 +51,8 @@ if TYPE_CHECKING:
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_PP_STAGE_TRACE: str | None = None
     VLLM_PP_HETERO: str | None = None
-    VLLM_PP_COMPUTE_SCALE: str | None = None
-    VLLM_PP_COMM_SCALE: str | None = None
+    VLLM_PP_COMM_BANDWIDTH_GBPS: str | None = None
+    VLLM_PP_COMM_LATENCY_MS: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = ""
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -693,9 +693,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PP_STAGE_TRACE": lambda: os.getenv("VLLM_PP_STAGE_TRACE", None),
     # Unified PP hetero emulator: "1,2" or "1,2/4" (compute[/comm]).
     "VLLM_PP_HETERO": lambda: os.getenv("VLLM_PP_HETERO", None),
-    # Legacy aliases; override the matching half of VLLM_PP_HETERO when set.
-    "VLLM_PP_COMPUTE_SCALE": lambda: os.getenv("VLLM_PP_COMPUTE_SCALE", None),
-    "VLLM_PP_COMM_SCALE": lambda: os.getenv("VLLM_PP_COMM_SCALE", None),
+    # Per-hop, per-TP-lane baseline communication model for PP hetero slowdown.
+    "VLLM_PP_COMM_BANDWIDTH_GBPS": lambda: os.getenv(
+        "VLLM_PP_COMM_BANDWIDTH_GBPS", None
+    ),
+    "VLLM_PP_COMM_LATENCY_MS": lambda: os.getenv("VLLM_PP_COMM_LATENCY_MS", None),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: int(os.getenv("VLLM_CPU_KVCACHE_SPACE", "0"))
@@ -1657,8 +1659,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PP_STAGE_TRACE",
         "VLLM_PP_HETERO",
-        "VLLM_PP_COMPUTE_SCALE",
-        "VLLM_PP_COMM_SCALE",
+        "VLLM_PP_COMM_BANDWIDTH_GBPS",
+        "VLLM_PP_COMM_LATENCY_MS",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
         "LD_LIBRARY_PATH",

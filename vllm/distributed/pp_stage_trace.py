@@ -10,10 +10,13 @@ Enabled by ``VLLM_PP_STAGE_TRACE=/path/to/dir``. Each PP rank writes
 * ``recv_ms`` / ``send_ms`` — blocking wait for the previous/next rank's
   intermediate-tensor transfer. Timed with CPU clock + device sync,
   because NCCL runs on its own stream.
+* ``send_transfer_ms`` — optional modeled link service cost from the explicit
+  bandwidth/latency baseline, including hetero slowdown but excluding waiting.
 
-When tracing is on, send is waited in the same step so each JSONL line
-is self-contained. That disables send/next-step overlap for the traced
-run; leave the env unset for production.
+Tracing additionally synchronizes the device so each JSONL line is
+self-contained. The ordinary NCCL send path in this checkout already inserts
+a wait on the compute stream; tracing adds host synchronization overhead.
+Leave the env unset for production.
 
 This is stage-level (one number per PP rank per step), not per-layer.
 """
@@ -36,14 +39,32 @@ logger = init_logger(__name__)
 T = TypeVar("T")
 
 
-def tensor_dict_nbytes(tensors: dict[str, Any] | None) -> int:
-    """Return the payload size of a PP intermediate-tensor dict."""
+def tensor_dict_nbytes(
+    tensors: dict[str, Any] | None,
+    *,
+    all_gather_size: int = 1,
+    all_gather_tensors: dict[str, bool] | None = None,
+) -> int:
+    """Return PP wire bytes, accounting for send-slice/receiver-all-gather.
+
+    The default counts the full payload. Pass the TP size and overrides used
+    by send_tensor_dict to count the bytes sent by this TP rank.
+    """
+    if all_gather_size < 1:
+        raise ValueError("all_gather_size must be >= 1")
     if not tensors:
         return 0
     total = 0
-    for value in tensors.values():
+    for key, value in tensors.items():
         if isinstance(value, torch.Tensor):
-            total += value.numel() * value.element_size()
+            numel = value.numel()
+            if all_gather_size > 1:
+                gather = numel % all_gather_size == 0
+                if all_gather_tensors:
+                    gather = all_gather_tensors.get(key, gather)
+                if gather:
+                    numel //= all_gather_size
+            total += numel * value.element_size()
     return total
 
 
@@ -80,6 +101,9 @@ class PPStageTraceRecord:
     send_ms: float | None
     recv_bytes: int | None
     send_bytes: int | None
+    send_transfer_ms: float | None = None
+    compute_scale: float = 1.0
+    comm_scale: float = 1.0
 
 
 class PPStageTracer:
@@ -169,6 +193,9 @@ class PPStageTracer:
         send_bytes: int | None,
         start_layer: int | None,
         end_layer: int | None,
+        send_transfer_ms: float | None = None,
+        compute_scale: float = 1.0,
+        comm_scale: float = 1.0,
     ) -> PPStageTraceRecord:
         rec = PPStageTraceRecord(
             step=self._step,
@@ -189,6 +216,9 @@ class PPStageTracer:
             send_ms=send_ms,
             recv_bytes=recv_bytes,
             send_bytes=send_bytes,
+            send_transfer_ms=send_transfer_ms,
+            compute_scale=compute_scale,
+            comm_scale=comm_scale,
         )
         self._fp.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
         self._fp.flush()

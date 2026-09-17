@@ -113,8 +113,13 @@ class PPAscendWorker(NPUWorker):
                 intermediate_tensors, recv_ms = tracer.measure_comm(_recv)
             else:
                 intermediate_tensors, recv_ms = time_call(_recv, _sync)
-            recv_ms = hetero.stretch_recv(pp_rank, recv_ms)
-            recv_bytes = tensor_dict_nbytes(intermediate_tensors.tensors)
+            recv_bytes = tensor_dict_nbytes(
+                intermediate_tensors.tensors,
+                all_gather_size=1 if gather is None else gather.world_size,
+            )
+            recv_ms = hetero.stretch_recv(
+                pp_rank, recv_ms, payload_bytes=recv_bytes
+            )
 
         def _run_forward():
             return self.model_runner.execute_model(
@@ -130,7 +135,10 @@ class PPAscendWorker(NPUWorker):
         send_ms: float | None = None
         send_bytes: int | None = None
         if isinstance(output, IntermediateTensors):
-            send_bytes = tensor_dict_nbytes(output.tensors)
+            send_bytes = tensor_dict_nbytes(
+                output.tensors,
+                all_gather_size=1 if gather is None else gather.world_size,
+            )
 
             def _send() -> None:
                 get_pp_group().send_tensor_dict(output.tensors, all_gather_group=gather)
@@ -139,7 +147,9 @@ class PPAscendWorker(NPUWorker):
                 _, send_ms = tracer.measure_comm(_send)
             else:
                 _, send_ms = time_call(_send, _sync)
-            send_ms = hetero.stretch_send(pp_rank, send_ms)
+            send_ms = hetero.stretch_send(
+                pp_rank, send_ms, payload_bytes=send_bytes
+            )
             if tracer is not None:
                 tracer.record(
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
@@ -155,6 +165,9 @@ class PPAscendWorker(NPUWorker):
                     send_bytes=send_bytes,
                     start_layer=start_layer,
                     end_layer=end_layer,
+                    send_transfer_ms=hetero.transfer_ms(pp_rank, send_bytes),
+                    compute_scale=hetero.compute_scale(pp_rank),
+                    comm_scale=hetero.comm_scale(pp_rank),
                 )
             kv_connector_output = getattr(output, "kv_connector_output", None)
             if not kv_connector_output:
@@ -183,6 +196,8 @@ class PPAscendWorker(NPUWorker):
                 send_bytes=None,
                 start_layer=start_layer,
                 end_layer=end_layer,
+                compute_scale=hetero.compute_scale(pp_rank),
+                comm_scale=hetero.comm_scale(pp_rank),
             )
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output

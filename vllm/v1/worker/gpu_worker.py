@@ -643,8 +643,14 @@ class Worker(WorkerBase):
                 intermediate_tensors, recv_ms = tracer.measure_comm(_recv)
             else:
                 intermediate_tensors, recv_ms = time_call(_recv, _sync)
-            recv_ms = hetero.stretch_recv(pp_rank, recv_ms)
-            recv_bytes = tensor_dict_nbytes(intermediate_tensors.tensors)
+            recv_bytes = tensor_dict_nbytes(
+                intermediate_tensors.tensors,
+                all_gather_size=get_tp_group().world_size,
+                all_gather_tensors=all_gather_tensors,
+            )
+            recv_ms = hetero.stretch_recv(
+                pp_rank, recv_ms, payload_bytes=recv_bytes
+            )
 
         def _run_forward() -> (
             ModelRunnerOutput | IntermediateTensors | None
@@ -663,7 +669,11 @@ class Worker(WorkerBase):
         send_ms: float | None = None
         send_bytes: int | None = None
         if isinstance(output, IntermediateTensors):
-            send_bytes = tensor_dict_nbytes(output.tensors)
+            send_bytes = tensor_dict_nbytes(
+                output.tensors,
+                all_gather_size=get_tp_group().world_size,
+                all_gather_tensors=all_gather_tensors,
+            )
 
             def _send() -> None:
                 get_pp_group().send_tensor_dict(
@@ -676,7 +686,9 @@ class Worker(WorkerBase):
                 _, send_ms = tracer.measure_comm(_send)
             else:
                 _, send_ms = time_call(_send, _sync)
-            send_ms = hetero.stretch_send(pp_rank, send_ms)
+            send_ms = hetero.stretch_send(
+                pp_rank, send_ms, payload_bytes=send_bytes
+            )
             if tracer is not None:
                 tracer.record(
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
@@ -692,6 +704,9 @@ class Worker(WorkerBase):
                     send_bytes=send_bytes,
                     start_layer=start_layer,
                     end_layer=end_layer,
+                    send_transfer_ms=hetero.transfer_ms(pp_rank, send_bytes),
+                    compute_scale=hetero.compute_scale(pp_rank),
+                    comm_scale=hetero.comm_scale(pp_rank),
                 )
             return None
 
@@ -710,6 +725,8 @@ class Worker(WorkerBase):
                 send_bytes=None,
                 start_layer=start_layer,
                 end_layer=end_layer,
+                compute_scale=hetero.compute_scale(pp_rank),
+                comm_scale=hetero.comm_scale(pp_rank),
             )
         if isinstance(output, (ModelRunnerOutput, NoneType)):
             return output

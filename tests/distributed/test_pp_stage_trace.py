@@ -37,6 +37,20 @@ def test_layer_range_from_runner_reads_nested_model():
     assert layer_range_from_runner(SimpleNamespace()) == (None, None)
 
 
+def test_wire_bytes_match_tp_slicing_and_sp_override():
+    tensors = {
+        "hidden_states": torch.empty(8, dtype=torch.float32),
+        "residual": torch.empty(8, dtype=torch.float32),
+        "odd": torch.empty(3, dtype=torch.float32),
+        "meta": "not a tensor",
+    }
+    assert tensor_dict_nbytes(tensors) == 76
+    assert tensor_dict_nbytes(tensors, all_gather_size=2) == 44
+    assert tensor_dict_nbytes(
+        tensors, all_gather_size=2, all_gather_tensors={"residual": False}
+    ) == 60
+
+
 def test_pp_stage_tracer_writes_jsonl(tmp_path):
     tracer = PPStageTracer(
         dump_dir=str(tmp_path),
@@ -74,6 +88,9 @@ def test_pp_stage_tracer_writes_jsonl(tmp_path):
         send_bytes=4096,
         start_layer=16,
         end_layer=32,
+        send_transfer_ms=4.0,
+        compute_scale=2.0,
+        comm_scale=4.0,
     )
     tracer.close()
 
@@ -94,3 +111,6 @@ def test_pp_stage_tracer_writes_jsonl(tmp_path):
     assert payload["send_bytes"] == 4096
     assert payload["compute_ms"] == pytest.approx(rec.compute_ms)
     assert "recv_ms" in payload and "send_ms" in payload
+    assert payload["send_transfer_ms"] == 4.0
+    assert payload["compute_scale"] == 2.0
+    assert payload["comm_scale"] == 4.0

@@ -22,7 +22,8 @@ DESCRIPTION = """Profile PP stage compute/communication, then choose
 VLLM_PP_LAYER_PARTITION via dynamic programming.
 
 Loads the model, feeds dummy prompts, writes pp_stage_pp*_tp*.jsonl traces,
-fits per-rank layer costs, and prints the optimal contiguous split.
+fits per-rank layer costs, and prints the minimum-cost contiguous split under
+the selected timing model. Memory feasibility is not checked.
 """
 
 
@@ -36,13 +37,7 @@ class PPProfileSubcommand(CLISubcommand):
         plan = run_from_cli_args(args)
         print(format_plan(plan))
         print()
-        print(
-            format_serve_command(
-                plan,
-                compute_scale=getattr(args, "compute_scale", None),
-                comm_scale=getattr(args, "comm_scale", None),
-            )
-        )
+        print(format_serve_command(plan))
 
     def validate(self, args: argparse.Namespace) -> None:
         if args.skip_run and not args.trace_dir:

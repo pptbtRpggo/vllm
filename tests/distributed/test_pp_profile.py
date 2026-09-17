@@ -11,6 +11,7 @@ import pytest
 from vllm.distributed.pp_profile import (
     build_profile_workload,
     clear_trace_files,
+    format_serve_command,
     prepare_trace_dir,
     profile_pp_partition,
     require_complete_traces,
@@ -53,6 +54,7 @@ def _rec(
         "recv_ms": None if pp_rank == 0 else 0.5,
         "compute_ms": compute_ms,
         "send_ms": send_ms,
+        "send_transfer_ms": send_ms,
         "recv_bytes": None if pp_rank == 0 else 4096,
         "send_bytes": 4096 if send_ms is not None else None,
     }
@@ -242,7 +244,8 @@ def test_shutdown_llm_calls_engine_core():
     shutdown_llm(SimpleNamespace())
 
 
-def test_write_profile_result_json(tmp_path):
+def test_write_profile_result_json(tmp_path, monkeypatch):
+    monkeypatch.delenv("VLLM_PP_HETERO", raising=False)
     _write_two_rank_traces(tmp_path)
     plan = profile_pp_partition(
         dump_dir=tmp_path,
@@ -260,7 +263,24 @@ def test_write_profile_result_json(tmp_path):
     assert plan.env_value == "16,16"
 
 
-def test_profile_skip_run_compute_scale_unbalances(tmp_path):
+def test_profile_result_preserves_link_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_PP_HETERO", "1,2/4")
+    monkeypatch.setenv("VLLM_PP_COMM_BANDWIDTH_GBPS", "8")
+    monkeypatch.setenv("VLLM_PP_COMM_LATENCY_MS", "0.5")
+    _write_two_rank_traces(tmp_path)
+    plan = profile_pp_partition(
+        dump_dir=tmp_path, skip_run=True, min_pp_size=2, max_pp_size=2
+    )
+    payload = json.loads((tmp_path / "pp_partition_plan.json").read_text())
+    assert payload["VLLM_PP_COMM_BANDWIDTH_GBPS"] == "8"
+    assert payload["VLLM_PP_COMM_LATENCY_MS"] == "0.5"
+    snippet = format_serve_command(plan)
+    assert "VLLM_PP_COMM_BANDWIDTH_GBPS=8" in snippet
+    assert "VLLM_PP_COMM_LATENCY_MS=0.5" in snippet
+
+
+def test_profile_skip_run_compute_scale_unbalances(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_PP_HETERO", "1,2")
     _write_two_rank_traces(tmp_path)
     plan = profile_pp_partition(
         dump_dir=tmp_path,
@@ -268,13 +288,12 @@ def test_profile_skip_run_compute_scale_unbalances(tmp_path):
         warmup_steps=5,
         min_pp_size=2,
         max_pp_size=2,
-        compute_scale="1,2",
         output_json=tmp_path / "scaled_plan.json",
     )
     assert sum(plan.partitions) == 32
     assert plan.partitions[0] > plan.partitions[1]
     payload = json.loads((tmp_path / "scaled_plan.json").read_text(encoding="utf-8"))
-    assert payload["compute_scale"] == "1,2"
+    assert payload["VLLM_PP_HETERO"] == "1,2"
     assert payload["VLLM_PP_LAYER_PARTITION"] == plan.env_value
 
 
@@ -294,9 +313,7 @@ def test_profile_rejects_pp1_live_run():
 
 def test_profile_live_run_sets_env_feeds_and_plans(tmp_path, monkeypatch):
     monkeypatch.delenv("VLLM_PP_STAGE_TRACE", raising=False)
-    monkeypatch.delenv("VLLM_PP_HETERO", raising=False)
-    monkeypatch.delenv("VLLM_PP_COMPUTE_SCALE", raising=False)
-    monkeypatch.delenv("VLLM_PP_COMM_SCALE", raising=False)
+    monkeypatch.setenv("VLLM_PP_HETERO", "1,2/4")
     seen: dict[str, str | None] = {}
     traces = _two_rank_recs()
     holder: dict[str, FakeLLM] = {}
@@ -322,8 +339,6 @@ def test_profile_live_run_sets_env_feeds_and_plans(tmp_path, monkeypatch):
         max_pp_size=2,
         vocab_size=32,
         seed=3,
-        compute_scale="1,2",
-        comm_scale="4",
     )
     assert Path(seen["env"] or "") == tmp_path.resolve()
     assert seen["hetero"] == "1,2/4"
@@ -339,8 +354,6 @@ def test_profile_live_run_sets_env_feeds_and_plans(tmp_path, monkeypatch):
     )
     assert payload["VLLM_PP_LAYER_PARTITION"] == "16,16"
     assert payload["VLLM_PP_HETERO"] == "1,2/4"
-    assert payload["compute_scale"] == "1,2"
-    assert payload["comm_scale"] == "4"
 
 
 def test_profile_fails_if_engine_writes_no_traces(tmp_path):
@@ -401,3 +414,14 @@ def test_live_run_ignores_stale_traces(tmp_path):
 def test_profile_requires_engine_when_not_skipping():
     with pytest.raises(ValueError, match="engine_args or llm_factory"):
         profile_pp_partition(dump_dir="unused", skip_run=False)
+
+
+def test_live_requires_link_calibration_before_loading_model(tmp_path, monkeypatch):
+    monkeypatch.delenv("VLLM_PP_HETERO", raising=False)
+    monkeypatch.delenv("VLLM_PP_COMM_BANDWIDTH_GBPS", raising=False)
+    with pytest.raises(ValueError, match="calibrated VLLM_PP_COMM_BANDWIDTH_GBPS"):
+        profile_pp_partition(
+            dump_dir=tmp_path / "not_created",
+            engine_args=SimpleNamespace(pipeline_parallel_size=2),
+        )
+    assert not (tmp_path / "not_created").exists()

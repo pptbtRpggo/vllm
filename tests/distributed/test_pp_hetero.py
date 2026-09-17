@@ -54,13 +54,17 @@ def test_stretch_after_sleeps_extra(monkeypatch):
 
 def test_hetero_config_stretch_uses_rank_and_hop(monkeypatch):
     monkeypatch.setattr("vllm.distributed.pp_hetero.time.sleep", lambda s: None)
-    cfg = PPHeteroConfig(compute_scales=(1.0, 3.0), comm_scales=(4.0,))
+    cfg = PPHeteroConfig(
+        compute_scales=(1.0, 3.0),
+        comm_scales=(4.0,),
+        comm_bandwidth_gbps=(8.0,),
+    )
     assert cfg.enabled is True
     assert cfg.stretch_compute(0, 10.0) == 10.0
     assert cfg.stretch_compute(1, 10.0) == pytest.approx(30.0)
-    assert cfg.stretch_send(0, 2.0) == pytest.approx(8.0)
-    assert cfg.stretch_recv(1, 2.0) == pytest.approx(8.0)
-    assert cfg.stretch_send(1, 2.0) == 2.0
+    assert cfg.stretch_send(0, 2.0, payload_bytes=2_000_000) == pytest.approx(8.0)
+    assert cfg.stretch_recv(1, 2.0, payload_bytes=2_000_000) == pytest.approx(8.0)
+    assert cfg.stretch_send(1, 2.0, payload_bytes=2_000_000) == 2.0
 
 
 def test_scale_rank_costs_compute_and_comm():
@@ -91,21 +95,79 @@ def test_parse_hetero_spec():
 
 def test_from_env_reads_unified_spec(monkeypatch):
     monkeypatch.setenv("VLLM_PP_HETERO", "1,2/4")
-    monkeypatch.delenv("VLLM_PP_COMPUTE_SCALE", raising=False)
-    monkeypatch.delenv("VLLM_PP_COMM_SCALE", raising=False)
+    monkeypatch.setenv("VLLM_PP_COMM_BANDWIDTH_GBPS", "8")
+    monkeypatch.setenv("VLLM_PP_COMM_LATENCY_MS", "0.5")
     cfg = PPHeteroConfig.from_env()
     assert cfg.compute_scales == (1.0, 2.0)
     assert cfg.comm_scales == (4.0,)
     assert cfg.enabled is True
+    assert cfg.comm_bandwidth_gbps == (8.0,)
+    assert cfg.comm_latency_ms == (0.5,)
 
 
-def test_from_env_legacy_aliases_override(monkeypatch):
-    monkeypatch.setenv("VLLM_PP_HETERO", "1,2/4")
-    monkeypatch.setenv("VLLM_PP_COMPUTE_SCALE", "1,3")
-    monkeypatch.delenv("VLLM_PP_COMM_SCALE", raising=False)
-    cfg = PPHeteroConfig.from_env()
-    assert cfg.compute_scales == (1.0, 3.0)
-    assert cfg.comm_scales == (4.0,)
+@pytest.mark.parametrize("wait_ms", [0.0, 100.0, 300.0])
+@pytest.mark.parametrize("endpoint", ["send", "recv"])
+def test_comm_delay_does_not_scale_peer_wait(monkeypatch, wait_ms, endpoint):
+    sleeps = []
+    monkeypatch.setattr("vllm.distributed.pp_hetero.time.sleep", sleeps.append)
+    cfg = PPHeteroConfig(comm_scales=(4,), comm_bandwidth_gbps=(8,))
+    fn = cfg.stretch_send if endpoint == "send" else cfg.stretch_recv
+    rank = 0 if endpoint == "send" else 1
+    # 1 MB at 8 Gbit/s takes 1 ms, regardless of peer readiness.
+    elapsed = fn(rank, wait_ms + 1, payload_bytes=1_000_000)
+    assert sleeps == [pytest.approx(0.003)]
+    assert elapsed == pytest.approx(wait_ms + 4)
+    assert cfg.transfer_ms(0, 1_000_000) == pytest.approx(4)
+
+
+def test_comm_delay_tracks_payload_and_hop(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("vllm.distributed.pp_hetero.time.sleep", sleeps.append)
+    cfg = PPHeteroConfig(
+        comm_scales=(4, 2), comm_bandwidth_gbps=(8, 4), comm_latency_ms=(0.5, 0)
+    )
+    assert cfg.transfer_ms(0, 1_000_000) == pytest.approx(6)
+    assert cfg.transfer_ms(1, 1_000_000) == pytest.approx(4)
+    assert cfg.transfer_ms(1, 2_000_000) == pytest.approx(8)
+    assert cfg.transfer_ms(2, 1_000_000) is None
+    assert cfg.stretch_recv(2, 102, payload_bytes=1_000_000) == pytest.approx(104)
+    assert sleeps == [pytest.approx(0.002)]
+    sleeps.clear()
+    assert cfg.stretch_send(0, 100, payload_bytes=0) == 100
+    assert sleeps == []
+
+
+def test_compute_metadata_uses_effective_slowdown():
+    cfg = PPHeteroConfig(compute_scales=(0.5,))
+    assert cfg.compute_scale(0) == 1.0
+    assert cfg.stretch_compute(0, 10) == 10
+
+
+def test_live_comm_scale_requires_explicit_baseline():
+    with pytest.raises(ValueError, match="VLLM_PP_COMM_BANDWIDTH_GBPS"):
+        PPHeteroConfig(comm_scales=(4,))
+    with pytest.raises(ValueError, match="Hop 1->2"):
+        PPHeteroConfig(comm_scales=(1, 4), comm_bandwidth_gbps=(8,))
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0, -1])
+def test_comm_bandwidth_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="bandwidth"):
+        PPHeteroConfig(comm_bandwidth_gbps=(value,))
+
+
+def test_export_env_preserves_comm_baseline(monkeypatch):
+    for name in (
+        "VLLM_PP_HETERO", "VLLM_PP_COMM_BANDWIDTH_GBPS", "VLLM_PP_COMM_LATENCY_MS"
+    ):
+        # Register an undo even when the variable was originally absent;
+        # export_env writes directly to os.environ.
+        monkeypatch.setenv(name, "")
+    cfg = PPHeteroConfig.from_text(
+        "1,2", "4", comm_bandwidth_gbps="8", comm_latency_ms="0"
+    )
+    cfg.export_env()
+    assert PPHeteroConfig.from_env() == cfg
 
 
 def test_maybe_override_swaps_npu_worker(monkeypatch):
@@ -124,8 +186,6 @@ def test_maybe_override_leaves_gpu_worker(monkeypatch):
 
 def test_maybe_override_noop_without_env(monkeypatch):
     monkeypatch.delenv("VLLM_PP_HETERO", raising=False)
-    monkeypatch.delenv("VLLM_PP_COMPUTE_SCALE", raising=False)
-    monkeypatch.delenv("VLLM_PP_COMM_SCALE", raising=False)
     monkeypatch.delenv("VLLM_PP_STAGE_TRACE", raising=False)
     cfg = type("PC", (), {"worker_cls": "vllm_ascend.worker.worker.NPUWorker"})()
     maybe_override_pp_worker(cfg)
