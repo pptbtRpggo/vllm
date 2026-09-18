@@ -22,8 +22,8 @@ DESCRIPTION = """Profile PP stage compute/communication, then choose
 VLLM_PP_LAYER_PARTITION via dynamic programming.
 
 Loads the model, feeds dummy prompts, writes pp_stage_pp*_tp*.jsonl traces,
-fits per-rank layer costs, and prints the minimum-cost contiguous split under
-the selected timing model. Memory feasibility is not checked.
+fits per-rank layer costs, and chooses a contiguous split within supplied
+per-device memory bounds. Timing-only analysis requires explicit opt-in.
 """
 
 

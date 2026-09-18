@@ -104,6 +104,7 @@ class PPStageTraceRecord:
     send_transfer_ms: float | None = None
     compute_scale: float = 1.0
     comm_scale: float = 1.0
+    tp_size: int = 1
 
 
 class PPStageTracer:
@@ -117,11 +118,13 @@ class PPStageTracer:
         device: torch.device,
         tp_rank: int = 0,
         use_cuda: bool | None = None,
+        tp_size: int = 1,
     ) -> None:
         os.makedirs(dump_dir, exist_ok=True)
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.tp_rank = tp_rank
+        self.tp_size = tp_size
         self.device = device
         self.use_cuda = (
             torch.cuda.is_available() and device.type == "cuda"
@@ -202,6 +205,7 @@ class PPStageTracer:
             ts_unix=time.time(),
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             start_layer=start_layer,
             end_layer=end_layer,
@@ -267,8 +271,10 @@ def maybe_create_pp_stage_tracer(
         )
         return None
     tp_rank = 0
+    tp_size = 1
     try:
         tp_rank = get_tp_group().rank_in_group
+        tp_size = get_tp_group().world_size
     except Exception:
         pass
     return PPStageTracer(
@@ -277,4 +283,5 @@ def maybe_create_pp_stage_tracer(
         pp_size=pp_group.world_size,
         device=device,
         tp_rank=tp_rank,
+        tp_size=tp_size,
     )

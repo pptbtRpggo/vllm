@@ -119,13 +119,15 @@ def test_replay_recorded_scales_are_not_applied_twice(tmp_path, monkeypatch):
         rec["comm_scale"] = 4 if rank == 0 else 1
         rec["send_transfer_ms"] = 4 if rank == 0 else None
         _write_rank_jsonl(tmp_path / f"pp_stage_pp{rank}_tp0.jsonl", [rec])
-    live = plan_from_trace_dir(tmp_path, hetero="", min_pp_size=2)
-    replay = plan_from_trace_dir(tmp_path, min_pp_size=2)
+    live = plan_from_trace_dir(tmp_path,
+        allow_unchecked_memory=True, hetero="", min_pp_size=2)
+    replay = plan_from_trace_dir(tmp_path, allow_unchecked_memory=True, min_pp_size=2)
     assert live == replay
     assert replay.rank_costs[0].t_comm_out_ms == 4.0
     assert replay.rank_costs[1].t_layer_ms == 2.0
 
-    changed = plan_from_trace_dir(tmp_path, hetero="1,2/8", min_pp_size=2)
+    changed = plan_from_trace_dir(tmp_path,
+        allow_unchecked_memory=True, hetero="1,2/8", min_pp_size=2)
     assert changed.rank_costs[0].t_comm_out_ms == 8.0
 
 
@@ -134,8 +136,7 @@ def test_throughput_balances_identical_ranks():
         RankCost(0, 16, t_layer_ms=1.0, t_comm_out_ms=0.1, n_steps=10),
         RankCost(1, 16, t_layer_ms=1.0, t_comm_out_ms=None, n_steps=10),
     ]
-    plan = partition_layers(
-        costs,
+    plan = partition_layers(costs, allow_unchecked_memory=True,
         objective="throughput",
         num_layers=32,
         min_pp_size=2,
@@ -150,8 +151,7 @@ def test_latency_drops_ranks_when_comm_is_expensive():
         RankCost(0, 16, t_layer_ms=1.0, t_comm_out_ms=100.0, n_steps=10),
         RankCost(1, 16, t_layer_ms=1.0, t_comm_out_ms=None, n_steps=10),
     ]
-    plan = partition_layers(
-        costs,
+    plan = partition_layers(costs, allow_unchecked_memory=True,
         objective="latency",
         num_layers=32,
         min_pp_size=1,
@@ -167,8 +167,7 @@ def test_forced_pp2_puts_more_layers_on_faster_rank():
         RankCost(0, 8, t_layer_ms=10.0, t_comm_out_ms=1.0, n_steps=10),
         RankCost(1, 24, t_layer_ms=1.0, t_comm_out_ms=None, n_steps=10),
     ]
-    plan = partition_layers(
-        costs,
+    plan = partition_layers(costs, allow_unchecked_memory=True,
         objective="throughput",
         num_layers=32,
         min_pp_size=2,
@@ -210,8 +209,7 @@ def test_plan_from_trace_dir_roundtrip(tmp_path):
     _write_rank_jsonl(tmp_path / "pp_stage_pp0_tp0.jsonl", recs0)
     _write_rank_jsonl(tmp_path / "pp_stage_pp1_tp0.jsonl", recs1)
 
-    plan = plan_from_trace_dir(
-        tmp_path,
+    plan = plan_from_trace_dir(tmp_path, allow_unchecked_memory=True,
         objective="throughput",
         warmup_steps=5,
         min_pp_size=2,
@@ -254,8 +252,7 @@ def test_plan_from_trace_dir_compute_scale_unbalances(tmp_path):
     _write_rank_jsonl(tmp_path / "pp_stage_pp0_tp0.jsonl", recs0)
     _write_rank_jsonl(tmp_path / "pp_stage_pp1_tp0.jsonl", recs1)
 
-    plan = plan_from_trace_dir(
-        tmp_path,
+    plan = plan_from_trace_dir(tmp_path, allow_unchecked_memory=True,
         objective="throughput",
         warmup_steps=5,
         min_pp_size=2,
@@ -295,8 +292,7 @@ def test_plan_from_trace_dir_comm_scale_multiplies_hop(tmp_path):
     _write_rank_jsonl(tmp_path / "pp_stage_pp0_tp0.jsonl", recs0)
     _write_rank_jsonl(tmp_path / "pp_stage_pp1_tp0.jsonl", recs1)
 
-    plan = plan_from_trace_dir(
-        tmp_path,
+    plan = plan_from_trace_dir(tmp_path, allow_unchecked_memory=True,
         objective="throughput",
         warmup_steps=5,
         min_pp_size=2,
@@ -332,7 +328,7 @@ def _simulate_blocking(compute, hops, num_batches=64):
 def test_blocking_two_stage_regression():
     # The old inbound-only objective chose 20/12 with predicted cost 20.
     costs = [RankCost(0, 16, 1, 8, 10), RankCost(1, 16, 1, None, 10)]
-    plan = partition_layers(costs, min_pp_size=2)
+    plan = partition_layers(costs, allow_unchecked_memory=True, min_pp_size=2)
     assert plan.partitions == [16, 16]
     assert plan.cost_ms == 24
     assert plan.cost_model == "blocking"
@@ -344,7 +340,8 @@ def test_blocking_two_stage_regression():
 
 def test_ideal_overlap_is_explicit_opt_in():
     costs = [RankCost(0, 16, 1, 8, 10), RankCost(1, 16, 1, None, 10)]
-    plan = partition_layers(costs, min_pp_size=2, overlap_comm=True)
+    plan = partition_layers(costs,
+        allow_unchecked_memory=True, min_pp_size=2, overlap_comm=True)
     assert plan.partitions == [16, 16]
     assert plan.cost_ms == 16
     assert plan.cost_model == "ideal_overlap"
@@ -356,7 +353,7 @@ def test_three_stages_charge_both_links_to_middle_rank():
         RankCost(1, 10, 1, 9, 10),
         RankCost(2, 10, 1, None, 10),
     ]
-    plan = partition_layers(costs, min_pp_size=3)
+    plan = partition_layers(costs, allow_unchecked_memory=True, min_pp_size=3)
     timeline = _simulate_blocking(plan.partitions, [1, 9])
     assert plan.cost_ms == timeline[-1] - timeline[-2] == 17
     assert plan.partitions[1] < plan.partitions[0]
@@ -368,10 +365,10 @@ def test_dropping_trailing_rank_removes_its_incoming_hop():
         RankCost(1, 4, 1, 100, 10),
         RankCost(2, 4, 100, None, 10),
     ]
-    plan = partition_layers(costs)
+    plan = partition_layers(costs, allow_unchecked_memory=True)
     assert plan.partitions == [6, 6]
     assert plan.cost_ms == 7
-    single = partition_layers(costs, max_pp_size=1)
+    single = partition_layers(costs, allow_unchecked_memory=True, max_pp_size=1)
     assert single.partitions == [12]
     assert single.cost_ms == 12
 
@@ -398,22 +395,24 @@ def test_blocking_dp_matches_exhaustive_event_simulation():
                 compute = [parts[r] * speeds[r] for r in range(pp_size)]
                 timeline = _simulate_blocking(compute, hops[:pp_size - 1])
                 candidates.append((timeline[-1] - timeline[-2], parts))
-        plan = partition_layers(costs, num_layers=layers)
+        plan = partition_layers(costs, allow_unchecked_memory=True, num_layers=layers)
         assert plan.cost_ms == min(c[0] for c in candidates)
         assert (plan.cost_ms, plan.partitions) in candidates
 
 
 def test_zero_communication_reduces_to_compute_balance():
     costs = [RankCost(0, 4, 1, 0, 10), RankCost(1, 4, 2, None, 10)]
-    blocking = partition_layers(costs, min_pp_size=2)
-    ideal = partition_layers(costs, min_pp_size=2, overlap_comm=True)
+    blocking = partition_layers(costs, allow_unchecked_memory=True, min_pp_size=2)
+    ideal = partition_layers(costs,
+        allow_unchecked_memory=True, min_pp_size=2, overlap_comm=True)
     assert blocking.partitions == ideal.partitions
     assert blocking.cost_ms == ideal.cost_ms
 
 
 def test_latency_counts_each_transfer_only_once():
     costs = [RankCost(0, 1, 2, 8, 10), RankCost(1, 1, 3, None, 10)]
-    plan = partition_layers(costs, objective="latency", min_pp_size=2)
+    plan = partition_layers(costs,
+        allow_unchecked_memory=True, objective="latency", min_pp_size=2)
     assert plan.cost_ms == 13
     assert plan.cost_model == "sequential"
 
@@ -456,7 +455,7 @@ def test_replay_scale_provenance_uses_the_filtered_samples(tmp_path):
     warmup["compute_scale"] = 100
     measured["compute_scale"] = 1
     _write_rank_jsonl(tmp_path / "pp_stage_pp0_tp0.jsonl", [warmup, measured])
-    plan = plan_from_trace_dir(tmp_path, hetero="2")
+    plan = plan_from_trace_dir(tmp_path, allow_unchecked_memory=True, hetero="2")
     assert plan.cost_ms == 16
     assert plan.rank_costs[0].n_steps == 1
 
@@ -469,9 +468,10 @@ def test_standalone_planner_defaults_to_blocking(tmp_path, capsys):
                    end=16 * (rank + 1), compute_ms=16,
                    send_ms=8 if rank == 0 else None)
         _write_rank_jsonl(tmp_path / f"pp_stage_pp{rank}_tp0.jsonl", [rec])
-    main([str(tmp_path), "--pp-size", "2"])
+    main([str(tmp_path), "--allow-unchecked-memory", "--pp-size", "2"])
     out = capsys.readouterr().out
     assert "cost_model=blocking" in out
     assert "predicted_cost_ms=24.0000" in out
-    main([str(tmp_path), "--pp-size", "2", "--overlap-comm"])
+    main(
+        [str(tmp_path), "--allow-unchecked-memory", "--pp-size", "2", "--overlap-comm"])
     assert "predicted_cost_ms=16.0000" in capsys.readouterr().out

@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from vllm.distributed.pp_hetero import parse_hetero_spec, scale_at
+from vllm.distributed.pp_memory import PPMemoryProfile, resolve_memory_profile
 
 Objective = Literal["latency", "throughput"]
 Workload = Literal["all", "decode", "prefill"]
@@ -69,6 +70,7 @@ class PPPartitionPlan:
     cost_ms: float
     rank_costs: list[RankCost]
     overlap_comm: bool = False
+    memory_profile: PPMemoryProfile | None = None
 
     @property
     def cost_model(self) -> str:
@@ -93,7 +95,17 @@ class PPPartitionPlan:
                 "steady_state_cycle_ms"
                 if self.objective == "throughput" else "sequential_latency_ms"
             ),
-            "memory_feasibility_checked": False,
+            "memory_feasibility_checked": self.memory_profile is not None,
+            "memory_feasibility_basis": (
+                "supplied_memory_bounds" if self.memory_profile else "unchecked"
+            ),
+            "memory_profile": (
+                self.memory_profile.to_dict() if self.memory_profile else None
+            ),
+            "memory_usage": (
+                self.memory_profile.plan_usage(self.partitions)
+                if self.memory_profile else []
+            ),
             "predicted_cost_ms": self.cost_ms,
             "pp_size": self.pp_size,
             "VLLM_PP_LAYER_PARTITION": self.env_value,
@@ -317,11 +329,15 @@ def partition_layers(
     min_pp_size: int = 1,
     max_pp_size: int | None = None,
     overlap_comm: bool = False,
+    memory_profile: PPMemoryProfile | None = None,
+    allow_unchecked_memory: bool = False,
 ) -> PPPartitionPlan:
     """DP over contiguous layer counts on a fixed PP rank order.
 
     Rank 0 is always the source. Using ``pp_size < len(costs)`` drops trailing
-    ranks; it does not reorder devices or check memory feasibility.
+    ranks; it does not reorder devices. Every candidate is checked against
+    all TP devices in the supplied memory profile before entering the DP.
+    Missing memory bounds require explicit timing-only opt-in.
 
     The blocking model assumes identical independent batches, enough in-flight
     work, and rendezvous transfers occupying both endpoints. Each rank performs
@@ -345,6 +361,11 @@ def partition_layers(
     n_layers = num_layers if num_layers is not None else sum(c.n_layers for c in costs)
     if n_layers < 1:
         raise ValueError("num_layers must be >= 1")
+    memory_profile = resolve_memory_profile(
+        memory_profile, None, allow_unchecked_memory=allow_unchecked_memory
+    )
+    if memory_profile is not None:
+        memory_profile.validate_dimensions(n_layers, n_ranks)
     max_pp = n_ranks if max_pp_size is None else min(max_pp_size, n_ranks)
     min_pp = max(1, min_pp_size)
     if min_pp > max_pp:
@@ -367,6 +388,12 @@ def partition_layers(
             incoming, outgoing = hops[r - 1], hops[r]
             for i in range(r, n_layers + 1):
                 for k in range(r - 1, i):
+                    if not math.isfinite(dp[k][r - 1]):
+                        continue
+                    if memory_profile is not None and not memory_profile.fits(
+                        r - 1, k, i, pp_size
+                    ):
+                        continue
                     compute = _compute_ms(costs, r - 1, i - k)
                     if objective == "latency":
                         # A link is counted once along the sequential path.
@@ -398,8 +425,14 @@ def partition_layers(
             cost_ms=float(dp[n_layers][pp_size]),
             rank_costs=list(costs[:pp_size]),
             overlap_comm=overlap_comm,
+            memory_profile=memory_profile,
         )
     if best_plan is None:
+        if memory_profile is not None:
+            raise ValueError(
+                "No memory-feasible partition within the requested PP size range; "
+                "check per-device budgets, layer/KV costs and endpoint reserves"
+            )
         raise ValueError("DP failed to find a finite partition")
     return best_plan
 
@@ -415,6 +448,8 @@ def plan_from_trace_dir(
     max_pp_size: int | None = None,
     overlap_comm: bool = False,
     allow_wall_time_comm: bool = False,
+    memory_profile: PPMemoryProfile | str | Path | None = None,
+    allow_unchecked_memory: bool = False,
     hetero: str | None = None,
 ) -> PPPartitionPlan:
     records = load_trace_records(dump_dir)
@@ -457,6 +492,16 @@ def plan_from_trace_dir(
         compute_scales=compute,
         comm_scales=comm,
     )
+    memory_profile = resolve_memory_profile(
+        memory_profile, dump_dir, allow_unchecked_memory=allow_unchecked_memory
+    )
+    if memory_profile is not None:
+        trace_tp_sizes = {
+            rec["tp_size"] for rows in records.values()
+            for rec in rows if "tp_size" in rec
+        }
+        if trace_tp_sizes and trace_tp_sizes != {memory_profile.tp_size}:
+            raise ValueError("memory profile TP size does not match timing traces")
     return partition_layers(
         costs,
         objective=objective,
@@ -464,6 +509,8 @@ def plan_from_trace_dir(
         min_pp_size=min_pp_size,
         max_pp_size=max_pp_size,
         overlap_comm=overlap_comm,
+        memory_profile=memory_profile,
+        allow_unchecked_memory=allow_unchecked_memory,
     )
 
 
@@ -474,7 +521,7 @@ def format_plan(plan: PPPartitionPlan) -> str:
         f"predicted_cost_ms={plan.cost_ms:.4f}",
         f"pp_size={plan.pp_size}",
         f"VLLM_PP_LAYER_PARTITION={plan.env_value}",
-        "memory_feasibility_checked=False",
+        f"memory_feasibility_checked={plan.memory_profile is not None}",
         "rank t_layer_ms n_layers_selected t_comm_out_ms steps comm_source",
     ]
     for cost, n in zip(plan.rank_costs, plan.partitions):
@@ -483,10 +530,30 @@ def format_plan(plan: PPPartitionPlan) -> str:
             f"  {cost.pp_rank} {cost.t_layer_ms:.4f} {n} {comm} "
             f"{cost.n_steps} {cost.comm_source}"
         )
+    if plan.memory_profile is not None:
+        lines.append("memory bounds (bytes): pp_rank tp_rank required budget headroom")
+        for usage in plan.memory_profile.plan_usage(plan.partitions):
+            lines.append(
+                f"  {usage['pp_rank']} {usage['tp_rank']} "
+                f"{usage['required_bytes']} {usage['budget_bytes']} "
+                f"{usage['headroom_bytes']}"
+            )
     return "\n".join(lines)
 
 
 def add_cost_model_args(parser: Any) -> None:
+    parser.add_argument(
+        "--memory-profile",
+        help=(
+            "Target serving memory bounds JSON "
+            "(default: trace-dir/pp_memory_profile.json)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-unchecked-memory",
+        action="store_true",
+        help="Explicit timing-only analysis without memory bounds; no deployable plan.",
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--overlap-comm",
@@ -557,6 +624,8 @@ def main(argv: Iterable[str] | None = None) -> None:
         max_pp_size=max_pp,
         overlap_comm=args.overlap_comm,
         allow_wall_time_comm=args.allow_wall_time_comm,
+        memory_profile=args.memory_profile,
+        allow_unchecked_memory=args.allow_unchecked_memory,
     )
     print(format_plan(plan))
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import shlex
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from vllm.distributed.pp_memory import PPMemoryProfile, resolve_memory_profile
 from vllm.distributed.pp_partition import (
     Objective,
     PPPartitionPlan,
@@ -228,12 +230,23 @@ def write_profile_result(
         if value := os.environ.get(name):
             payload[name] = value
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    if plan.memory_profile is not None:
+        memory_path = Path(dump_dir) / "pp_memory_profile.json"
+        memory_path.write_text(
+            json.dumps(plan.memory_profile.to_dict(), indent=2) + "\n",
+            encoding="utf-8",
+        )
     logger.info("Wrote PP partition plan to %s", path)
     return path
 
 
 def format_serve_command(plan: PPPartitionPlan) -> str:
     """Shell snippet to re-serve with the chosen split and hetero env."""
+    if plan.memory_profile is None:
+        return (
+            "Timing-only candidate: memory feasibility was not checked. "
+            "Supply --memory-profile before generating a serve command."
+        )
     lines = ["Re-serve with:"]
     exports = [f"VLLM_PP_LAYER_PARTITION={plan.env_value}"]
     hetero = os.environ.get("VLLM_PP_HETERO")
@@ -243,9 +256,20 @@ def format_serve_command(plan: PPPartitionPlan) -> str:
         if value := os.environ.get(name):
             exports.append(f"{name}={value}")
     for item in exports:
-        lines.append(f"  {item} \\")
+        name, value = item.split("=", 1)
+        lines.append(f"  {name}={shlex.quote(value)} \\")
+    scope = plan.memory_profile.serving_config
+    command = [
+        "vllm", "serve", scope["model"],
+        "--pipeline-parallel-size", str(plan.pp_size),
+        "--tensor-parallel-size", str(plan.memory_profile.tp_size),
+    ]
+    for key, value in scope.items():
+        if key != "model" and value is not None:
+            command.extend(["--" + key.replace("_", "-"), str(value)])
+    lines.append("    " + shlex.join(command))
     lines.append(
-        f"    vllm serve <model> --pipeline-parallel-size {plan.pp_size}"
+        "Use the same device budgets and runtime settings as the memory profile."
     )
     return "\n".join(lines)
 
@@ -305,6 +329,8 @@ def profile_pp_partition(
     max_pp_size: int | None = None,
     overlap_comm: bool = False,
     allow_wall_time_comm: bool = False,
+    memory_profile: PPMemoryProfile | str | Path | None = None,
+    allow_unchecked_memory: bool = False,
     output_json: str | Path | None = None,
 ) -> PPPartitionPlan:
     """Run the profile pipeline and return the DP layer split.
@@ -333,6 +359,8 @@ def profile_pp_partition(
         max_pp_size: Largest PP size the DP may choose.
         overlap_comm: Throughput DP uses max(compute, comm) when True.
         allow_wall_time_comm: Allow legacy send wall times as approximate costs.
+        memory_profile: Explicit target serving memory bounds, or sidecar JSON.
+        allow_unchecked_memory: Permit timing-only analysis without bounds.
         output_json: Optional plan JSON path.
 
     Returns:
@@ -343,6 +371,9 @@ def profile_pp_partition(
         FileNotFoundError: Traces are missing after the run.
     """
     pp_size = _pipeline_parallel_size(engine_args)
+    memory_profile = resolve_memory_profile(
+        memory_profile, dump_dir, allow_unchecked_memory=allow_unchecked_memory
+    )
     planner_hetero: str | None
     if not skip_run:
         if llm_factory is None:
@@ -385,6 +416,13 @@ def profile_pp_partition(
             )
         llm = llm_factory()
         try:
+            if memory_profile is not None:
+                config = getattr(getattr(llm, "llm_engine", None), "vllm_config", None)
+                if config is None:
+                    raise ValueError(
+                        "cannot validate memory profile: missing engine config"
+                    )
+                memory_profile.validate_engine_config(config)
             run_traced_generate(llm, workload)
         finally:
             shutdown_llm(llm)
@@ -408,6 +446,8 @@ def profile_pp_partition(
         max_pp_size=max_pp_size,
         overlap_comm=overlap_comm,
         allow_wall_time_comm=allow_wall_time_comm,
+        memory_profile=memory_profile,
+        allow_unchecked_memory=allow_unchecked_memory,
         hetero=planner_hetero,
     )
     write_profile_result(plan, dump_dir, output_json=output_json)
@@ -517,6 +557,8 @@ def run_from_cli_args(args: Any) -> PPPartitionPlan:
         max_pp_size=args.max_pp_size,
         overlap_comm=args.overlap_comm,
         allow_wall_time_comm=args.allow_wall_time_comm,
+        memory_profile=args.memory_profile,
+        allow_unchecked_memory=args.allow_unchecked_memory,
         output_json=args.output_json,
     )
 

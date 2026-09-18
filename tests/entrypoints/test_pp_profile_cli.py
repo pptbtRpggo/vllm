@@ -88,7 +88,7 @@ def test_cmd_init_returns_subcommand():
 def test_parse_skip_run_and_profile_knobs(pp_profile_parser):
     args = pp_profile_parser.parse_args(
         [
-            "pp-profile",
+            "pp-profile", "--allow-unchecked-memory",
             "--skip-run",
             "--trace-dir",
             "/tmp/traces",
@@ -116,7 +116,7 @@ def test_parse_skip_run_and_profile_knobs(pp_profile_parser):
 def test_parse_model_tag_and_pp_size(pp_profile_parser):
     args = pp_profile_parser.parse_args(
         [
-            "pp-profile",
+            "pp-profile", "--allow-unchecked-memory",
             "facebook/opt-125m",
             "--pipeline-parallel-size",
             "4",
@@ -128,13 +128,15 @@ def test_parse_model_tag_and_pp_size(pp_profile_parser):
 
 
 def test_validate_skip_run_requires_trace_dir(pp_profile_parser):
-    args = pp_profile_parser.parse_args(["pp-profile", "--skip-run"])
+    args = pp_profile_parser.parse_args(
+        ["pp-profile", "--allow-unchecked-memory", "--skip-run"])
     with pytest.raises(ValueError, match="trace-dir"):
         PPProfileSubcommand().validate(args)
 
 
 def test_validate_live_run_requires_pp_gt_1(pp_profile_parser):
-    args = pp_profile_parser.parse_args(["pp-profile", "some-model"])
+    args = pp_profile_parser.parse_args(
+        ["pp-profile", "--allow-unchecked-memory", "some-model"])
     with pytest.raises(ValueError, match="pipeline-parallel-size"):
         PPProfileSubcommand().validate(args)
 
@@ -146,7 +148,7 @@ def test_cmd_skip_run_prints_partition(
     _write_two_rank_traces(tmp_path)
     args = pp_profile_parser.parse_args(
         [
-            "pp-profile",
+            "pp-profile", "--allow-unchecked-memory",
             "--skip-run",
             "--trace-dir",
             str(tmp_path),
@@ -175,7 +177,7 @@ def test_cmd_skip_run_hetero_env_prints_env(
     _write_two_rank_traces(tmp_path)
     args = pp_profile_parser.parse_args(
         [
-            "pp-profile",
+            "pp-profile", "--allow-unchecked-memory",
             "--skip-run",
             "--trace-dir",
             str(tmp_path),
@@ -190,7 +192,7 @@ def test_cmd_skip_run_hetero_env_prints_env(
     PPProfileSubcommand().validate(args)
     PPProfileSubcommand.cmd(args)
     out = capsys.readouterr().out
-    assert "VLLM_PP_HETERO=1,2" in out
+    assert "memory feasibility was not checked" in out
     payload = json.loads(
         (tmp_path / "pp_partition_plan.json").read_text(encoding="utf-8")
     )
@@ -216,7 +218,8 @@ def test_cli_main_registers_pp_profile():
 ])
 def test_cost_model_flags_reach_planner(pp_profile_parser, tmp_path, flag, model, cost):
     _write_two_rank_traces(tmp_path)
-    argv = ["pp-profile", "--skip-run", "--trace-dir", str(tmp_path),
+    argv = [
+        "pp-profile", "--allow-unchecked-memory", "--skip-run", "--trace-dir", str(tmp_path),
             "--min-pp-size", "2", "--max-pp-size", "2"]
     if flag:
         argv.append(flag)
@@ -234,7 +237,8 @@ def test_legacy_trace_cli_requires_explicit_approximation(pp_profile_parser, tmp
         for rec in recs:
             rec.pop("send_transfer_ms")
         path.write_text("".join(json.dumps(rec) + "\n" for rec in recs))
-    argv = ["pp-profile", "--skip-run", "--trace-dir", str(tmp_path),
+    argv = [
+        "pp-profile", "--allow-unchecked-memory", "--skip-run", "--trace-dir", str(tmp_path),
             "--min-pp-size", "2", "--max-pp-size", "2"]
     with pytest.raises(ValueError, match="includes peer waiting"):
         PPProfileSubcommand.cmd(pp_profile_parser.parse_args(argv))

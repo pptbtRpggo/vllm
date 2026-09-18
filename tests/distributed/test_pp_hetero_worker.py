@@ -89,7 +89,8 @@ def test_worker_comm_delay_excludes_peer_wait(
         return None if rank == 2 else IntermediateTensors(payload)
 
     tracer = (
-        PPStageTracer(str(tmp_path), rank, 3, torch.device("cpu")) if tracing else None
+        PPStageTracer(str(tmp_path), rank, 3, torch.device("cpu"), tp_size=2)
+        if tracing else None
     )
     worker = object.__new__(worker_cls)
     worker.device = torch.device("cpu")

@@ -247,7 +247,7 @@ def test_shutdown_llm_calls_engine_core():
 def test_write_profile_result_json(tmp_path, monkeypatch):
     monkeypatch.delenv("VLLM_PP_HETERO", raising=False)
     _write_two_rank_traces(tmp_path)
-    plan = profile_pp_partition(
+    plan = profile_pp_partition(allow_unchecked_memory=True,
         dump_dir=tmp_path,
         skip_run=True,
         warmup_steps=5,
@@ -268,21 +268,21 @@ def test_profile_result_preserves_link_model(tmp_path, monkeypatch):
     monkeypatch.setenv("VLLM_PP_COMM_BANDWIDTH_GBPS", "8")
     monkeypatch.setenv("VLLM_PP_COMM_LATENCY_MS", "0.5")
     _write_two_rank_traces(tmp_path)
-    plan = profile_pp_partition(
+    plan = profile_pp_partition(allow_unchecked_memory=True,
         dump_dir=tmp_path, skip_run=True, min_pp_size=2, max_pp_size=2
     )
     payload = json.loads((tmp_path / "pp_partition_plan.json").read_text())
     assert payload["VLLM_PP_COMM_BANDWIDTH_GBPS"] == "8"
     assert payload["VLLM_PP_COMM_LATENCY_MS"] == "0.5"
     snippet = format_serve_command(plan)
-    assert "VLLM_PP_COMM_BANDWIDTH_GBPS=8" in snippet
-    assert "VLLM_PP_COMM_LATENCY_MS=0.5" in snippet
+    assert "memory feasibility was not checked" in snippet
+    assert "vllm serve" not in snippet
 
 
 def test_profile_skip_run_compute_scale_unbalances(tmp_path, monkeypatch):
     monkeypatch.setenv("VLLM_PP_HETERO", "1,2")
     _write_two_rank_traces(tmp_path)
-    plan = profile_pp_partition(
+    plan = profile_pp_partition(allow_unchecked_memory=True,
         dump_dir=tmp_path,
         skip_run=True,
         warmup_steps=5,
@@ -299,12 +299,12 @@ def test_profile_skip_run_compute_scale_unbalances(tmp_path, monkeypatch):
 
 def test_profile_skip_run_requires_trace_dir():
     with pytest.raises(ValueError, match="trace-dir"):
-        profile_pp_partition(skip_run=True)
+        profile_pp_partition(allow_unchecked_memory=True, skip_run=True)
 
 
 def test_profile_rejects_pp1_live_run():
     with pytest.raises(ValueError, match="pipeline_parallel_size"):
-        profile_pp_partition(
+        profile_pp_partition(allow_unchecked_memory=True,
             dump_dir="unused",
             engine_args=SimpleNamespace(pipeline_parallel_size=1),
             llm_factory=lambda: None,
@@ -325,7 +325,7 @@ def test_profile_live_run_sets_env_feeds_and_plans(tmp_path, monkeypatch):
         holder["llm"] = llm
         return llm
 
-    plan = profile_pp_partition(
+    plan = profile_pp_partition(allow_unchecked_memory=True,
         dump_dir=tmp_path,
         llm_factory=factory,
         engine_args=SimpleNamespace(pipeline_parallel_size=2),
@@ -359,7 +359,7 @@ def test_profile_live_run_sets_env_feeds_and_plans(tmp_path, monkeypatch):
 def test_profile_fails_if_engine_writes_no_traces(tmp_path):
     llm = FakeLLM(tmp_path, {}, write_traces=False)
     with pytest.raises(FileNotFoundError):
-        profile_pp_partition(
+        profile_pp_partition(allow_unchecked_memory=True,
             dump_dir=tmp_path,
             llm_factory=lambda: llm,
             engine_args=SimpleNamespace(pipeline_parallel_size=2),
@@ -380,7 +380,7 @@ def test_profile_shutdown_runs_when_generate_raises(tmp_path):
 
     llm = BoomLLM(tmp_path, {}, write_traces=False)
     with pytest.raises(RuntimeError, match="generate failed"):
-        profile_pp_partition(
+        profile_pp_partition(allow_unchecked_memory=True,
             dump_dir=tmp_path,
             llm_factory=lambda: llm,
             engine_args=SimpleNamespace(pipeline_parallel_size=2),
@@ -398,7 +398,7 @@ def test_live_run_ignores_stale_traces(tmp_path):
     _write_two_rank_traces(tmp_path)
     llm = FakeLLM(tmp_path, {}, write_traces=False)
     with pytest.raises(FileNotFoundError):
-        profile_pp_partition(
+        profile_pp_partition(allow_unchecked_memory=True,
             dump_dir=tmp_path,
             llm_factory=lambda: llm,
             engine_args=SimpleNamespace(pipeline_parallel_size=2),
@@ -413,14 +413,15 @@ def test_live_run_ignores_stale_traces(tmp_path):
 
 def test_profile_requires_engine_when_not_skipping():
     with pytest.raises(ValueError, match="engine_args or llm_factory"):
-        profile_pp_partition(dump_dir="unused", skip_run=False)
+        profile_pp_partition(
+            allow_unchecked_memory=True, dump_dir="unused", skip_run=False)
 
 
 def test_live_requires_link_calibration_before_loading_model(tmp_path, monkeypatch):
     monkeypatch.delenv("VLLM_PP_HETERO", raising=False)
     monkeypatch.delenv("VLLM_PP_COMM_BANDWIDTH_GBPS", raising=False)
     with pytest.raises(ValueError, match="calibrated VLLM_PP_COMM_BANDWIDTH_GBPS"):
-        profile_pp_partition(
+        profile_pp_partition(allow_unchecked_memory=True,
             dump_dir=tmp_path / "not_created",
             engine_args=SimpleNamespace(pipeline_parallel_size=2),
         )
