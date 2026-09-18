@@ -196,6 +196,8 @@ AGENTS.md
 
 # Results
 *.csv
+/output/
+/tau_batch*
 
 # Python pickle files
 *.pkl
