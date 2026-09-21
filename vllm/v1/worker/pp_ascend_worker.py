@@ -17,7 +17,9 @@ from vllm_ascend.utils import enable_sp
 from vllm_ascend.worker.worker import NPUWorker
 
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.pp_batch_shape import scheduled_batch_id, scheduled_batch_shape
 from vllm.distributed.pp_hetero import PPHeteroConfig, sync_torch_device, time_call
+from vllm.distributed.pp_link_profile import profile_worker_links, tensor_spec
 from vllm.distributed.pp_stage_trace import (
     PPStageTracer,
     layer_range_from_runner,
@@ -37,23 +39,6 @@ if TYPE_CHECKING:
 
 def _all_gather_group():
     return None if enable_sp() else get_tp_group()
-
-
-def _token_mix(scheduler_output: SchedulerOutput) -> tuple[int, int, int, int]:
-    new_ids = {req.req_id for req in scheduler_output.scheduled_new_reqs}
-    num_ctx_tokens = 0
-    num_gen_tokens = 0
-    for req_id, ntok in scheduler_output.num_scheduled_tokens.items():
-        if req_id in new_ids:
-            num_ctx_tokens += ntok
-        else:
-            num_gen_tokens += ntok
-    return (
-        len(new_ids),
-        num_ctx_tokens,
-        len(scheduler_output.num_scheduled_tokens) - len(new_ids),
-        num_gen_tokens,
-    )
 
 
 class PPAscendWorker(NPUWorker):
@@ -85,6 +70,18 @@ class PPAscendWorker(NPUWorker):
             return super().execute_model(scheduler_output)
         return self._execute_model_with_pp_trace(scheduler_output, tracer, hetero)
 
+    def get_pp_memory_observation(self) -> dict:
+        from vllm.distributed.pp_memory import observe_worker_memory
+
+        return observe_worker_memory(self)
+
+    def profile_pp_links(self, warmup: int = 3, repeats: int = 10) -> None:
+        profile_worker_links(self, warmup, repeats)
+
+    def set_pp_profile_warmup(self, enabled: bool) -> None:
+        if tracer := getattr(self, "_pp_stage_tracer", None):
+            tracer.is_warmup = enabled
+
     def _execute_model_with_pp_trace(
         self,
         scheduler_output: SchedulerOutput,
@@ -92,12 +89,18 @@ class PPAscendWorker(NPUWorker):
         hetero: PPHeteroConfig,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         start_layer, end_layer = layer_range_from_runner(self.model_runner)
-        n_ctx_req, n_ctx_tok, n_gen_req, n_gen_tok = _token_mix(scheduler_output)
+        batch = (
+            scheduled_batch_shape(scheduler_output, self.model_runner)
+            if tracer is not None
+            else {}
+        )
         gather = _all_gather_group()
         pp_rank = get_pp_group().rank_in_group
 
         def _sync() -> None:
             sync_torch_device(self.device)
+
+        batch_id = scheduled_batch_id(scheduler_output) if tracer is not None else None
 
         recv_ms: float | None = None
         recv_bytes: int | None = None
@@ -110,16 +113,14 @@ class PPAscendWorker(NPUWorker):
                 )
 
             if tracer is not None:
-                intermediate_tensors, recv_ms = tracer.measure_comm(_recv)
+                intermediate_tensors, recv_ms = tracer.measure_comm(_recv, kind="recv")
             else:
                 intermediate_tensors, recv_ms = time_call(_recv, _sync)
             recv_bytes = tensor_dict_nbytes(
                 intermediate_tensors.tensors,
                 all_gather_size=1 if gather is None else gather.world_size,
             )
-            recv_ms = hetero.stretch_recv(
-                pp_rank, recv_ms, payload_bytes=recv_bytes
-            )
+            recv_ms = hetero.stretch_recv(pp_rank, recv_ms, payload_bytes=recv_bytes)
 
         def _run_forward():
             return self.model_runner.execute_model(
@@ -127,10 +128,12 @@ class PPAscendWorker(NPUWorker):
             )
 
         if tracer is not None:
-            output, compute_ms = tracer.measure_compute(_run_forward)
+            output, compute_timing = tracer.measure_stretched_compute(
+                _run_forward, lambda ms: hetero.stretch_compute(pp_rank, ms)
+            )
         else:
             output, compute_ms = time_call(_run_forward, _sync)
-        compute_ms = hetero.stretch_compute(pp_rank, compute_ms)
+            hetero.stretch_compute(pp_rank, compute_ms)
 
         send_ms: float | None = None
         send_bytes: int | None = None
@@ -144,28 +147,24 @@ class PPAscendWorker(NPUWorker):
                 get_pp_group().send_tensor_dict(output.tensors, all_gather_group=gather)
 
             if tracer is not None:
-                _, send_ms = tracer.measure_comm(_send)
+                _, send_ms = tracer.measure_comm(_send, kind="send")
             else:
                 _, send_ms = time_call(_send, _sync)
-            send_ms = hetero.stretch_send(
-                pp_rank, send_ms, payload_bytes=send_bytes
-            )
+            send_ms = hetero.stretch_send(pp_rank, send_ms, payload_bytes=send_bytes)
             if tracer is not None:
                 tracer.record(
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
                     num_reqs=len(scheduler_output.num_scheduled_tokens),
-                    num_ctx_requests=n_ctx_req,
-                    num_ctx_tokens=n_ctx_tok,
-                    num_generation_requests=n_gen_req,
-                    num_generation_tokens=n_gen_tok,
-                    compute_ms=compute_ms,
+                    **batch,
+                    batch_id=batch_id,
+                    **compute_timing,
                     recv_ms=recv_ms,
                     send_ms=send_ms,
                     recv_bytes=recv_bytes,
                     send_bytes=send_bytes,
                     start_layer=start_layer,
                     end_layer=end_layer,
-                    send_transfer_ms=hetero.transfer_ms(pp_rank, send_bytes),
+                    send_tensor_spec=tensor_spec(output.tensors),
                     compute_scale=hetero.compute_scale(pp_rank),
                     comm_scale=hetero.comm_scale(pp_rank),
                 )
@@ -185,11 +184,9 @@ class PPAscendWorker(NPUWorker):
             tracer.record(
                 num_tokens=scheduler_output.total_num_scheduled_tokens,
                 num_reqs=len(scheduler_output.num_scheduled_tokens),
-                num_ctx_requests=n_ctx_req,
-                num_ctx_tokens=n_ctx_tok,
-                num_generation_requests=n_gen_req,
-                num_generation_tokens=n_gen_tok,
-                compute_ms=compute_ms,
+                **batch,
+                batch_id=batch_id,
+                **compute_timing,
                 recv_ms=recv_ms,
                 send_ms=None,
                 recv_bytes=recv_bytes,

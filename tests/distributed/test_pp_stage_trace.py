@@ -71,8 +71,8 @@ def test_pp_stage_tracer_writes_jsonl(tmp_path):
     assert result == sum(range(1000))
     assert compute_ms >= 0.0
 
-    _, recv_ms = tracer.measure_comm(lambda: None)
-    _, send_ms = tracer.measure_comm(lambda: None)
+    _, recv_ms = tracer.measure_comm(lambda: None, kind="recv")
+    _, send_ms = tracer.measure_comm(lambda: None, kind="send")
 
     rec = tracer.record(
         num_tokens=32,
@@ -88,7 +88,6 @@ def test_pp_stage_tracer_writes_jsonl(tmp_path):
         send_bytes=4096,
         start_layer=16,
         end_layer=32,
-        send_transfer_ms=4.0,
         compute_scale=2.0,
         comm_scale=4.0,
     )
@@ -111,6 +110,39 @@ def test_pp_stage_tracer_writes_jsonl(tmp_path):
     assert payload["send_bytes"] == 4096
     assert payload["compute_ms"] == pytest.approx(rec.compute_ms)
     assert "recv_ms" in payload and "send_ms" in payload
-    assert payload["send_transfer_ms"] == 4.0
+    assert payload["recv_start_ns"] < payload["recv_end_ns"]
+    assert payload["send_start_ns"] < payload["send_end_ns"]
+    assert tracer._comm_windows == {}
+    assert "send_transfer_ms" not in payload
     assert payload["compute_scale"] == 2.0
     assert payload["comm_scale"] == 4.0
+
+
+def test_compute_wall_time_measures_sleep_overshoot(tmp_path, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(
+        "vllm.distributed.pp_stage_trace.time.perf_counter", lambda: clock[0]
+    )
+    tracer = PPStageTracer(str(tmp_path), 0, 2, torch.device("cpu"))
+
+    def compute():
+        clock[0] += 0.010
+        return "result"
+
+    def stretch(ms):
+        clock[0] += 0.012  # Requested 10ms sleep, actual completion after 12ms.
+        return ms * 2
+
+    try:
+        output, timing = tracer.measure_stretched_compute(compute, stretch)
+        assert output == "result"
+        assert timing == pytest.approx(
+            dict(
+                compute_ms=20,
+                compute_base_ms=10,
+                compute_wall_ms=22,
+                compute_delay_ms=12,
+            )
+        )
+    finally:
+        tracer.close()

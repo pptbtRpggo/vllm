@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.distributed.pp_trace_fixtures import write_fit_profile, write_trace
 from vllm.distributed.pp_profile import (
     build_profile_workload,
     clear_trace_files,
@@ -21,10 +22,7 @@ from vllm.distributed.pp_profile import (
 
 
 def _write_rank_jsonl(path: Path, recs: list[dict]) -> None:
-    path.write_text(
-        "".join(json.dumps(rec) + "\n" for rec in recs),
-        encoding="utf-8",
-    )
+    write_trace(path, recs)
 
 
 def _rec(
@@ -46,6 +44,7 @@ def _rec(
         "start_layer": start,
         "end_layer": end,
         "num_tokens": 8,
+        "batch_shape": [dict(query_tokens=8, context_tokens=16, prompt_tokens=0)],
         "num_reqs": 1,
         "num_ctx_requests": 0,
         "num_ctx_tokens": 0,
@@ -53,8 +52,11 @@ def _rec(
         "num_generation_tokens": 8,
         "recv_ms": None if pp_rank == 0 else 0.5,
         "compute_ms": compute_ms,
+        "compute_wall_ms": compute_ms,
         "send_ms": send_ms,
-        "send_transfer_ms": send_ms,
+        "send_transfer_ms": 99999,
+        "send_service_ms": send_ms,
+        "send_service_source": "measured_idle_replay",
         "recv_bytes": None if pp_rank == 0 else 4096,
         "send_bytes": 4096 if send_ms is not None else None,
     }
@@ -92,6 +94,7 @@ def _write_two_rank_traces(dump_dir: Path, recs: dict[int, list[dict]] | None = 
     recs = recs or _two_rank_recs()
     for rank, rows in recs.items():
         _write_rank_jsonl(dump_dir / f"pp_stage_pp{rank}_tp0.jsonl", rows)
+    write_fit_profile(dump_dir / "fit", recs)
     return recs
 
 
@@ -114,6 +117,9 @@ class FakeLLM:
             engine_core=SimpleNamespace(shutdown=self._shutdown)
         )
 
+    def collective_rpc(self, method, args=()):
+        pass  # Fixture traces already include link measurements.
+
     def generate(self, prompts, sampling_params, use_tqdm=True):
         self.generate_calls.append(
             {
@@ -131,6 +137,41 @@ class FakeLLM:
 
     def _shutdown(self) -> None:
         self.closed = True
+
+
+def test_collect_only_does_not_fit_or_write_a_plan(tmp_path, monkeypatch):
+    monkeypatch.delenv("VLLM_PP_HETERO", raising=False)
+    llm = FakeLLM(tmp_path, _two_rank_recs())
+    plan = profile_pp_partition(
+        dump_dir=tmp_path,
+        fit_trace_dirs=[tmp_path / "fit"],
+        comm_source="replay",
+        llm_factory=lambda: llm,
+        collect_only=True,
+        allow_unchecked_memory=True,
+        compute_model="shape-affine",
+        num_iters=1,
+        num_iters_warmup=0,
+    )
+    assert plan is None
+    assert llm.closed
+    assert len(require_complete_traces(tmp_path)) == 2
+    assert not (tmp_path / "pp_partition_plan.json").exists()
+
+
+def test_profile_marks_complete_warmup_iterations(tmp_path):
+    llm = FakeLLM(tmp_path, _two_rank_recs())
+    calls = []
+    llm.collective_rpc = lambda method, args: calls.append((method, args))
+    workload = build_profile_workload(
+        num_prompts=1,
+        input_len=16,
+        output_len=4,
+        num_iters=2,
+        num_iters_warmup=1,
+    )
+    run_traced_generate(llm, workload)
+    assert calls == [("set_pp_profile_warmup", (v,)) for v in [True, False, False]]
 
 
 def test_build_profile_workload_fixed_lengths():
@@ -247,8 +288,11 @@ def test_shutdown_llm_calls_engine_core():
 def test_write_profile_result_json(tmp_path, monkeypatch):
     monkeypatch.delenv("VLLM_PP_HETERO", raising=False)
     _write_two_rank_traces(tmp_path)
-    plan = profile_pp_partition(allow_unchecked_memory=True,
+    plan = profile_pp_partition(
+        allow_unchecked_memory=True,
         dump_dir=tmp_path,
+        fit_trace_dirs=[tmp_path / "fit"],
+        comm_source="replay",
         skip_run=True,
         warmup_steps=5,
         min_pp_size=2,
@@ -263,27 +307,38 @@ def test_write_profile_result_json(tmp_path, monkeypatch):
     assert plan.env_value == "16,16"
 
 
-def test_profile_result_preserves_link_model(tmp_path, monkeypatch):
+def test_profile_result_does_not_export_analysis_mock_environment(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("VLLM_PP_HETERO", "1,2/4")
     monkeypatch.setenv("VLLM_PP_COMM_BANDWIDTH_GBPS", "8")
     monkeypatch.setenv("VLLM_PP_COMM_LATENCY_MS", "0.5")
     _write_two_rank_traces(tmp_path)
-    plan = profile_pp_partition(allow_unchecked_memory=True,
-        dump_dir=tmp_path, skip_run=True, min_pp_size=2, max_pp_size=2
+    plan = profile_pp_partition(
+        allow_unchecked_memory=True,
+        dump_dir=tmp_path,
+        fit_trace_dirs=[tmp_path / "fit"],
+        comm_source="replay",
+        skip_run=True,
+        min_pp_size=2,
+        max_pp_size=2,
     )
     payload = json.loads((tmp_path / "pp_partition_plan.json").read_text())
-    assert payload["VLLM_PP_COMM_BANDWIDTH_GBPS"] == "8"
-    assert payload["VLLM_PP_COMM_LATENCY_MS"] == "0.5"
+    assert "VLLM_PP_COMM_BANDWIDTH_GBPS" not in payload
+    assert "VLLM_PP_COMM_LATENCY_MS" not in payload
     snippet = format_serve_command(plan)
     assert "memory feasibility was not checked" in snippet
     assert "vllm serve" not in snippet
 
 
-def test_profile_skip_run_compute_scale_unbalances(tmp_path, monkeypatch):
+def test_profile_skip_run_ignores_mock_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("VLLM_PP_HETERO", "1,2")
     _write_two_rank_traces(tmp_path)
-    plan = profile_pp_partition(allow_unchecked_memory=True,
+    plan = profile_pp_partition(
+        allow_unchecked_memory=True,
         dump_dir=tmp_path,
+        fit_trace_dirs=[tmp_path / "fit"],
+        comm_source="replay",
         skip_run=True,
         warmup_steps=5,
         min_pp_size=2,
@@ -291,9 +346,9 @@ def test_profile_skip_run_compute_scale_unbalances(tmp_path, monkeypatch):
         output_json=tmp_path / "scaled_plan.json",
     )
     assert sum(plan.partitions) == 32
-    assert plan.partitions[0] > plan.partitions[1]
+    assert plan.partitions == [16, 16]
     payload = json.loads((tmp_path / "scaled_plan.json").read_text(encoding="utf-8"))
-    assert payload["VLLM_PP_HETERO"] == "1,2"
+    assert "VLLM_PP_HETERO" not in payload
     assert payload["VLLM_PP_LAYER_PARTITION"] == plan.env_value
 
 
@@ -304,7 +359,8 @@ def test_profile_skip_run_requires_trace_dir():
 
 def test_profile_rejects_pp1_live_run():
     with pytest.raises(ValueError, match="pipeline_parallel_size"):
-        profile_pp_partition(allow_unchecked_memory=True,
+        profile_pp_partition(
+            allow_unchecked_memory=True,
             dump_dir="unused",
             engine_args=SimpleNamespace(pipeline_parallel_size=1),
             llm_factory=lambda: None,
@@ -325,8 +381,11 @@ def test_profile_live_run_sets_env_feeds_and_plans(tmp_path, monkeypatch):
         holder["llm"] = llm
         return llm
 
-    plan = profile_pp_partition(allow_unchecked_memory=True,
+    plan = profile_pp_partition(
+        allow_unchecked_memory=True,
         dump_dir=tmp_path,
+        fit_trace_dirs=[tmp_path / "fit"],
+        comm_source="replay",
         llm_factory=factory,
         engine_args=SimpleNamespace(pipeline_parallel_size=2),
         num_prompts=2,
@@ -353,14 +412,17 @@ def test_profile_live_run_sets_env_feeds_and_plans(tmp_path, monkeypatch):
         (tmp_path / "pp_partition_plan.json").read_text(encoding="utf-8")
     )
     assert payload["VLLM_PP_LAYER_PARTITION"] == "16,16"
-    assert payload["VLLM_PP_HETERO"] == "1,2/4"
+    assert "VLLM_PP_HETERO" not in payload
 
 
 def test_profile_fails_if_engine_writes_no_traces(tmp_path):
     llm = FakeLLM(tmp_path, {}, write_traces=False)
     with pytest.raises(FileNotFoundError):
-        profile_pp_partition(allow_unchecked_memory=True,
+        profile_pp_partition(
+            allow_unchecked_memory=True,
             dump_dir=tmp_path,
+            fit_trace_dirs=[tmp_path / "fit"],
+            comm_source="replay",
             llm_factory=lambda: llm,
             engine_args=SimpleNamespace(pipeline_parallel_size=2),
             num_prompts=1,
@@ -380,8 +442,11 @@ def test_profile_shutdown_runs_when_generate_raises(tmp_path):
 
     llm = BoomLLM(tmp_path, {}, write_traces=False)
     with pytest.raises(RuntimeError, match="generate failed"):
-        profile_pp_partition(allow_unchecked_memory=True,
+        profile_pp_partition(
+            allow_unchecked_memory=True,
             dump_dir=tmp_path,
+            fit_trace_dirs=[tmp_path / "fit"],
+            comm_source="replay",
             llm_factory=lambda: llm,
             engine_args=SimpleNamespace(pipeline_parallel_size=2),
             num_prompts=1,
@@ -398,8 +463,11 @@ def test_live_run_ignores_stale_traces(tmp_path):
     _write_two_rank_traces(tmp_path)
     llm = FakeLLM(tmp_path, {}, write_traces=False)
     with pytest.raises(FileNotFoundError):
-        profile_pp_partition(allow_unchecked_memory=True,
+        profile_pp_partition(
+            allow_unchecked_memory=True,
             dump_dir=tmp_path,
+            fit_trace_dirs=[tmp_path / "fit"],
+            comm_source="replay",
             llm_factory=lambda: llm,
             engine_args=SimpleNamespace(pipeline_parallel_size=2),
             num_prompts=1,
@@ -414,15 +482,23 @@ def test_live_run_ignores_stale_traces(tmp_path):
 def test_profile_requires_engine_when_not_skipping():
     with pytest.raises(ValueError, match="engine_args or llm_factory"):
         profile_pp_partition(
-            allow_unchecked_memory=True, dump_dir="unused", skip_run=False)
+            allow_unchecked_memory=True, dump_dir="unused", skip_run=False
+        )
 
 
-def test_live_requires_link_calibration_before_loading_model(tmp_path, monkeypatch):
+def test_live_does_not_require_mock_link_parameters(tmp_path, monkeypatch):
     monkeypatch.delenv("VLLM_PP_HETERO", raising=False)
     monkeypatch.delenv("VLLM_PP_COMM_BANDWIDTH_GBPS", raising=False)
-    with pytest.raises(ValueError, match="calibrated VLLM_PP_COMM_BANDWIDTH_GBPS"):
-        profile_pp_partition(allow_unchecked_memory=True,
-            dump_dir=tmp_path / "not_created",
-            engine_args=SimpleNamespace(pipeline_parallel_size=2),
-        )
-    assert not (tmp_path / "not_created").exists()
+    llm = FakeLLM(tmp_path, _two_rank_recs())
+    monkeypatch.setattr(
+        "vllm.distributed.pp_profile._default_llm_factory", lambda _: llm
+    )
+    plan = profile_pp_partition(
+        allow_unchecked_memory=True,
+        dump_dir=tmp_path,
+        fit_trace_dirs=[tmp_path / "fit"],
+        comm_source="replay",
+        engine_args=SimpleNamespace(pipeline_parallel_size=2),
+        min_pp_size=2,
+    )
+    assert plan.partitions == [16, 16]

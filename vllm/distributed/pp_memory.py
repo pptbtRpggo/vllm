@@ -11,9 +11,57 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+
+def observe_worker_memory(worker: Any) -> dict[str, Any]:
+    """Observe loaded tensor storage and allocator peaks after a drained workload.
+
+    This is evidence for capacity bounds, not an automatic safety guarantee for
+    different partitions. In particular allocator peaks include the allocated KV
+    pool and must not be added to a second KV estimate.
+    """
+    import torch
+
+    from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+
+    device = worker.device
+    backend = getattr(torch, device.type)
+    backend.synchronize(device)
+    model = worker.model_runner.model
+    layers: dict[str, int] = {}
+    endpoint = 0
+    seen = set()
+    for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+        storage = tensor.untyped_storage()
+        identity = (str(tensor.device), storage.data_ptr())
+        if identity in seen:
+            continue
+        seen.add(identity)
+        size = storage.nbytes()
+        match = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
+        if match:
+            index = match.group(1)
+            layers[index] = layers.get(index, 0) + size
+        else:
+            endpoint += size
+    free, total = backend.mem_get_info(device)
+    return dict(
+        pp_rank=get_pp_group().rank_in_group,
+        tp_rank=get_tp_group().rank_in_group,
+        layer_storage_bytes=layers,
+        non_layer_storage_bytes=endpoint,
+        allocated_bytes=backend.memory_allocated(device),
+        reserved_bytes=backend.memory_reserved(device),
+        peak_allocated_bytes=backend.max_memory_allocated(device),
+        peak_reserved_bytes=backend.max_memory_reserved(device),
+        free_bytes=free,
+        total_bytes=total,
+        includes_kv_pool=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -51,8 +99,12 @@ class DeviceMemory:
             self.last_stage_bytes if self.pp_rank == pp_size - 1 else 0
         )
         reserve = (
-            self.runtime_bytes + self.activation_bytes + self.workspace_bytes
-            + self.communication_bytes + self.graph_bytes + self.safety_margin_bytes
+            self.runtime_bytes
+            + self.activation_bytes
+            + self.workspace_bytes
+            + self.communication_bytes
+            + self.graph_bytes
+            + self.safety_margin_bytes
         )
         required = weights + kv + endpoints + reserve
         return {
@@ -86,14 +138,25 @@ class PPMemoryProfile:
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{key} must be a positive integer")
         required = {
-            "model", "revision", "dtype", "quantization", "kv_cache_dtype",
-            "block_size", "max_model_len", "max_num_seqs", "max_num_batched_tokens",
+            "model",
+            "revision",
+            "dtype",
+            "quantization",
+            "kv_cache_dtype",
+            "block_size",
+            "max_model_len",
+            "max_num_seqs",
+            "max_num_batched_tokens",
             "gpu_memory_utilization",
         }
         if set(self.serving_config) != required:
             raise ValueError(f"serving_config must contain exactly {sorted(required)}")
-        for key in ("block_size", "max_model_len", "max_num_seqs",
-                    "max_num_batched_tokens"):
+        for key in (
+            "block_size",
+            "max_model_len",
+            "max_num_seqs",
+            "max_num_batched_tokens",
+        ):
             value = self.serving_config[key]
             if type(value) is not int or value <= 0:
                 raise ValueError(f"serving_config.{key} must be a positive integer")
@@ -128,7 +191,8 @@ class PPMemoryProfile:
     def fits(self, rank: int, start: int, end: int, pp_size: int) -> bool:
         return all(
             d.estimate(start, end, pp_size)["headroom_bytes"] >= 0
-            for d in self.devices if d.pp_rank == rank
+            for d in self.devices
+            if d.pp_rank == rank
         )
 
     def plan_usage(self, partitions: list[int]) -> list[dict[str, int]]:

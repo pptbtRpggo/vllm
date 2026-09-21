@@ -35,11 +35,14 @@ class PPProfileSubcommand(CLISubcommand):
     @staticmethod
     def cmd(args: argparse.Namespace) -> None:
         plan = run_from_cli_args(args)
-        print(format_plan(plan))
-        print()
-        print(format_serve_command(plan))
+        if plan is not None:
+            print(format_plan(plan))
+            print()
+            print(format_serve_command(plan))
 
     def validate(self, args: argparse.Namespace) -> None:
+        if args.collect_only and args.skip_run:
+            raise ValueError("--collect-only cannot be combined with --skip-run")
         if args.skip_run and not args.trace_dir:
             raise ValueError("--trace-dir is required with --skip-run")
         if not args.skip_run and getattr(args, "pipeline_parallel_size", 1) <= 1:

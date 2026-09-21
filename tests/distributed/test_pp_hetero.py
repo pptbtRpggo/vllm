@@ -14,7 +14,6 @@ from vllm.distributed.pp_hetero import (
     scale_at,
     stretch_after,
 )
-from vllm.distributed.pp_partition import RankCost, scale_rank_costs
 
 
 def test_parse_scale_list_empty():
@@ -65,20 +64,6 @@ def test_hetero_config_stretch_uses_rank_and_hop(monkeypatch):
     assert cfg.stretch_send(0, 2.0, payload_bytes=2_000_000) == pytest.approx(8.0)
     assert cfg.stretch_recv(1, 2.0, payload_bytes=2_000_000) == pytest.approx(8.0)
     assert cfg.stretch_send(1, 2.0, payload_bytes=2_000_000) == 2.0
-
-
-def test_scale_rank_costs_compute_and_comm():
-    costs = [
-        RankCost(0, 16, t_layer_ms=1.0, t_comm_out_ms=0.5, n_steps=8),
-        RankCost(1, 16, t_layer_ms=1.0, t_comm_out_ms=None, n_steps=8),
-    ]
-    scaled = scale_rank_costs(
-        costs, compute_scales=(1.0, 2.0), comm_scales=(3.0,)
-    )
-    assert scaled[0].t_layer_ms == pytest.approx(1.0)
-    assert scaled[0].t_comm_out_ms == pytest.approx(1.5)
-    assert scaled[1].t_layer_ms == pytest.approx(2.0)
-    assert scaled[1].t_comm_out_ms is None
 
 
 def test_parse_hetero_spec():
@@ -158,7 +143,9 @@ def test_comm_bandwidth_rejects_invalid_values(value):
 
 def test_export_env_preserves_comm_baseline(monkeypatch):
     for name in (
-        "VLLM_PP_HETERO", "VLLM_PP_COMM_BANDWIDTH_GBPS", "VLLM_PP_COMM_LATENCY_MS"
+        "VLLM_PP_HETERO",
+        "VLLM_PP_COMM_BANDWIDTH_GBPS",
+        "VLLM_PP_COMM_LATENCY_MS",
     ):
         # Register an undo even when the variable was originally absent;
         # export_env writes directly to os.environ.

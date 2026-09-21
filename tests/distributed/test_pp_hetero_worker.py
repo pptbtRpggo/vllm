@@ -43,8 +43,9 @@ def _worker_module(backend, monkeypatch):
 @pytest.mark.parametrize("backend", ["cuda", "ascend", "ascend_sp"])
 @pytest.mark.parametrize("rank", [0, 1, 2])
 @pytest.mark.parametrize("tracing", [False, True])
+@pytest.mark.parametrize("compute_scale", [1, 2])
 def test_worker_comm_delay_excludes_peer_wait(
-    backend, rank, tracing, tmp_path, monkeypatch
+    backend, rank, tracing, compute_scale, tmp_path, monkeypatch
 ):
     module, worker_cls = _worker_module(backend, monkeypatch)
     now = [0.0]
@@ -96,11 +97,13 @@ def test_worker_comm_delay_excludes_peer_wait(
     worker.device = torch.device("cpu")
     worker._pp_stage_tracer = tracer
     worker._pp_hetero = PPHeteroConfig(
+        compute_scales=(compute_scale,) * 3,
         comm_scales=(4, 7), comm_bandwidth_gbps=(8, 8)
     )
     worker.model_runner = SimpleNamespace(
         execute_model=forward,
         model=SimpleNamespace(start_layer=rank * 16, end_layer=(rank + 1) * 16),
+        requests={"r": SimpleNamespace(prompt_token_ids=[0] * 16)},
     )
     worker.annotate_profile = lambda _: nullcontext()
     worker.vllm_config = SimpleNamespace(
@@ -112,6 +115,7 @@ def test_worker_comm_delay_excludes_peer_wait(
     scheduler = SimpleNamespace(
         total_num_scheduled_tokens=1, num_scheduled_tokens={"r": 1},
         scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=["r"], num_computed_tokens=[32]),
     )
     try:
         assert worker.execute_model(scheduler) is None
@@ -125,11 +129,19 @@ def test_worker_comm_delay_excludes_peer_wait(
     expected_delays = []
     if rank:
         expected_delays.append(baseline_ms * ((4, 7)[rank - 1] - 1) / 1000)
+    if compute_scale > 1:
+        expected_delays.append(.010 * (compute_scale - 1))
     if rank < 2:
         expected_delays.append(baseline_ms * ((4, 7)[rank] - 1) / 1000)
     assert sleeps == pytest.approx(expected_delays)
     if tracer:
         record = json.loads(Path(tracer.path).read_text())
+        assert record["batch_shape"] == [
+            dict(query_tokens=1, context_tokens=32, prompt_tokens=0)
+        ]
+        assert record["num_generation_tokens"] == 1
+        assert record["compute_wall_ms"] == pytest.approx(10 * compute_scale)
+        assert record["compute_base_ms"] == pytest.approx(10)
         if rank:
             assert record["recv_bytes"] == wire_bytes
             assert record["recv_ms"] == pytest.approx(
@@ -138,9 +150,7 @@ def test_worker_comm_delay_excludes_peer_wait(
         if rank < 2:
             assert record["send_bytes"] == wire_bytes
             assert record["send_ms"] == pytest.approx(300 + baseline_ms * (4, 7)[rank])
-            assert record["send_transfer_ms"] == pytest.approx(
-                baseline_ms * (4, 7)[rank]
-            )
-            assert record["comm_scale"] == (4, 7)[rank]
+            assert "send_transfer_ms" not in record
+            assert record["send_tensor_spec"][0]["shape"] == [1_000_000]
         else:
-            assert record["send_transfer_ms"] is None
+            assert "send_transfer_ms" not in record

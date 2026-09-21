@@ -10,8 +10,7 @@ Enabled by ``VLLM_PP_STAGE_TRACE=/path/to/dir``. Each PP rank writes
 * ``recv_ms`` / ``send_ms`` — blocking wait for the previous/next rank's
   intermediate-tensor transfer. Timed with CPU clock + device sync,
   because NCCL runs on its own stream.
-* ``send_transfer_ms`` — optional modeled link service cost from the explicit
-  bandwidth/latency baseline, including hetero slowdown but excluding waiting.
+* ``send_tensor_spec`` — actual outgoing tensor layouts for idle link replay.
 
 Tracing additionally synchronizes the device so each JSONL line is
 self-contained. The ordinary NCCL send path in this checkout already inserts
@@ -26,8 +25,10 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, TypeVar
 
 import torch
@@ -37,6 +38,20 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 T = TypeVar("T")
+
+
+def monotonic_clock_domain() -> str | None:
+    """Only assert comparability on a shared Linux boot and time namespace.
+
+    Do not use hostnames or wall-clock offsets to infer synchronized clocks on
+    different hosts. Unknown platforms fail closed for cross-process timing.
+    """
+    try:
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        namespace = os.readlink("/proc/self/ns/time")
+    except OSError:
+        return None
+    return f"{boot}/{namespace}/{time.get_clock_info('perf_counter').implementation}"
 
 
 def tensor_dict_nbytes(
@@ -101,10 +116,23 @@ class PPStageTraceRecord:
     send_ms: float | None
     recv_bytes: int | None
     send_bytes: int | None
-    send_transfer_ms: float | None = None
     compute_scale: float = 1.0
     comm_scale: float = 1.0
     tp_size: int = 1
+    batch_shape: list[dict[str, int]] | None = None
+    compute_base_ms: float | None = None
+    compute_wall_ms: float | None = None
+    compute_delay_ms: float | None = None
+    is_warmup: bool = False
+    trace_id: str = ""
+    send_tensor_spec: list[dict[str, Any]] | None = None
+    trace_session: str | None = None
+    clock_domain: str | None = None
+    batch_id: str | None = None
+    send_start_ns: int | None = None
+    send_end_ns: int | None = None
+    recv_start_ns: int | None = None
+    recv_end_ns: int | None = None
 
 
 class PPStageTracer:
@@ -133,8 +161,14 @@ class PPStageTracer:
         )
         path = os.path.join(dump_dir, f"pp_stage_pp{pp_rank}_tp{tp_rank}.jsonl")
         self._path = path
-        self._fp = open(path, "a", encoding="utf-8")
+        # Kept open across steps; the worker calls close() on shutdown.
+        self._fp = open(path, "a", encoding="utf-8")  # noqa: SIM115
         self._step = 0
+        self.trace_id = uuid.uuid4().hex
+        self.trace_session = os.environ.get("VLLM_PP_TRACE_SESSION")
+        self.clock_domain = monotonic_clock_domain()
+        self._comm_windows: dict[str, int] = {}
+        self.is_warmup = False
         self._records: list[PPStageTraceRecord] = []
         if self.use_cuda:
             self._start_event = torch.cuda.Event(enable_timing=True)
@@ -173,12 +207,38 @@ class PPStageTracer:
         self._sync_device()
         return result, (time.perf_counter() - t0) * 1000.0
 
-    def measure_comm(self, fn: Callable[[], T]) -> tuple[T, float]:
+    def measure_comm(
+        self, fn: Callable[[], T], *, kind: str | None = None
+    ) -> tuple[T, float]:
         """Time a blocking send/recv wait. Returns ``(result, elapsed_ms)``."""
+        if kind not in (None, "send", "recv"):
+            raise ValueError("communication kind must be send or recv")
+        start_ns = time.perf_counter_ns()
         t0 = time.perf_counter()
         result = fn()
         self._sync_device()
+        end_ns = time.perf_counter_ns()
+        if kind:
+            self._comm_windows.update(
+                {f"{kind}_start_ns": start_ns, f"{kind}_end_ns": end_ns}
+            )
         return result, (time.perf_counter() - t0) * 1000.0
+
+    def measure_stretched_compute(
+        self, fn: Callable[[], T], stretch: Callable[[float], float]
+    ) -> tuple[T, dict[str, float]]:
+        """Keep modeled slowdown separate from actual synchronized wall time."""
+        start = time.perf_counter()
+        result, base_ms = self.measure_compute(fn)
+        delay_start = time.perf_counter()
+        modeled_ms = stretch(base_ms)
+        end = time.perf_counter()
+        return result, dict(
+            compute_ms=modeled_ms,
+            compute_base_ms=base_ms,
+            compute_wall_ms=(end - start) * 1000,
+            compute_delay_ms=(end - delay_start) * 1000,
+        )
 
     def record(
         self,
@@ -196,9 +256,14 @@ class PPStageTracer:
         send_bytes: int | None,
         start_layer: int | None,
         end_layer: int | None,
-        send_transfer_ms: float | None = None,
         compute_scale: float = 1.0,
         comm_scale: float = 1.0,
+        batch_shape: list[dict[str, int]] | None = None,
+        compute_base_ms: float | None = None,
+        compute_wall_ms: float | None = None,
+        compute_delay_ms: float | None = None,
+        send_tensor_spec: list[dict[str, Any]] | None = None,
+        batch_id: str | None = None,
     ) -> PPStageTraceRecord:
         rec = PPStageTraceRecord(
             step=self._step,
@@ -220,14 +285,25 @@ class PPStageTracer:
             send_ms=send_ms,
             recv_bytes=recv_bytes,
             send_bytes=send_bytes,
-            send_transfer_ms=send_transfer_ms,
             compute_scale=compute_scale,
             comm_scale=comm_scale,
+            batch_shape=batch_shape,
+            compute_base_ms=compute_base_ms,
+            compute_wall_ms=compute_wall_ms,
+            compute_delay_ms=compute_delay_ms,
+            is_warmup=self.is_warmup,
+            trace_id=self.trace_id,
+            send_tensor_spec=send_tensor_spec,
+            trace_session=self.trace_session,
+            clock_domain=self.clock_domain,
+            batch_id=batch_id,
+            **self._comm_windows,
         )
         self._fp.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
         self._fp.flush()
         self._records.append(rec)
         self._step += 1
+        self._comm_windows.clear()
         return rec
 
     def close(self) -> None:

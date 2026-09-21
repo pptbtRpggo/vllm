@@ -19,6 +19,7 @@ import os
 import random
 import shlex
 import tempfile
+import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -27,6 +28,7 @@ from typing import Any
 
 from vllm.distributed.pp_memory import PPMemoryProfile, resolve_memory_profile
 from vllm.distributed.pp_partition import (
+    ComputeModel,
     Objective,
     PPPartitionPlan,
     Workload,
@@ -125,6 +127,7 @@ def prepare_trace_dir(dump_dir: str | Path | None = None) -> Path:
     path = Path(dump_dir).expanduser().resolve()
     path.mkdir(parents=True, exist_ok=True)
     os.environ["VLLM_PP_STAGE_TRACE"] = str(path)
+    os.environ["VLLM_PP_TRACE_SESSION"] = uuid.uuid4().hex
     return path
 
 
@@ -179,6 +182,8 @@ def run_traced_generate(llm: Any, workload: ProfileWorkload) -> None:
     )
     total = workload.num_iters_warmup + workload.num_iters
     for i in range(total):
+        if callable(rpc := getattr(llm, "collective_rpc", None)):
+            rpc("set_pp_profile_warmup", args=(i < workload.num_iters_warmup,))
         logger.info(
             "PP profile generate %d/%d (%s)",
             i + 1,
@@ -223,12 +228,6 @@ def write_profile_result(
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = plan.to_dict()
-    hetero = os.environ.get("VLLM_PP_HETERO")
-    if hetero:
-        payload["VLLM_PP_HETERO"] = hetero
-    for name in ("VLLM_PP_COMM_BANDWIDTH_GBPS", "VLLM_PP_COMM_LATENCY_MS"):
-        if value := os.environ.get(name):
-            payload[name] = value
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     if plan.memory_profile is not None:
         memory_path = Path(dump_dir) / "pp_memory_profile.json"
@@ -241,7 +240,7 @@ def write_profile_result(
 
 
 def format_serve_command(plan: PPPartitionPlan) -> str:
-    """Shell snippet to re-serve with the chosen split and hetero env."""
+    """Shell snippet with the chosen split and declared serving configuration."""
     if plan.memory_profile is None:
         return (
             "Timing-only candidate: memory feasibility was not checked. "
@@ -249,20 +248,18 @@ def format_serve_command(plan: PPPartitionPlan) -> str:
         )
     lines = ["Re-serve with:"]
     exports = [f"VLLM_PP_LAYER_PARTITION={plan.env_value}"]
-    hetero = os.environ.get("VLLM_PP_HETERO")
-    if hetero:
-        exports.append(f"VLLM_PP_HETERO={hetero}")
-    for name in ("VLLM_PP_COMM_BANDWIDTH_GBPS", "VLLM_PP_COMM_LATENCY_MS"):
-        if value := os.environ.get(name):
-            exports.append(f"{name}={value}")
     for item in exports:
         name, value = item.split("=", 1)
         lines.append(f"  {name}={shlex.quote(value)} \\")
     scope = plan.memory_profile.serving_config
     command = [
-        "vllm", "serve", scope["model"],
-        "--pipeline-parallel-size", str(plan.pp_size),
-        "--tensor-parallel-size", str(plan.memory_profile.tp_size),
+        "vllm",
+        "serve",
+        scope["model"],
+        "--pipeline-parallel-size",
+        str(plan.pp_size),
+        "--tensor-parallel-size",
+        str(plan.memory_profile.tp_size),
     ]
     for key, value in scope.items():
         if key != "model" and value is not None:
@@ -277,8 +274,9 @@ def format_serve_command(plan: PPPartitionPlan) -> str:
 def clear_trace_files(dump_dir: str | Path) -> None:
     """Remove leftover ``pp_stage_pp*_tp*.jsonl`` so a live run cannot reuse them."""
     dump_dir = Path(dump_dir)
-    for path in dump_dir.glob("pp_stage_pp*_tp*.jsonl"):
-        path.unlink()
+    for pattern in ("pp_stage_pp*_tp*.jsonl", "pp_link_pp*_tp*.jsonl"):
+        for path in dump_dir.glob(pattern):
+            path.unlink()
 
 
 def _ensure_ascend_pp_worker(engine_args: Any) -> None:
@@ -328,15 +326,18 @@ def profile_pp_partition(
     min_pp_size: int = 1,
     max_pp_size: int | None = None,
     overlap_comm: bool = False,
-    allow_wall_time_comm: bool = False,
     memory_profile: PPMemoryProfile | str | Path | None = None,
     allow_unchecked_memory: bool = False,
     output_json: str | Path | None = None,
-) -> PPPartitionPlan:
+    compute_model: ComputeModel = "shape-affine",
+    fit_trace_dirs: Sequence[str | Path] = (),
+    collect_only: bool = False,
+    comm_source: str = "serving",
+) -> PPPartitionPlan | None:
     """Run the profile pipeline and return the DP layer split.
 
-    Hetero emulation is ``VLLM_PP_HETERO`` only. Live runs stretch in the
-    worker; ``--skip-run`` multiplies fitted costs from the same env.
+    Costs come from measured traces. Mock slowdown, if enabled, executes
+    on workers during collection; offline planning never rescales traces.
 
     Args:
         dump_dir: Trace directory. Created if missing.
@@ -358,21 +359,27 @@ def profile_pp_partition(
         min_pp_size: Smallest PP size the DP may choose.
         max_pp_size: Largest PP size the DP may choose.
         overlap_comm: Throughput DP uses max(compute, comm) when True.
-        allow_wall_time_comm: Allow legacy send wall times as approximate costs.
         memory_profile: Explicit target serving memory bounds, or sidecar JSON.
         allow_unchecked_memory: Permit timing-only analysis without bounds.
         output_json: Optional plan JSON path.
+        compute_model: Measured multi-shard fixed/per-layer cost fit.
+        fit_trace_dirs: Extra shard profiles; dump_dir sets the workload weights.
+        collect_only: Save traces without fitting (returns None).
 
     Returns:
-        The chosen partition (also written as JSON under ``dump_dir``).
+        The chosen partition (written under ``dump_dir``), or None for collect-only.
 
     Raises:
         ValueError: PP size is 1 for a live run, or workload knobs are invalid.
         FileNotFoundError: Traces are missing after the run.
     """
+    if collect_only and skip_run:
+        raise ValueError("--collect-only cannot be combined with --skip-run")
     pp_size = _pipeline_parallel_size(engine_args)
     memory_profile = resolve_memory_profile(
-        memory_profile, dump_dir, allow_unchecked_memory=allow_unchecked_memory
+        memory_profile,
+        dump_dir,
+        allow_unchecked_memory=allow_unchecked_memory or collect_only,
     )
     planner_hetero: str | None
     if not skip_run:
@@ -386,16 +393,6 @@ def profile_pp_partition(
                     "pipeline_parallel_size must be > 1 to profile PP stages "
                     f"(got {pp_size})"
                 )
-            if not allow_wall_time_comm:
-                from vllm.distributed.pp_hetero import PPHeteroConfig
-
-                config = PPHeteroConfig.from_env()
-                if len(config.comm_bandwidth_gbps) < pp_size - 1:
-                    raise ValueError(
-                        "Set calibrated VLLM_PP_COMM_BANDWIDTH_GBPS for every "
-                        "PP hop before profiling, or explicitly use "
-                        "--allow-wall-time-comm for an approximate plan"
-                    )
             llm_factory = partial(_default_llm_factory, engine_args)
         elif pp_size is not None and pp_size <= 1:
             raise ValueError(
@@ -424,6 +421,8 @@ def profile_pp_partition(
                     )
                 memory_profile.validate_engine_config(config)
             run_traced_generate(llm, workload)
+            if comm_source == "replay":
+                llm.collective_rpc("profile_pp_links", args=())
         finally:
             shutdown_llm(llm)
         require_complete_traces(dump_dir, pp_size=pp_size)
@@ -436,6 +435,14 @@ def profile_pp_partition(
         require_complete_traces(dump_dir, pp_size=pp_size)
         planner_hetero = None
 
+    if collect_only:
+        if memory_profile is not None:
+            (Path(dump_dir) / "pp_memory_profile.json").write_text(
+                json.dumps(memory_profile.to_dict(), indent=2) + "\n", encoding="utf-8"
+            )
+        logger.info("Collected PP traces in %s; no partition was fitted", dump_dir)
+        return None
+
     plan = plan_from_trace_dir(
         dump_dir,
         objective=objective,
@@ -445,10 +452,12 @@ def profile_pp_partition(
         min_pp_size=min_pp_size,
         max_pp_size=max_pp_size,
         overlap_comm=overlap_comm,
-        allow_wall_time_comm=allow_wall_time_comm,
         memory_profile=memory_profile,
         allow_unchecked_memory=allow_unchecked_memory,
         hetero=planner_hetero,
+        compute_model=compute_model,
+        fit_trace_dirs=fit_trace_dirs,
+        comm_source=comm_source,
     )
     write_profile_result(plan, dump_dir, output_json=output_json)
     logger.info("PP profile result:\n%s", format_plan(plan))
@@ -491,7 +500,7 @@ def add_cli_args(parser: Any) -> Any:
     parser.add_argument(
         "--workload",
         dest="workload_kind",
-        choices=("all", "decode", "prefill"),
+        choices=("all", "decode", "prefill", "mixed"),
         default="all",
         help="Which traced steps to fit costs from.",
     )
@@ -511,6 +520,11 @@ def add_cli_args(parser: Any) -> Any:
     )
     add_cost_model_args(parser)
     parser.add_argument(
+        "--collect-only",
+        action="store_true",
+        help="Collect a shard profile without fitting a partition; preserves traces.",
+    )
+    parser.add_argument(
         "--skip-run",
         action="store_true",
         help="Do not launch the engine; only fit+DP traces in --trace-dir.",
@@ -527,7 +541,7 @@ def add_cli_args(parser: Any) -> Any:
     return parser
 
 
-def run_from_cli_args(args: Any) -> PPPartitionPlan:
+def run_from_cli_args(args: Any) -> PPPartitionPlan | None:
     """Dispatch :func:`profile_pp_partition` from parsed CLI args."""
     if getattr(args, "model_tag", None) is not None:
         args.model = args.model_tag
@@ -556,10 +570,13 @@ def run_from_cli_args(args: Any) -> PPPartitionPlan:
         min_pp_size=args.min_pp_size,
         max_pp_size=args.max_pp_size,
         overlap_comm=args.overlap_comm,
-        allow_wall_time_comm=args.allow_wall_time_comm,
         memory_profile=args.memory_profile,
         allow_unchecked_memory=args.allow_unchecked_memory,
         output_json=args.output_json,
+        compute_model=args.compute_model,
+        fit_trace_dirs=args.fit_trace_dirs,
+        comm_source=args.comm_source,
+        collect_only=args.collect_only,
     )
 
 
@@ -570,9 +587,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     add_cli_args(parser)
     args = parser.parse_args(list(argv) if argv is not None else None)
     plan = run_from_cli_args(args)
-    print(format_plan(plan))
-    print()
-    print(format_serve_command(plan))
+    if plan is not None:
+        print(format_plan(plan))
+        print()
+        print(format_serve_command(plan))
 
 
 if __name__ == "__main__":

@@ -1,174 +1,154 @@
-# PP profiling and heterogeneous communication
+# PP profiling：从 serving 样本到 partition
 
-`vllm pp-profile` measures an existing pipeline partition and recommends
-contiguous decoder layer counts on the same ordered PP ranks. It is a restricted
-adaptation of [EdgeShard](https://arxiv.org/html/2405.14371v1), not a complete
-implementation of its joint device selection and execution schedule. Memory
-feasibility now prunes candidates using explicit per-device memory bounds.
+DP 的计算、通信成本来自目标设备上的实测 trace。默认使用 `shape-affine`
+计算拟合和 `--comm-source serving` 通信计时，不根据 mock 算力、带宽或延迟
+配置生成成本。模拟异构只改变 worker 实际执行，真实异构设备不需要设置模拟变量。
 
-## Communication slowdown
+## 完整流程
 
-`VLLM_PP_HETERO=1,2/4` requests rank 1 compute slowdown of 2 and hop 0→1
-communication slowdown of 4. **Live communication slowdown now requires an
-explicit baseline**; previously it multiplied blocking send/recv wall time,
-which incorrectly amplified producer/consumer waiting.
+1. 从目标服务日志抽取 requests，保留 prompt、生成参数、到达间隔和并发设置。
+2. 在目标设备上启动独立 profiling 服务；先 warmup，再采集 scheduler 实际组成
+   的 microbatch。保持目标服务的 model、dtype、TP、cache 和调度设置一致。
+3. 保持设备映射和 PP size 不变，更换连续层 partition，重复采集。每个 rank 至少
+   测两种层数，建议三种以上，以便检查对未参与拟合的 partition 的预测误差。
+4. 用主 trace 的实际 microbatch 分布作为权重，拟合计算成本并统计通信均值。
+   同时准备目标 serving 配置下的内存容量上界。
+5. 分别执行 latency 和 throughput DP。两个目标如果对应不同的并发/到达负载，
+   应分别采样和拟合，不能把一个负载的最优结果当作另一个负载的最优结果。
+6. 用没有参与 profiling 的请求，关闭 tracing，启动 DP 推荐、均分和相邻方案。
+   每次启动都 warmup，改变方案顺序并重复启动测量。报告实测候选排名；DP 的
+   预测最优不代表 vLLM serving 的全局最优。
 
-Set these variables before starting the workers:
+当前实现针对同构结构的 decoder layers、固定设备顺序和固定 PP size，不实现
+EdgeShard 的任意设备选择。异构硬件可以有不同的实测系数；模型结构不同的层
+不能无条件共用一个每层系数。
 
-- `VLLM_PP_COMM_BANDWIDTH_GBPS`: comma-separated baseline rates, in decimal
-  Gbit/s, indexed by the source PP rank. Each rate describes one TP lane, not
-  aggregate bandwidth across all TP ranks. Supply an entry for every slowed hop.
-- `VLLM_PP_COMM_LATENCY_MS`: optional comma-separated fixed baseline latency
-  per hop, in milliseconds. Missing entries default to zero.
+## 请求采样和 trace
 
-For a wire payload of `S` bytes, bandwidth `B` Gbit/s, latency `L` ms and
-slowdown factor `s >= 1`, the model is:
+输入 JSONL：
 
-```text
-baseline_ms = L + 8 * S / (B * 1_000_000)
-extra_ms    = (s - 1) * baseline_ms
+```json
+{"at_s": 0.0, "request": {"prompt": "Explain pipeline parallelism.", "max_tokens": 64, "temperature": 0}}
+{"at_s": 0.2, "request": {"prompt": "Explain KV cache.", "max_tokens": 32, "temperature": 0}}
 ```
 
-Workers add `extra_ms` after completing the transfer at each endpoint. The
-sender and receiver delay completion of the same transfer; neither multiplies
-its measured peer wait. A missing baseline raises an error instead of using
-blocking wall time as a bandwidth measurement. Empty tensor payloads add no
-delay. This is software delay emulation, not a network traffic shaper, and does
-not implement asynchronous compute/communication overlap.
-
-For example, a 1,000,000-byte payload at a baseline of 8 Gbit/s and zero fixed
-latency takes 1 ms in this model. Fourfold slowdown adds 3 ms. If the receive
-already waited 100 ms for upstream compute, the recorded receive wall time is
-104 ms rather than 404 ms.
-
-The following example assumes a **separately calibrated** baseline of 8 Gbit/s
-and 0.5 ms; these values are illustrative, not hardware defaults:
+`prompt` 可以是字符串或 token ID 数组。工具保留 EOS 和生成参数；不把真实请求
+强制改成固定生成长度。它使用 completions 接口，chat/multimodal 流量必须先按目标
+服务真实模板处理。`--sample-size` 从文件中选取连续请求窗口并平移起始时间，保留
+窗口内到达间隔；随机丢弃单条请求会改变到达速率，因此不采用这种抽样方式。
 
 ```bash
-VLLM_PP_HETERO=1,2/4 \
-VLLM_PP_COMM_BANDWIDTH_GBPS=8 \
-VLLM_PP_COMM_LATENCY_MS=0.5 \
-vllm pp-profile <model> --pipeline-parallel-size 2 --trace-dir /tmp/pp-traces \
-  --memory-profile /path/to/serving-memory.json
+# 仅在独立、受控的 profiling 服务开启管理 RPC。
+export VLLM_SERVER_DEV_MODE=1
+export VLLM_PP_TRACE_SESSION=unique-session-for-this-server
+export VLLM_PP_STAGE_TRACE=/tmp/pp-profile/base
+export VLLM_PP_LAYER_PARTITION=8,8,8,8
+vllm serve <model> --host 127.0.0.1 --pipeline-parallel-size 4 \
+  --tensor-parallel-size 1
+
+python -m vllm.distributed.pp_serving_profile requests.jsonl \
+  --model <model> --concurrency 16 --warmup-rounds 2 \
+  --sample-size 100 --seed 42 --output /tmp/pp-profile/base/client.json
 ```
 
-Calibrate on the target topology, TP size and relevant activation sizes. The
-wire byte count accounts for the PP send-slice/receiver-all-gather optimization
-and its per-tensor overrides. Receiver all-gather, serialization and other
-overheads are not automatically inferred by the link model; fixed latency may
-approximate some costs, but a single rate/latency pair may not fit every size.
+Ascend 加 `--worker-cls vllm.v1.worker.pp_ascend_worker.PPAscendWorker`。
+所有 workers 的 session 必须相同，并且每次启动必须更换；每种 partition 使用独立
+目录。采样客户端记录实际 dispatch 和完成时间，便于检查并发上限是否改变提交节奏。
+两轮 warmup 不等于已经证明性能稳定，最终评估仍需检查重复轮次。
 
-The plan JSON and printed serve command retain the baseline environment
-variables. They must also be available to every distributed worker.
+## 计算成本
 
-## Trace fields and replay
+计时包围 worker 的 `model_runner.execute_model`，到设备同步完成结束。
+包含这个调用中的输入准备、decoder、embedding 和末端 logits 计算等工作；
+不包含单独调用的 `sample_tokens`，也不等于 request 的端到端 latency。
 
-- `send_ms` and `recv_ms` contain measured operation wall durations, including
-  peer waits, plus the configured added delay. OS sleep overshoot is not measured
-  by this accounting. Do not add both as two independent link transfers.
-- `send_transfer_ms` is the modeled hop service time, including its slowdown
-  but excluding peer waits. The fitter prefers it over `send_ms` when present.
-- `send_bytes` and `recv_bytes` count the local TP lane's wire payload.
-- `compute_scale` and `comm_scale` record the effective slowdown used during
-  collection. Replaying new traces under the same `VLLM_PP_HETERO` does not
-  multiply those scales again. A changed environment is treated as a target
-  configuration, with costs adjusted relative to the recorded configuration.
+记录每个 request 本轮的 query tokens、已计算 context 和 prompt tokens。
+因此可以表示 mixed microbatch，不依赖 batch 级的 prefill/decode 二选一标签。
+默认 `--workload all` 包含全部正式 microbatch；其余过滤条件仅用于诊断。
 
-Legacy traces without scale metadata are assumed unscaled. Legacy traces
-without a link model are rejected by default: `send_ms` can include
-backpressure. `--allow-wall-time-comm` explicitly permits an approximate plan
-and emits a warning. `rank_costs[].comm_source` records `link_model` or
-`wall_time`; mixed sources within one rank are rejected. Such old traces
-cannot establish isolated link cost or whether slowdown was already applied;
-recollect with the baseline configuration before relying on predictions. Offline `--skip-run` does not retroactively calibrate old traces
-from new bandwidth environment variables.
-
-## Effect on the EdgeShard objective
-
-The paper's throughput bottleneck model assumes that communication and
-computation can overlap. A PP pipeline can overlap computations on different
-stages without overlapping a sender's communication with its own next forward.
-These are separate properties.
-
-In this checkout, the new tracing/hetero paths synchronize devices after
-communication. Removing that synchronization alone is insufficient to prove
-overlap: the ordinary PyTorch NCCL `send()` path also waits on its work handle,
-inserting a dependency into the current compute stream.
-
-The default throughput model is now `blocking`. `--no-overlap-comm` remains
-an explicit alias for that default. `--overlap-comm` selects the paper's
-`ideal_overlap` model for comparison; it does not enable overlap in the worker.
-Both the standalone planner and `vllm pp-profile` use these defaults.
-
-For two stages with transfer duration `D`, compute times `C0`/`C1`, sufficient
-independent equal batches and no other costs, the period is
-`max(C0 + D, C1 + D)`. For a linear rendezvous pipeline with independent links:
+模型是：
 
 ```text
-stage_occupancy[i] = incoming_transfer[i] + compute[i] + outgoing_transfer[i]
-steady_state_cycle = max(stage_occupancy)
+stage_ms(n, microbatch) = fixed(microbatch) + n * layer(microbatch)
 ```
 
-The first rank has no incoming hop; the final **selected** rank has no outgoing
-hop. An interior rank serializes recv, forward and send. Each transfer occupies
-both endpoints at the same time; it is not counted as two consecutive transfers.
-Latency still sums each hop once. The DP fixes the final PP size before costing
-prefixes, so dropping a trailing rank also removes its incoming link. Searching
-up to P ranks and N layers in timing-only mode takes O(P^2 N^2) time and
-O(P N) DP storage. Memory checks additionally sum candidate layer bounds for
-each local TP device.
+如果参考 microbatch shape 在多种层数中都有测量，直接拟合相同 shape 的平均耗时。
+否则使用非负最小二乘：输入为常数项、request 数、prompt tokens、generation tokens、
+以及包含 context 的 causal query-key 对数；固定项和每层项分别学习系数。
+这些量是描述实际 workload 的特征，系数全部从实测耗时学习，不是设备配置公式。
+每份 profile 的总训练权重相同，避免 scheduler 多产生 microbatch 就增加其训练权重。
 
-This cycle formula is exact for the stated deterministic rendezvous model.
-To see attainability, let S_i(n) be completion of batch n's transfer on link i.
-A periodic schedule S_i(n)=n*T+a_i with
-`a_i - a_(i-1) = C_i + D_i` meets the compute-input dependency. The downstream
-readiness constraint reduces to `T >= D_i + C_(i+1) + D_(i+1)`, exactly the
-next stage's occupancy bound. Endpoint and repeated-send constraints also
-fit within the maximum occupancy. Unit tests separately simulate earliest
-recv/compute/send events and exhaustively compare small candidate partitions.
+最后用主 trace 的 microbatch 出现比例计算期望固定成本和期望每层成本。
+每层成本是 homogeneous decoder 的边际成本估计，不是声称所有层实测耗时完全相同。
+固定项也不是单独测出的 embedding/LM head 耗时，不应作因果解释。
 
-This is not a guarantee of measured vLLM throughput: finite in-flight batches,
-autoregressive feedback, shared NIC contention, CPU scheduling/metadata,
-receiver TP all-gather, and varying batch/context sizes are not modeled.
-`predicted_cost_ms` for throughput is a **steady-state microbatch cycle**, not
-per-request latency or measured tokens/s. JSON records `cost_model` and
-`cost_kind`. Memory checking is required by default; see the memory profile
-section below. Timing-only analysis must explicitly opt out.
+不再要求不同 partition 重现完全一样的 microbatch，但仍必须有不同层数的测量。
+DP 只在实测层数范围内搜索。JSON 保存系数、训练误差、设计矩阵 rank 和按 profile
+留出验证的误差；只有两种层数时通常无法做这种留出验证。低训练误差不代表最终
+serving 排名准确；特征不足、样本偏移、硬件干扰和调度反馈仍会造成误差。
 
-The 32-layer, 1 ms/layer, 8 ms-link regression now chooses 16/16 with a 24 ms
-cycle. The old inbound-only model chose 20/12 and predicted 20 ms, although its
-blocking timeline takes 28 ms per batch. With two fixed ranks and a fixed wire
-payload, D changes the predicted throughput but is constant across layer splits.
+## 通信成本
 
-Live profiling through the standard engine factory checks for a calibrated
-bandwidth entry for every PP hop before loading the model. To replay older
-traces explicitly as an approximation:
+默认配对同一个 microbatch 的相邻 stage：
+
+```text
+D = recv_end_ns - max(send_start_ns, recv_start_ns)
+```
+
+start 在 Python 通信调用前，end 在调用返回并完成设备同步后。这个区间扣除了
+两端进入函数的时间差，仍包含 metadata、接收端分配、backend 调度和同步。
+它不是设备级 wire time，也不保证与 partition 无关。trace 同时保留 send_end，
+因为接收端完成和发送端释放资源的时间可以不同。
+
+配对检查 session、step、microbatch hash、传输字节数和时钟来源。当前支持同机
+Linux、TP=1；跨主机时间不可直接相减，时钟来源未知或配对失败就报错。
+mock 通信延迟位于计时窗口外，所以该模式拒绝非 1 的通信减速倍数。
+
+独立通信测量保留作显式选择，适用于不能比较两端时钟的情况和实验对照：
 
 ```bash
-vllm pp-profile --skip-run --trace-dir /tmp/old-pp-traces \
-  --allow-wall-time-comm --allow-unchecked-memory --min-pp-size 2 --max-pp-size 2
+python -m vllm.distributed.pp_serving_profile requests.jsonl \
+  --model <model> --concurrency 16 --warmup-rounds 2 --measure-links \
+  --output /tmp/pp-profile/base/client.json
+# 对应 DP 使用 --comm-source replay
 ```
 
-Workload and warmup filters are now strict: no matching samples raises an error
-instead of silently using excluded prefill or warmup steps.
+这条路径按 trace 的实际 tensor 布局，在同样设备和通信路径上重复测量；当前也是
+TP=1。默认不再要求额外通信回放。没有任何模式会退回带宽公式或直接使用含对端
+等待的原始 send_ms。
 
-To reproduce the paper's overlap assumptions, future work needs:
+## DP 和验证
 
-1. Nonblocking activation transfers, with completion waits deferred until the
-   data or its storage is actually needed. An immediate `isend().wait()` on the
-   compute stream does not achieve this.
-2. Activation buffer lifetimes and multiple buffer slots compatible with CUDA
-   graphs; retaining a tensor reference prevents deallocation, not overwrite
-   by the next graph replay.
-3. Receiving waits before consuming activations, consistent PP/TP ordering,
-   and sufficient independent batches in flight. The next token of batch A
-   still depends on A finishing the downstream stages and returning its result.
-4. Event-based asynchronous profiling that distinguishes link service,
-   backpressure and local computation, without forcing a per-step device sync.
-5. Hardware timeline validation and predicted-versus-measured token throughput.
+```bash
+vllm pp-profile --skip-run --trace-dir /tmp/pp-profile/base \
+  --fit-trace-dir /tmp/pp-profile/split-a \
+  --fit-trace-dir /tmp/pp-profile/split-b \
+  --memory-profile /path/to/memory.json --warmup-steps 0 \
+  --objective throughput
+```
 
-The blocking cost-model correction does not implement asynchronous runtime
-execution.
+`latency` 最小化各 stage 期望计算成本与各链路期望通信成本之和。
+`throughput` 最小化最大 stage 的 `E[recv + compute + send]`，包括发送端占用。
+若多个 partition 的瓶颈成本相同，再选择串行总成本最小的方案。实现使用两遍
+DP：先求最小瓶颈，再在该瓶颈上界内最小化总成本。不能只给第一遍 DP 的局部
+并列状态加排序，因为后续 stage 可能掩盖此前不同的瓶颈。
+它是平均资源占用近似，不是 `E[max(stage耗时)]`，也不是 vLLM 调度模拟器。
+生成过程的反馈、pipeline 填充/排空和 shared-link 竞争仍需最终 serving 实测。
+
+固定设备顺序下，固定开销之和不会改变 latency 的切分排名，但会影响总耗时预测；
+throughput 中固定开销会影响哪个 stage 是瓶颈，因此必须保留。
+
+只想采集 synthetic smoke-test trace 时仍可用 `vllm pp-profile ... --collect-only`。
+该模式不要求 memory profile，也不生成可部署方案。单次采集不能自动辨别固定开销
+和每层成本，不能省略多种层数的 profiling。
+
+## 内存实测与容量检查
+
+worker RPC `get_pp_memory_observation` 在请求结束后读取每层实际 tensor storage、
+非 decoder 层 storage、allocator 已分配/保留量及峰值、设备空闲和总内存。
+共享 storage 去重。它提供实际测量依据，但 allocator 峰值包含已分配 KV pool，
+不能再把峰值和完整 KV 估算相加。非 PyTorch 分配和未见过的候选 workload 也不能
+仅凭这个接口推定，因此完整容量预算仍需要显式给出。
 
 ## Memory feasibility
 
@@ -288,25 +268,9 @@ TP size; keep the same devices, budgets and other runtime settings (attention
 backend, graph mode, adapters, etc.) used to establish the reserves. Recalibrate
 the bounds after any such change and validate peak usage on hardware.
 
-## Source evidence for the send dependency
 
-In this checkout, `vllm/v1/worker/gpu_worker.py::execute_model` calls the runner,
-then `get_pp_group().send_tensor_dict(...)`. Its GPU branch in
-`vllm/distributed/parallel_state.py` calls `torch.distributed.send`. The CUDA
-requirements pin PyTorch 2.9.0:
+## 已移除的旧入口
 
-- [send calls isend().wait()](https://github.com/pytorch/pytorch/blob/v2.9.0/torch/distributed/distributed_c10d.py#L2304).
-- [WorkNCCL::wait calls synchronize](https://github.com/pytorch/pytorch/blob/v2.9.0/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp#L737).
-- [synchronizeStream blocks the current CUDA stream on the NCCL completion event](https://github.com/pytorch/pytorch/blob/v2.9.0/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp#L728).
-
-Thus the next forward on the dependent compute stream cannot execute before
-local send completion, although the CPU may return and enqueue work sooner.
-This does not mean the receiver must finish its forward or return from its
-Python recv call. The profiling path additionally calls `measure_comm`, which
-performs device synchronization after send/recv. NCCL evidence alone does not
-establish the behavior of an arbitrary HCCL version; the profiling wrapper's
-explicit NPU synchronization is a separate, directly visible dependency.
-
-The [v0.29.0 worker](https://github.com/vllm-project/vllm/blob/v0.29.0/vllm/v1/worker/gpu_worker.py#L1020)
-uses isend but waits previous device send handles at the start of the next step,
-before calling the model runner, to avoid overwriting in-flight send buffers.
+已移除 `layer-linear` 成本拟合、`scale_rank_costs` 离线成本缩放、
+`--allow-wall-time-comm` 以及 `send_transfer_ms` trace 字段。旧 trace 缺少新的
+测量和 microbatch 信息时需重新采集。模拟异构工具仍用于实验，不能作为 DP 成本。

@@ -32,7 +32,9 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
 )
+from vllm.distributed.pp_batch_shape import scheduled_batch_id, scheduled_batch_shape
 from vllm.distributed.pp_hetero import PPHeteroConfig, sync_torch_device, time_call
+from vllm.distributed.pp_link_profile import profile_worker_links, tensor_spec
 from vllm.distributed.pp_stage_trace import (
     PPStageTracer,
     layer_range_from_runner,
@@ -583,24 +585,17 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
-    def _pp_token_mix(
-        self, scheduler_output: "SchedulerOutput"
-    ) -> tuple[int, int, int, int]:
-        """Approximate prefill vs decode token counts from the scheduler batch."""
-        new_ids = {req.req_id for req in scheduler_output.scheduled_new_reqs}
-        num_ctx_tokens = 0
-        num_gen_tokens = 0
-        for req_id, ntok in scheduler_output.num_scheduled_tokens.items():
-            if req_id in new_ids:
-                num_ctx_tokens += ntok
-            else:
-                num_gen_tokens += ntok
-        return (
-            len(new_ids),
-            num_ctx_tokens,
-            len(scheduler_output.num_scheduled_tokens) - len(new_ids),
-            num_gen_tokens,
-        )
+    def get_pp_memory_observation(self) -> dict:
+        from vllm.distributed.pp_memory import observe_worker_memory
+
+        return observe_worker_memory(self)
+
+    def profile_pp_links(self, warmup: int = 3, repeats: int = 10) -> None:
+        profile_worker_links(self, warmup, repeats)
+
+    def set_pp_profile_warmup(self, enabled: bool) -> None:
+        if tracer := getattr(self, "_pp_stage_tracer", None):
+            tracer.is_warmup = enabled
 
     def _execute_model_with_pp_trace(
         self,
@@ -622,9 +617,13 @@ class Worker(WorkerBase):
             sync_torch_device(self.device)
 
         start_layer, end_layer = layer_range_from_runner(self.model_runner)
-        n_ctx_req, n_ctx_tok, n_gen_req, n_gen_tok = self._pp_token_mix(
-            scheduler_output
+        batch = (
+            scheduled_batch_shape(scheduler_output, self.model_runner)
+            if tracer is not None
+            else {}
         )
+
+        batch_id = scheduled_batch_id(scheduler_output) if tracer is not None else None
 
         recv_ms: float | None = None
         recv_bytes: int | None = None
@@ -640,7 +639,7 @@ class Worker(WorkerBase):
                 return IntermediateTensors(tensor_dict)
 
             if tracer is not None:
-                intermediate_tensors, recv_ms = tracer.measure_comm(_recv)
+                intermediate_tensors, recv_ms = tracer.measure_comm(_recv, kind="recv")
             else:
                 intermediate_tensors, recv_ms = time_call(_recv, _sync)
             recv_bytes = tensor_dict_nbytes(
@@ -648,23 +647,21 @@ class Worker(WorkerBase):
                 all_gather_size=get_tp_group().world_size,
                 all_gather_tensors=all_gather_tensors,
             )
-            recv_ms = hetero.stretch_recv(
-                pp_rank, recv_ms, payload_bytes=recv_bytes
-            )
+            recv_ms = hetero.stretch_recv(pp_rank, recv_ms, payload_bytes=recv_bytes)
 
-        def _run_forward() -> (
-            ModelRunnerOutput | IntermediateTensors | None
-        ):
+        def _run_forward() -> ModelRunnerOutput | IntermediateTensors | None:
             with self.annotate_profile(scheduler_output):
                 return self.model_runner.execute_model(
                     scheduler_output, intermediate_tensors
                 )
 
         if tracer is not None:
-            output, compute_ms = tracer.measure_compute(_run_forward)
+            output, compute_timing = tracer.measure_stretched_compute(
+                _run_forward, lambda ms: hetero.stretch_compute(pp_rank, ms)
+            )
         else:
             output, compute_ms = time_call(_run_forward, _sync)
-        compute_ms = hetero.stretch_compute(pp_rank, compute_ms)
+            hetero.stretch_compute(pp_rank, compute_ms)
 
         send_ms: float | None = None
         send_bytes: int | None = None
@@ -683,28 +680,24 @@ class Worker(WorkerBase):
                 )
 
             if tracer is not None:
-                _, send_ms = tracer.measure_comm(_send)
+                _, send_ms = tracer.measure_comm(_send, kind="send")
             else:
                 _, send_ms = time_call(_send, _sync)
-            send_ms = hetero.stretch_send(
-                pp_rank, send_ms, payload_bytes=send_bytes
-            )
+            send_ms = hetero.stretch_send(pp_rank, send_ms, payload_bytes=send_bytes)
             if tracer is not None:
                 tracer.record(
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
                     num_reqs=len(scheduler_output.num_scheduled_tokens),
-                    num_ctx_requests=n_ctx_req,
-                    num_ctx_tokens=n_ctx_tok,
-                    num_generation_requests=n_gen_req,
-                    num_generation_tokens=n_gen_tok,
-                    compute_ms=compute_ms,
+                    **batch,
+                    batch_id=batch_id,
+                    **compute_timing,
                     recv_ms=recv_ms,
                     send_ms=send_ms,
                     recv_bytes=recv_bytes,
                     send_bytes=send_bytes,
                     start_layer=start_layer,
                     end_layer=end_layer,
-                    send_transfer_ms=hetero.transfer_ms(pp_rank, send_bytes),
+                    send_tensor_spec=tensor_spec(output.tensors),
                     compute_scale=hetero.compute_scale(pp_rank),
                     comm_scale=hetero.comm_scale(pp_rank),
                 )
@@ -714,11 +707,9 @@ class Worker(WorkerBase):
             tracer.record(
                 num_tokens=scheduler_output.total_num_scheduled_tokens,
                 num_reqs=len(scheduler_output.num_scheduled_tokens),
-                num_ctx_requests=n_ctx_req,
-                num_ctx_tokens=n_ctx_tok,
-                num_generation_requests=n_gen_req,
-                num_generation_tokens=n_gen_tok,
-                compute_ms=compute_ms,
+                **batch,
+                batch_id=batch_id,
+                **compute_timing,
                 recv_ms=recv_ms,
                 send_ms=None,
                 recv_bytes=recv_bytes,
@@ -772,12 +763,8 @@ class Worker(WorkerBase):
                 )
             }
 
-        if (
-            forward_pass
-            and (
-                self._pp_stage_tracer is not None
-                or self._pp_hetero.enabled
-            )
+        if forward_pass and (
+            self._pp_stage_tracer is not None or self._pp_hetero.enabled
         ):
             return self._execute_model_with_pp_trace(
                 scheduler_output, all_gather_tensors
@@ -1097,6 +1084,7 @@ class Worker(WorkerBase):
         if tracer := getattr(self, "_pp_stage_tracer", None):
             tracer.close()
             self._pp_stage_tracer = None
+
 
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,
