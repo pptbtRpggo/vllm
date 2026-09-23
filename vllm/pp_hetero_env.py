@@ -22,6 +22,7 @@ def hetero_env_requested() -> bool:
     return bool(
         os.environ.get("VLLM_PP_HETERO")
         or os.environ.get("VLLM_PP_STAGE_TRACE")
+        or os.environ.get("VLLM_PP_NETWORK")
     )
 
 
@@ -33,21 +34,12 @@ def maybe_override_pp_worker(parallel_config: Any) -> None:
     """
     if not hetero_env_requested():
         return
-    current = getattr(parallel_config, "worker_cls", None)
-    if current == PP_ASCEND_WORKER:
+    # The platform has already resolved "auto". Replace only its built-in
+    # worker; custom worker names/classes must not be matched by substring.
+    if (
+        getattr(parallel_config, "worker_cls", None)
+        != "vllm_ascend.worker.worker.NPUWorker"
+    ):
         return
-    current_s = "" if current is None else str(current)
-    is_auto = current_s in ("", "auto")
-    is_npu = any(
-        marker in current_s.lower()
-        for marker in ("vllm_ascend", "npuworker", "npu_worker")
-    )
-    if not is_auto and not is_npu:
-        return
-    if is_auto:
-        try:
-            import vllm_ascend  # noqa: F401
-        except ImportError:
-            return
     parallel_config.worker_cls = PP_ASCEND_WORKER
     logger.info("PP hetero/trace enabled: worker_cls=%s", PP_ASCEND_WORKER)

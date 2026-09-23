@@ -34,8 +34,8 @@ from vllm.distributed.pp_partition import (
     Workload,
     add_cost_model_args,
     format_plan,
-    load_trace_records,
     plan_from_trace_dir,
+    require_complete_traces,
 )
 from vllm.logger import init_logger
 
@@ -55,6 +55,8 @@ class ProfileWorkload:
     num_iters_warmup: int = 0
     ignore_eos: bool = True
     temperature: float = 1.0
+    warmup_prompts: list[PromptTokens] | None = None
+    iteration_prompts: list[list[PromptTokens]] | None = None
 
 
 def build_profile_workload(
@@ -98,15 +100,35 @@ def build_profile_workload(
         raise ValueError(f"num_iters_warmup must be >= 0, got {num_iters_warmup}")
 
     rng = random.Random(seed)
-    prompts: list[PromptTokens] = []
-    for _ in range(num_prompts):
-        token_ids = [rng.randrange(1, vocab_size) for _ in range(input_len)]
-        prompts.append({"prompt_token_ids": token_ids})
+    previous: set[tuple[int, ...]] = set()
+
+    def new_prompts() -> list[PromptTokens]:
+        prompts = []
+        for _ in range(num_prompts):
+            for _attempt in range(1000):
+                token_ids = [rng.randrange(1, vocab_size) for _ in range(input_len)]
+                if tuple(token_ids) not in previous:
+                    break
+            else:
+                raise ValueError(
+                    "not enough distinct synthetic prompts; increase vocab_size "
+                    "or input_len, or reduce iteration counts"
+                )
+            prompts.append({"prompt_token_ids": token_ids})
+        previous.update(tuple(p["prompt_token_ids"]) for p in prompts)
+        return prompts
+
+    # Each measured iteration uses fresh prompts; otherwise later iterations
+    # could hit the prefix cache populated by the first measured iteration.
+    iterations = [new_prompts() for _ in range(num_iters)]
+    warmup = new_prompts() if num_iters_warmup else None
     return ProfileWorkload(
-        prompts=prompts,
+        prompts=iterations[0],
         max_tokens=output_len,
         num_iters=num_iters,
         num_iters_warmup=num_iters_warmup,
+        warmup_prompts=warmup,
+        iteration_prompts=iterations,
     )
 
 
@@ -131,41 +153,6 @@ def prepare_trace_dir(dump_dir: str | Path | None = None) -> Path:
     return path
 
 
-def require_complete_traces(
-    dump_dir: str | Path,
-    pp_size: int | None = None,
-) -> dict[int, list[dict[str, Any]]]:
-    """Load traces and fail if any expected PP rank is missing or empty.
-
-    Args:
-        dump_dir: Directory of ``pp_stage_pp*_tp*.jsonl`` files.
-        pp_size: If set, require exactly this many contiguous ranks from 0.
-
-    Returns:
-        Records grouped by PP rank.
-
-    Raises:
-        FileNotFoundError: Missing files or missing ranks.
-        ValueError: A rank file exists but has no records.
-    """
-    records = load_trace_records(dump_dir)
-    if not records:
-        raise ValueError(f"empty traces in {dump_dir}")
-    ranks = sorted(records)
-    if ranks != list(range(len(ranks))):
-        raise FileNotFoundError(
-            f"PP ranks must be contiguous from 0, found {ranks} in {dump_dir}"
-        )
-    if pp_size is not None and len(ranks) != pp_size:
-        raise FileNotFoundError(
-            f"expected traces for {pp_size} PP ranks, found {ranks} in {dump_dir}"
-        )
-    empty = [rank for rank, recs in records.items() if not recs]
-    if empty:
-        raise ValueError(f"empty traces for PP ranks {empty} in {dump_dir}")
-    return records
-
-
 def run_traced_generate(llm: Any, workload: ProfileWorkload) -> None:
     """Feed ``workload`` into ``llm.generate`` (warmup then measured iters).
 
@@ -175,6 +162,22 @@ def run_traced_generate(llm: Any, workload: ProfileWorkload) -> None:
     """
     from vllm.sampling_params import SamplingParams
 
+    measured = workload.iteration_prompts
+    if measured is None:
+        measured = [workload.prompts] * workload.num_iters
+    if len(measured) != workload.num_iters or any(not prompts for prompts in measured):
+        raise ValueError("provide one nonempty prompt batch per measured iteration")
+    if workload.num_iters_warmup:
+        if not workload.warmup_prompts:
+            raise ValueError("warmup requires separate warmup_prompts")
+        measured_keys = {
+            tuple(p["prompt_token_ids"]) for prompts in measured for p in prompts
+        }
+        if any(
+            tuple(p["prompt_token_ids"]) in measured_keys
+            for p in workload.warmup_prompts
+        ):
+            raise ValueError("warmup prompts must differ from measured prompts")
     sampling_params = SamplingParams(
         temperature=workload.temperature,
         ignore_eos=workload.ignore_eos,
@@ -191,7 +194,9 @@ def run_traced_generate(llm: Any, workload: ProfileWorkload) -> None:
             "warmup" if i < workload.num_iters_warmup else "traced",
         )
         llm.generate(
-            workload.prompts,
+            workload.warmup_prompts
+            if i < workload.num_iters_warmup
+            else measured[i - workload.num_iters_warmup],
             sampling_params=sampling_params,
             use_tqdm=False,
         )
@@ -259,6 +264,8 @@ def format_serve_command(plan: PPPartitionPlan) -> str:
         )
     lines.append("Re-serve with:")
     exports = [f"VLLM_PP_LAYER_PARTITION={plan.env_value}"]
+    if plan.device_order:
+        exports.append("VLLM_PP_DEVICE_ORDER=" + ",".join(map(str, plan.device_order)))
     for item in exports:
         name, value = item.split("=", 1)
         lines.append(f"  {name}={shlex.quote(value)} \\")
@@ -294,23 +301,10 @@ def clear_trace_files(dump_dir: str | Path) -> None:
             path.unlink()
 
 
-def _ensure_ascend_pp_worker(engine_args: Any) -> None:
-    """Use the tracing NPUWorker subclass when vllm-ascend is installed."""
-    try:
-        import vllm_ascend  # noqa: F401
-    except ImportError:
-        return
-    current = getattr(engine_args, "worker_cls", None)
-    if current in (None, "", "auto"):
-        engine_args.worker_cls = "vllm.v1.worker.pp_ascend_worker.PPAscendWorker"
-
-
 def _default_llm_factory(engine_args: Any) -> Any:
     from vllm import LLM
 
-    _ensure_ascend_pp_worker(engine_args)
-    if hasattr(LLM, "from_engine_args"):
-        return LLM.from_engine_args(engine_args)
+    # VllmConfig selects the PP tracing worker after platform configuration.
     return LLM(**vars(engine_args))
 
 
@@ -340,16 +334,14 @@ def profile_pp_partition(
     num_layers: int | None = None,
     min_pp_size: int = 1,
     max_pp_size: int | None = None,
-    overlap_comm: bool = False,
     memory_profile: PPMemoryProfile | str | Path | None = None,
     allow_unchecked_memory: bool = False,
     output_json: str | Path | None = None,
     compute_model: ComputeModel = "shape-affine",
     fit_trace_dirs: Sequence[str | Path] = (),
     collect_only: bool = False,
-    comm_source: str = "serving",
     device_selection: bool = False,
-    layer_aggregation: str = "phase-balanced",
+    layer_aggregation: str = "microbatch",
 ) -> PPPartitionPlan | None:
     """Run the profile pipeline and return the DP layer split.
 
@@ -375,7 +367,6 @@ def profile_pp_partition(
         num_layers: Optional hidden-layer count override.
         min_pp_size: Smallest PP size the DP may choose.
         max_pp_size: Largest PP size the DP may choose.
-        overlap_comm: Throughput DP uses max(compute, comm) when True.
         memory_profile: Explicit target serving memory bounds, or sidecar JSON.
         allow_unchecked_memory: Permit timing-only analysis without bounds.
         output_json: Optional plan JSON path.
@@ -402,7 +393,6 @@ def profile_pp_partition(
         dump_dir,
         allow_unchecked_memory=allow_unchecked_memory or collect_only,
     )
-    planner_hetero: str | None
     if not skip_run:
         if llm_factory is None:
             if engine_args is None:
@@ -445,10 +435,6 @@ def profile_pp_partition(
                     )
                 memory_profile.validate_engine_config(config)
             run_traced_generate(llm, workload)
-            if comm_source == "replay":
-                llm.collective_rpc("profile_pp_links", args=())
-            if device_selection:
-                llm.collective_rpc("profile_pp_links", args=(3, 10, True))
         finally:
             try:
                 if llm is not None:
@@ -458,17 +444,13 @@ def profile_pp_partition(
                     os.environ.pop("VLLM_PP_COMPUTE_MODEL", None)
                 else:
                     os.environ["VLLM_PP_COMPUTE_MODEL"] = previous_mode
-        require_complete_traces(dump_dir, pp_size=pp_size)
-        # Traces already include worker stretch; do not scale again.
-        planner_hetero = ""
     else:
         if dump_dir is None:
             raise ValueError("--trace-dir is required with --skip-run")
         dump_dir = Path(dump_dir)
-        require_complete_traces(dump_dir, pp_size=pp_size)
-        planner_hetero = None
 
     if collect_only:
+        require_complete_traces(dump_dir, pp_size=pp_size)
         if memory_profile is not None:
             (Path(dump_dir) / "pp_memory_profile.json").write_text(
                 json.dumps(memory_profile.to_dict(), indent=2) + "\n", encoding="utf-8"
@@ -478,19 +460,17 @@ def profile_pp_partition(
 
     plan = plan_from_trace_dir(
         dump_dir,
+        expected_pp_size=pp_size,
         objective=objective,
         workload=workload_kind,
         warmup_steps=warmup_steps,
         num_layers=num_layers,
         min_pp_size=min_pp_size,
         max_pp_size=max_pp_size,
-        overlap_comm=overlap_comm,
         memory_profile=memory_profile,
         allow_unchecked_memory=allow_unchecked_memory,
-        hetero=planner_hetero,
         compute_model=compute_model,
         fit_trace_dirs=fit_trace_dirs,
-        comm_source=comm_source,
         device_selection=device_selection,
         layer_aggregation=layer_aggregation,
     )
@@ -604,13 +584,11 @@ def run_from_cli_args(args: Any) -> PPPartitionPlan | None:
         num_layers=args.num_layers,
         min_pp_size=args.min_pp_size,
         max_pp_size=args.max_pp_size,
-        overlap_comm=args.overlap_comm,
         memory_profile=args.memory_profile,
         allow_unchecked_memory=args.allow_unchecked_memory,
         output_json=args.output_json,
         compute_model=args.compute_model,
         fit_trace_dirs=args.fit_trace_dirs,
-        comm_source=args.comm_source,
         device_selection=args.device_selection,
         layer_aggregation=args.layer_aggregation,
         collect_only=args.collect_only,

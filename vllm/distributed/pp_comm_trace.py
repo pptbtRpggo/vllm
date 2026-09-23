@@ -74,7 +74,8 @@ def paired_transfer(sender: dict, receiver: dict) -> tuple[str, dict]:
 
 def select_serving_communication(records: list[dict]) -> None:
     for record in records:
-        record["send_replay_ms"] = record.pop("send_service_ms", None)
+        record.pop("send_service_ms", None)
+        record.pop("send_replay_ms", None)
         record.pop("send_service_source", None)
         if record.get("send_overlap_status") == "paired":
             record["send_service_ms"] = record["send_overlap_ms"]

@@ -10,6 +10,7 @@ import pytest
 
 from tests.distributed.pp_trace_fixtures import write_fit_profile, write_trace
 from vllm.distributed.pp_profile import (
+    _default_llm_factory,
     build_profile_workload,
     clear_trace_files,
     format_serve_command,
@@ -56,7 +57,7 @@ def _rec(
         "send_ms": send_ms,
         "send_transfer_ms": 99999,
         "send_service_ms": send_ms,
-        "send_service_source": "measured_idle_replay",
+        "send_service_source": "measured_serving_overlap",
         "recv_bytes": None if pp_rank == 0 else 4096,
         "send_bytes": 4096 if send_ms is not None else None,
     }
@@ -118,7 +119,7 @@ class FakeLLM:
         )
 
     def collective_rpc(self, method, args=()):
-        pass  # Fixture traces already include link measurements.
+        pass  # No engine state to change on a warmup notification.
 
     def generate(self, prompts, sampling_params, use_tqdm=True):
         self.generate_calls.append(
@@ -145,7 +146,6 @@ def test_collect_only_does_not_fit_or_write_a_plan(tmp_path, monkeypatch):
     plan = profile_pp_partition(
         dump_dir=tmp_path,
         fit_trace_dirs=[tmp_path / "fit"],
-        comm_source="replay",
         llm_factory=lambda: llm,
         collect_only=True,
         allow_unchecked_memory=True,
@@ -157,6 +157,20 @@ def test_collect_only_does_not_fit_or_write_a_plan(tmp_path, monkeypatch):
     assert llm.closed
     assert len(require_complete_traces(tmp_path)) == 2
     assert not (tmp_path / "pp_partition_plan.json").exists()
+
+
+def test_profile_factory_leaves_worker_selection_to_platform(monkeypatch):
+    import sys
+
+    import vllm
+
+    # Having the Ascend package installed must not select its worker before
+    # VllmConfig has determined the actual platform.
+    monkeypatch.setitem(sys.modules, "vllm_ascend", SimpleNamespace())
+    args = SimpleNamespace(worker_cls="auto")
+    monkeypatch.setattr(vllm, "LLM", lambda **kwargs: SimpleNamespace(**kwargs))
+    assert _default_llm_factory(args).worker_cls == "auto"
+    assert args.worker_cls == "auto"
 
 
 def test_profile_marks_complete_warmup_iterations(tmp_path):
@@ -256,7 +270,7 @@ def test_require_complete_traces_empty_file(tmp_path):
         require_complete_traces(tmp_path, pp_size=2)
 
 
-def test_run_traced_generate_feeds_prompts_and_repeats():
+def test_run_traced_generate_uses_separate_warmup_and_fresh_measured_prompts():
     workload = build_profile_workload(
         num_prompts=2,
         input_len=5,
@@ -275,7 +289,15 @@ def test_run_traced_generate_feeds_prompts_and_repeats():
     assert call["max_tokens"] == 7
     assert call["ignore_eos"] is True
     assert call["use_tqdm"] is False
-    assert call["prompt_token_ids"] == [p["prompt_token_ids"] for p in workload.prompts]
+    assert call["prompt_token_ids"] == [
+        p["prompt_token_ids"] for p in workload.warmup_prompts
+    ]
+    groups = [set(map(tuple, c["prompt_token_ids"])) for c in llm.generate_calls]
+    assert groups[0].isdisjoint(groups[1] | groups[2])
+    assert groups[1].isdisjoint(groups[2])
+    assert llm.generate_calls[1]["prompt_token_ids"] == [
+        p["prompt_token_ids"] for p in workload.prompts
+    ]
 
 
 def test_shutdown_llm_calls_engine_core():
@@ -292,7 +314,6 @@ def test_write_profile_result_json(tmp_path, monkeypatch):
         allow_unchecked_memory=True,
         dump_dir=tmp_path,
         fit_trace_dirs=[tmp_path / "fit"],
-        comm_source="replay",
         skip_run=True,
         warmup_steps=5,
         min_pp_size=2,
@@ -307,6 +328,62 @@ def test_write_profile_result_json(tmp_path, monkeypatch):
     assert plan.env_value == "16,16"
 
 
+@pytest.mark.parametrize(
+    ("skip_run", "collect_only"), [(False, False), (True, False), (False, True)]
+)
+def test_profile_loads_each_trace_directory_once(
+    tmp_path, monkeypatch, skip_run, collect_only
+):
+    import vllm.distributed.pp_partition as partition
+
+    monkeypatch.delenv("VLLM_PP_HETERO", raising=False)
+    _write_two_rank_traces(tmp_path)
+    llm = FakeLLM(tmp_path, _two_rank_recs())
+    loads = []
+    original_load = partition.load_trace_records
+
+    def load(directory):
+        loads.append(Path(directory))
+        return original_load(directory)
+
+    monkeypatch.setattr(partition, "load_trace_records", load)
+    plan = profile_pp_partition(
+        dump_dir=tmp_path,
+        fit_trace_dirs=[tmp_path / "fit"],
+        llm_factory=lambda: llm,
+        engine_args=SimpleNamespace(pipeline_parallel_size=2),
+        skip_run=skip_run,
+        collect_only=collect_only,
+        allow_unchecked_memory=True,
+        warmup_steps=5,
+        min_pp_size=2,
+        max_pp_size=2,
+        num_iters=1,
+        num_iters_warmup=0,
+    )
+    expected = [tmp_path]
+    if not collect_only:
+        expected.append(tmp_path / "fit")
+        assert plan.partitions == [16, 16]
+    assert loads == expected
+
+
+@pytest.mark.parametrize("skip_run", [False, True])
+def test_profile_keeps_expected_rank_count_check(tmp_path, skip_run):
+    _write_two_rank_traces(tmp_path)
+    llm = FakeLLM(tmp_path, _two_rank_recs())
+    with pytest.raises(FileNotFoundError, match="expected traces for 3 PP ranks"):
+        profile_pp_partition(
+            dump_dir=tmp_path,
+            llm_factory=lambda: llm,
+            engine_args=SimpleNamespace(pipeline_parallel_size=3),
+            skip_run=skip_run,
+            allow_unchecked_memory=True,
+            num_iters=1,
+            num_iters_warmup=0,
+        )
+
+
 def test_profile_result_does_not_export_analysis_mock_environment(
     tmp_path, monkeypatch
 ):
@@ -318,7 +395,6 @@ def test_profile_result_does_not_export_analysis_mock_environment(
         allow_unchecked_memory=True,
         dump_dir=tmp_path,
         fit_trace_dirs=[tmp_path / "fit"],
-        comm_source="replay",
         skip_run=True,
         min_pp_size=2,
         max_pp_size=2,
@@ -338,7 +414,6 @@ def test_profile_skip_run_ignores_mock_environment(tmp_path, monkeypatch):
         allow_unchecked_memory=True,
         dump_dir=tmp_path,
         fit_trace_dirs=[tmp_path / "fit"],
-        comm_source="replay",
         skip_run=True,
         warmup_steps=5,
         min_pp_size=2,
@@ -385,7 +460,6 @@ def test_profile_live_run_sets_env_feeds_and_plans(tmp_path, monkeypatch):
         allow_unchecked_memory=True,
         dump_dir=tmp_path,
         fit_trace_dirs=[tmp_path / "fit"],
-        comm_source="replay",
         llm_factory=factory,
         engine_args=SimpleNamespace(pipeline_parallel_size=2),
         num_prompts=2,
@@ -422,7 +496,6 @@ def test_profile_fails_if_engine_writes_no_traces(tmp_path):
             allow_unchecked_memory=True,
             dump_dir=tmp_path,
             fit_trace_dirs=[tmp_path / "fit"],
-            comm_source="replay",
             llm_factory=lambda: llm,
             engine_args=SimpleNamespace(pipeline_parallel_size=2),
             num_prompts=1,
@@ -446,7 +519,6 @@ def test_profile_shutdown_runs_when_generate_raises(tmp_path):
             allow_unchecked_memory=True,
             dump_dir=tmp_path,
             fit_trace_dirs=[tmp_path / "fit"],
-            comm_source="replay",
             llm_factory=lambda: llm,
             engine_args=SimpleNamespace(pipeline_parallel_size=2),
             num_prompts=1,
@@ -467,7 +539,6 @@ def test_live_run_ignores_stale_traces(tmp_path):
             allow_unchecked_memory=True,
             dump_dir=tmp_path,
             fit_trace_dirs=[tmp_path / "fit"],
-            comm_source="replay",
             llm_factory=lambda: llm,
             engine_args=SimpleNamespace(pipeline_parallel_size=2),
             num_prompts=1,
@@ -497,7 +568,6 @@ def test_live_does_not_require_mock_link_parameters(tmp_path, monkeypatch):
         allow_unchecked_memory=True,
         dump_dir=tmp_path,
         fit_trace_dirs=[tmp_path / "fit"],
-        comm_source="replay",
         engine_args=SimpleNamespace(pipeline_parallel_size=2),
         min_pp_size=2,
     )
@@ -544,3 +614,31 @@ def test_profile_selects_worker_mode_and_restores_environment(
         assert run() is None
     assert os.environ["VLLM_PP_COMPUTE_MODEL"] == "previous-value"
     assert llm.closed == (fail_at != "construct")
+
+
+def test_synthetic_warmup_generation_is_reproducible():
+    kwargs = dict(
+        num_prompts=2,
+        input_len=8,
+        output_len=4,
+        num_iters=2,
+        num_iters_warmup=1,
+        seed=37,
+    )
+    assert build_profile_workload(**kwargs) == build_profile_workload(**kwargs)
+    with pytest.raises(ValueError, match="not enough distinct"):
+        build_profile_workload(
+            num_prompts=1, input_len=1, output_len=1, vocab_size=2, num_iters_warmup=1
+        )
+
+
+def test_custom_workload_cannot_reuse_measured_prompts_for_warmup():
+    from dataclasses import replace
+
+    workload = build_profile_workload(
+        num_prompts=1, input_len=8, output_len=1, num_iters_warmup=1
+    )
+    llm = FakeLLM(".", {}, write_traces=False)
+    with pytest.raises(ValueError, match="warmup prompts must differ"):
+        run_traced_generate(llm, replace(workload, warmup_prompts=workload.prompts))
+    assert llm.generate_calls == []

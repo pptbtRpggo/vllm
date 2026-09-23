@@ -237,9 +237,7 @@ def test_json_sidecar_roundtrip_and_serve_scope(tmp_path, monkeypatch):
     path.write_text(json.dumps(memory.to_dict()))
     assert PPMemoryProfile.from_file(path) == memory
     _write_traces(tmp_path, memory)
-    plan = plan_from_trace_dir(
-        tmp_path, fit_trace_dirs=[tmp_path / "fit"], comm_source="replay"
-    )
+    plan = plan_from_trace_dir(tmp_path, fit_trace_dirs=[tmp_path / "fit"])
     assert plan.partitions == [16, 16]
     write_profile_result(plan, tmp_path)
     payload = json.loads((tmp_path / "pp_partition_plan.json").read_text())
@@ -252,9 +250,7 @@ def test_json_sidecar_roundtrip_and_serve_scope(tmp_path, monkeypatch):
     assert "VLLM_PP_COMM_BANDWIDTH_GBPS" not in command
     _write_traces(tmp_path, memory, tp_size=2)
     with pytest.raises(ValueError, match="TP size"):
-        plan_from_trace_dir(
-            tmp_path, fit_trace_dirs=[tmp_path / "fit"], comm_source="replay"
-        )
+        plan_from_trace_dir(tmp_path, fit_trace_dirs=[tmp_path / "fit"])
 
 
 def _engine_config(memory):
@@ -299,7 +295,6 @@ def test_live_engine_scope_checked_before_generate_and_shutdown_on_failure(tmp_p
         profile_pp_partition(
             dump_dir=tmp_path,
             fit_trace_dirs=[tmp_path / "fit"],
-            comm_source="replay",
             llm_factory=lambda: llm,
             memory_profile=memory,
         )
@@ -375,8 +370,6 @@ def test_cli_requires_memory_and_honors_explicit_profile(tmp_path, capsys):
         str(tmp_path),
         "--fit-trace-dir",
         str(tmp_path / "fit"),
-        "--comm-source",
-        "replay",
     ]
     with pytest.raises(ValueError, match="memory feasibility requires"):
         PPProfileSubcommand.cmd(parser.parse_args(argv))
@@ -401,7 +394,6 @@ def test_live_memory_profile_is_saved_and_replay_is_equivalent(tmp_path):
     live = profile_pp_partition(
         dump_dir=tmp_path,
         fit_trace_dirs=[tmp_path / "fit"],
-        comm_source="replay",
         llm_factory=lambda: llm,
         memory_profile=memory,
     )
@@ -409,7 +401,6 @@ def test_live_memory_profile_is_saved_and_replay_is_equivalent(tmp_path):
         dump_dir=tmp_path,
         skip_run=True,
         fit_trace_dirs=[tmp_path / "fit"],
-        comm_source="replay",
     )
     assert events == ["shutdown"]
     assert live.to_dict() == replay.to_dict()
@@ -423,7 +414,6 @@ def test_bad_supplied_profile_cannot_be_ignored_by_opt_out(tmp_path):
         profile_pp_partition(
             dump_dir=tmp_path,
             fit_trace_dirs=[tmp_path / "fit"],
-            comm_source="replay",
             memory_profile=path,
             allow_unchecked_memory=True,
             skip_run=True,
@@ -453,8 +443,6 @@ def test_standalone_planner_loads_memory_profile(tmp_path, capsys):
             str(tmp_path),
             "--fit-trace-dir",
             str(tmp_path / "fit"),
-            "--comm-source",
-            "replay",
             "--memory-profile",
             str(path),
         ]

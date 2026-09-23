@@ -1,144 +1,85 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
-from datetime import timedelta
-from types import SimpleNamespace
 
 import pytest
-import torch
 
 from tests.distributed.pp_trace_fixtures import write_trace
+from tests.distributed.test_pp_layer_cost import layer_trace
 from vllm.distributed.pp_link_profile import (
-    attach_link_measurements,
+    load_topology_measurements,
     measured_transfer_ms,
-    profile_worker_links,
-    tensor_spec,
 )
+from vllm.distributed.pp_partition import load_trace_records
 
 
-def test_replay_join_requires_run_and_layout_match(tmp_path):
-    record = dict(pp_rank=0, tp_rank=0, send_service_ms=2.0)
-    write_trace(tmp_path / "pp_stage_pp0_tp0.jsonl", [record])
-    stale = record | dict(trace_id="another-run")
-    wrong_layout = record | dict(send_tensor_spec=[dict(name="different")])
-    attach_link_measurements(tmp_path, [record, stale, wrong_layout])
-    assert measured_transfer_ms(record) == 2
-    for invalid in [stale, wrong_layout, dict(send_transfer_ms=2, send_ms=2)]:
-        with pytest.raises(ValueError, match="missing measured"):
-            measured_transfer_ms(invalid)
+def test_unused_link_files_cannot_change_serving_cost(tmp_path):
+    for rank, rows in layer_trace().items():
+        write_trace(tmp_path / f"pp_stage_pp{rank}_tp0.jsonl", rows)
+    for name in ("pp_link_pp0_tp0.jsonl", "pp_topology_pp0_to1.jsonl"):
+        (tmp_path / name).write_text("invalid old data")
+    records = load_trace_records(tmp_path)
+    assert measured_transfer_ms(records[0][0]) == 3
+    assert load_topology_measurements([records], "all", 0) == {(0, 1): 1.2}
+    assert "send_replay_ms" not in records[0][0]
 
 
-def test_raw_endpoint_measurements_are_averaged(tmp_path):
-    record = dict(pp_rank=0, tp_rank=0, send_service_ms=2.0)
-    write_trace(tmp_path / "pp_stage_pp0_tp0.jsonl", [record])
-    path = tmp_path / "pp_link_pp0_tp0.jsonl"
-    row = json.loads(path.read_text())
-    row["samples"] = [
-        dict(sender_ms=1, receiver_ms=3),
-        dict(sender_ms=7, receiver_ms=2),
-    ]
-    path.write_text(json.dumps(row) + "\n")
-    attach_link_measurements(tmp_path, [record])
-    assert measured_transfer_ms(record) == 5
-    row["samples"][0]["sender_ms"] = float("nan")
-    path.write_text(json.dumps(row) + "\n")
-    with pytest.raises(ValueError, match="invalid measured"):
-        attach_link_measurements(tmp_path, [record])
-
-
-def test_payload_spec_preserves_tensor_count_shape_dtype():
-    tensors = dict(
-        hidden_states=torch.zeros(8, 16, dtype=torch.float16),
-        residual=torch.zeros(8, 16, dtype=torch.float32),
-    )
-    spec = tensor_spec(tensors)
-    assert len(spec) == 2
-    assert [s["dtype"] for s in spec] == ["float16", "float32"]
-    assert spec[0]["shape"] == [8, 16]
-    assert tensor_spec(dict(hidden_states=tensors["hidden_states"].t())) is None
-    assert tensor_spec(dict(extra="unsupported")) is None
-
-
-def _gloo_replay(rank, init_file, directory, all_pairs=False):
-    import vllm.distributed.parallel_state as parallel
-    from vllm.distributed.pp_hetero import PPHeteroConfig
-    from vllm.distributed.pp_stage_trace import PPStageTracer
-
-    torch.distributed.init_process_group(
-        "gloo",
-        init_method=f"file://{init_file}",
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=30),
-    )
-
-    # Use production tensor-dict transport methods with the real Gloo group.
-    class Group:
-        world_size = 2
-        ranks = [0, 1]
-        rank_in_group = rank
-        cpu_group = torch.distributed.group.WORLD
-        device_group = cpu_group
-        use_cpu_custom_send_recv = False
-        send_tensor_dict = parallel.GroupCoordinator.send_tensor_dict
-        recv_tensor_dict = parallel.GroupCoordinator.recv_tensor_dict
-        send_object = parallel.GroupCoordinator.send_object
-        recv_object = parallel.GroupCoordinator.recv_object
-        barrier = parallel.GroupCoordinator.barrier
-
-    parallel.get_pp_group = lambda: Group()
-    parallel.get_tp_group = lambda: SimpleNamespace(world_size=1)
-    tracer = PPStageTracer(directory, rank, 2, torch.device("cpu"), use_cuda=False)
-    tracer._records = [
-        SimpleNamespace(
-            is_warmup=False,
-            send_tensor_spec=tensor_spec(
-                dict(hidden_states=torch.zeros(4, 16), residual=torch.zeros(4, 16))
-            ),
+def test_link_means_include_mixed_and_drop_warmup():
+    rows = [
+        dict(
+            step=10,
+            num_tokens=2,
+            num_ctx_tokens=2,
+            num_generation_tokens=0,
+            send_service_ms=10,
         ),
-        SimpleNamespace(is_warmup=True, send_tensor_spec=None),
+        dict(
+            step=11,
+            num_tokens=1,
+            num_ctx_tokens=0,
+            num_generation_tokens=1,
+            send_service_ms=2,
+        ),
+        dict(
+            step=12,
+            num_tokens=2,
+            num_ctx_tokens=1,
+            num_generation_tokens=1,
+            send_service_ms=6,
+        ),
+        dict(step=13, num_tokens=1, is_warmup=True, send_service_ms=999),
     ]
-    worker = SimpleNamespace(
-        _pp_stage_tracer=tracer, _pp_hetero=PPHeteroConfig(), device=torch.device("cpu")
-    )
-    try:
-        profile_worker_links(worker, warmup=1, repeats=3, all_pairs=all_pairs)
-    finally:
-        tracer._records = []
-        tracer.close()
-        torch.distributed.destroy_process_group()
+    for row in rows:
+        row.update(profile_device_id=0, send_service_source="measured_serving_overlap")
+    records = {0: rows, 1: [dict(profile_device_id=1)]}
+    assert load_topology_measurements([records], "all", 5) == {(0, 1): 6}
+    assert load_topology_measurements([records], "decode", 5) == {(0, 1): 2}
 
 
-def test_real_two_process_transfer_without_bandwidth_config(tmp_path, monkeypatch):
-    monkeypatch.delenv("VLLM_PP_HETERO", raising=False)
-    monkeypatch.delenv("VLLM_PP_COMM_BANDWIDTH_GBPS", raising=False)
-    torch.multiprocessing.spawn(
-        _gloo_replay,
-        args=(str(tmp_path / "init"), str(tmp_path)),
-        nprocs=2,
-        join=True,
-    )
-    rows = (tmp_path / "pp_link_pp0_tp0.jsonl").read_text().splitlines()
-    assert len(rows) == 1
-    row = json.loads(rows[0])
-    assert row["source"] == "measured_idle_replay"
-    assert len(row["samples"]) == 3
-    assert all(s["sender_ms"] > 0 and s["receiver_ms"] > 0 for s in row["samples"])
-    assert not (tmp_path / "pp_link_pp1_tp0.jsonl").exists()
+def test_reordered_runs_use_device_pairs_and_sample_counts(tmp_path):
+    trace_sets = []
+    for name, order, repeats in [("first", [0, 1], (1, 9)), ("second", [1, 0], (0, 2))]:
+        directory = tmp_path / name
+        directory.mkdir()
+        for rank, rows in layer_trace(repeats=repeats).items():
+            for row in rows:
+                row["device_id"] = order[rank]
+            write_trace(directory / f"pp_stage_pp{rank}_tp0.jsonl", rows)
+        trace_sets.append(load_trace_records(directory))
+    assert load_topology_measurements(trace_sets, "all", 0) == {(0, 1): 1.2, (1, 0): 1}
+    assert load_topology_measurements(trace_sets[:1], "all", 0) == {(0, 1): 1.2}
+    (tmp_path / "second" / "pp_device_map.json").write_text(json.dumps([0, 1]))
+    with pytest.raises(ValueError, match="conflicts"):
+        load_trace_records(tmp_path / "second")
 
 
-def test_all_pair_replay_includes_reverse_direction(tmp_path):
-    torch.multiprocessing.spawn(
-        _gloo_replay,
-        args=(str(tmp_path / "init"), str(tmp_path), True),
-        nprocs=2,
-        join=True,
-    )
-    for source, target in ((0, 1), (1, 0)):
-        row = json.loads(
-            (tmp_path / f"pp_topology_pp{source}_to{target}.jsonl").read_text()
+@pytest.mark.parametrize("value", [None, -1, 0, float("nan"), True])
+def test_bad_or_missing_measurement_cannot_be_a_link(value):
+    with pytest.raises(ValueError, match="measured"):
+        measured_transfer_ms(
+            dict(send_service_source="measured_serving_overlap", send_service_ms=value)
         )
-        assert row["pp_rank"] == source and row["dst_rank"] == target
-        assert row["reference_rank"] == 0
-        assert len(row["samples"]) == 3
-        assert all(s["sender_ms"] > 0 and s["receiver_ms"] > 0 for s in row["samples"])
+    with pytest.raises(ValueError, match="missing measured"):
+        measured_transfer_ms(
+            dict(send_service_source="measured_idle_replay", send_service_ms=1)
+        )

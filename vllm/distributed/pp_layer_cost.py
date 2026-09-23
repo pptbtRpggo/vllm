@@ -28,7 +28,7 @@ def _duration(value: Any) -> float:
     return float(value)
 
 
-def phase_groups(rows, workload, warmup_steps, aggregation="phase-balanced"):
+def phase_groups(rows, workload, warmup_steps, aggregation="microbatch"):
     from vllm.distributed.pp_partition import _keep_record
 
     if aggregation not in ("phase-balanced", "microbatch"):
@@ -58,7 +58,7 @@ def measured_layer_rank_costs(
     warmup_steps: int,
     num_layers: int | None = None,
     include_communication: bool = True,
-    layer_aggregation: str = "phase-balanced",
+    layer_aggregation: str = "microbatch",
 ) -> list[RankCost]:
     from vllm.distributed.pp_partition import RankCost
 
@@ -137,8 +137,8 @@ def measured_layer_rank_costs(
                     "endpoint times plus runner overhead must match residual"
                 )
         scales = {r.get("comm_scale", 1.0) for r in rows}
-        if len(scales) != 1 or any(not math.isfinite(v) or v <= 0 for v in scales):
-            raise ValueError("profiles mix communication scales or have invalid scales")
+        if any(not math.isfinite(v) or v <= 0 for v in scales):
+            raise ValueError("profiles have invalid communication scales")
 
         def endpoint(key, groups=groups):
             # Endpoint roles may be collected in additional reordered runs.

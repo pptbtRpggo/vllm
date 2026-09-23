@@ -110,12 +110,11 @@ def test_serving_windows_reach_dp_without_replay_or_mock_config(tmp_path, monkey
     plan = plan_from_trace_dir(
         tmp_path,
         fit_trace_dirs=[fit_dir],
-        comm_source="serving",
         min_pp_size=2,
         allow_unchecked_memory=True,
     )
     assert plan.cost_ms == 4
     assert plan.rank_costs[0].comm_source == "measured_serving_overlap"
-    loaded = load_trace_records(tmp_path, comm_source="serving")
+    loaded = load_trace_records(tmp_path)
     assert loaded[0][0]["send_arrival_wait_ms"] == 8
     assert loaded[0][0]["send_service_ms"] == 2

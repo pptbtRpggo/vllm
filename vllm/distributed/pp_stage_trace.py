@@ -10,7 +10,6 @@ Enabled by ``VLLM_PP_STAGE_TRACE=/path/to/dir``. Each PP rank writes
 * ``recv_ms`` / ``send_ms`` — blocking wait for the previous/next rank's
   intermediate-tensor transfer. Timed with CPU clock + device sync,
   because NCCL runs on its own stream.
-* ``send_tensor_spec`` — actual outgoing tensor layouts for idle link replay.
 
 Tracing additionally synchronizes the device so each JSONL line is
 self-contained. The ordinary NCCL send path in this checkout already inserts
@@ -31,11 +30,14 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
 
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
 
@@ -127,7 +129,7 @@ class PPStageTraceRecord:
     compute_delay_ms: float | None = None
     is_warmup: bool = False
     trace_id: str = ""
-    send_tensor_spec: list[dict[str, Any]] | None = None
+    device_id: int | None = None
     trace_session: str | None = None
     clock_domain: str | None = None
     batch_id: str | None = None
@@ -165,6 +167,12 @@ class PPStageTracer:
         self._layer_measurement: dict[str, Any] = {}
         self._layer_timer = None
         self._layer_model = None
+        from vllm.distributed.pp_hetero import parse_device_order
+
+        order = parse_device_order(os.environ.get("VLLM_PP_DEVICE_ORDER"))
+        if order and len(order) != pp_size:
+            raise ValueError("VLLM_PP_DEVICE_ORDER length must match PP size")
+        self.device_id = order[pp_rank] if order else None
         os.makedirs(dump_dir, exist_ok=True)
         self.pp_rank = pp_rank
         self.pp_size = pp_size
@@ -186,7 +194,8 @@ class PPStageTracer:
         self.clock_domain = monotonic_clock_domain()
         self._comm_windows: dict[str, int] = {}
         self.is_warmup = False
-        self._records: list[PPStageTraceRecord] = []
+        self._timing_sums = dict(compute_ms=0.0, recv_ms=0.0, send_ms=0.0)
+        self._timing_counts = dict(compute_ms=0, recv_ms=0, send_ms=0)
         if self.use_cuda:
             self._start_event = torch.cuda.Event(enable_timing=True)
             self._end_event = torch.cuda.Event(enable_timing=True)
@@ -312,6 +321,43 @@ class PPStageTracer:
             compute_delay_ms=(end - delay_start) * 1000,
         )
 
+    def record_step(
+        self,
+        scheduler_output: SchedulerOutput,
+        *,
+        batch: dict[str, Any],
+        batch_id: str | None,
+        compute_timing: dict[str, float],
+        recv_ms: float | None,
+        send_ms: float | None,
+        recv_bytes: int | None,
+        send_bytes: int | None,
+        start_layer: int | None,
+        end_layer: int | None,
+        compute_scale: float,
+        comm_scale: float,
+    ) -> PPStageTraceRecord:
+        """Record one completed worker step with the pre-execution batch shape.
+
+        GPU and Ascend workers share this field mapping. A last stage passes
+        None for send timing and bytes; intermediate stages record after send.
+        """
+        return self.record(
+            num_tokens=scheduler_output.total_num_scheduled_tokens,
+            num_reqs=len(scheduler_output.num_scheduled_tokens),
+            **batch,
+            batch_id=batch_id,
+            **compute_timing,
+            recv_ms=recv_ms,
+            send_ms=send_ms,
+            recv_bytes=recv_bytes,
+            send_bytes=send_bytes,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            compute_scale=compute_scale,
+            comm_scale=comm_scale,
+        )
+
     def record(
         self,
         *,
@@ -334,7 +380,6 @@ class PPStageTracer:
         compute_base_ms: float | None = None,
         compute_wall_ms: float | None = None,
         compute_delay_ms: float | None = None,
-        send_tensor_spec: list[dict[str, Any]] | None = None,
         batch_id: str | None = None,
     ) -> PPStageTraceRecord:
         if self.compute_model == "layer-measured" and not self._layer_measurement:
@@ -367,7 +412,7 @@ class PPStageTracer:
             compute_delay_ms=compute_delay_ms,
             is_warmup=self.is_warmup,
             trace_id=self.trace_id,
-            send_tensor_spec=send_tensor_spec,
+            device_id=self.device_id,
             trace_session=self.trace_session,
             clock_domain=self.clock_domain,
             batch_id=batch_id,
@@ -377,7 +422,11 @@ class PPStageTracer:
         )
         self._fp.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
         self._fp.flush()
-        self._records.append(rec)
+        for field in self._timing_sums:
+            value = getattr(rec, field)
+            if value is not None:
+                self._timing_sums[field] += value
+                self._timing_counts[field] += 1
         self._step += 1
         self._comm_windows.clear()
         self._layer_measurement.clear()
@@ -386,18 +435,19 @@ class PPStageTracer:
     def close(self) -> None:
         if self._fp.closed:
             return
-        if self._records:
-            comps = [r.compute_ms for r in self._records]
-            recvs = [r.recv_ms for r in self._records if r.recv_ms is not None]
-            sends = [r.send_ms for r in self._records if r.send_ms is not None]
+        if self._step:
+            means = {
+                field: f"{self._timing_sums[field] / count:.3f}" if count else "n/a"
+                for field, count in self._timing_counts.items()
+            }
             logger.info(
                 "PP stage tracer pp_rank=%s: %d steps, "
-                "mean compute_ms=%.3f recv_ms=%s send_ms=%s -> %s",
+                "mean compute_ms=%s recv_ms=%s send_ms=%s -> %s",
                 self.pp_rank,
-                len(self._records),
-                sum(comps) / len(comps),
-                f"{sum(recvs) / len(recvs):.3f}" if recvs else "n/a",
-                f"{sum(sends) / len(sends):.3f}" if sends else "n/a",
+                self._step,
+                means["compute_ms"],
+                means["recv_ms"],
+                means["send_ms"],
                 self._path,
             )
         self._fp.close()

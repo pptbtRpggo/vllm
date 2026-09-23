@@ -49,7 +49,7 @@ def trace(n0, repeats=(3, 1)):
                         compute_ms=99999,  # modeled value must not be fitted
                         send_transfer_ms=99999,
                         send_service_ms=(1, 5)[shape_id] if rank == 0 else None,
-                        send_service_source="measured_idle_replay",
+                        send_service_source="measured_serving_overlap",
                         compute_scale=1,
                         comm_scale=1,
                     )
@@ -196,21 +196,10 @@ def test_cli_trace_roundtrip_and_scale_guard(tmp_path, monkeypatch):
         dirs[0],
         fit_trace_dirs=dirs[1:],
         compute_model="shape-affine",
-        comm_source="replay",
         allow_unchecked_memory=True,
     )
     assert plan.partitions == [6, 2]
     assert plan.to_dict()["compute_model"] == "shape-affine"
-    with pytest.raises(ValueError, match="changed hetero scales"):
-        plan_from_trace_dir(
-            dirs[0],
-            fit_trace_dirs=dirs[1:],
-            hetero="1,2/1",
-            compute_model="shape-affine",
-            comm_source="replay",
-            allow_unchecked_memory=True,
-        )
-
     from vllm.distributed.pp_partition import main
 
     main(
@@ -220,8 +209,6 @@ def test_cli_trace_roundtrip_and_scale_guard(tmp_path, monkeypatch):
             str(dirs[1]),
             "--fit-trace-dir",
             str(dirs[2]),
-            "--comm-source",
-            "replay",
             "--compute-model",
             "shape-affine",
             "--allow-unchecked-memory",

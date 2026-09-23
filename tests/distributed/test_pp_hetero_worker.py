@@ -52,6 +52,7 @@ def test_worker_comm_delay_excludes_peer_wait(
     tmp_path,
     monkeypatch,
     compute_model="shape-affine",
+    network=False,
 ):
     module, worker_cls = _worker_module(backend, monkeypatch)
     now = [0.0]
@@ -104,6 +105,8 @@ def test_worker_comm_delay_excludes_peer_wait(
             now[0] += 0.010
         return None if rank == 2 else IntermediateTensors(payload)
 
+    if network:
+        monkeypatch.setenv("VLLM_PP_DEVICE_ORDER", "0,2,1")
     tracer = (
         PPStageTracer(
             str(tmp_path),
@@ -124,6 +127,20 @@ def test_worker_comm_delay_excludes_peer_wait(
         comm_scales=(4, 7),
         comm_bandwidth_gbps=(8, 8),
     )
+    if network:
+        from vllm.distributed.pp_hetero import PPNetwork
+
+        worker._pp_hetero = PPHeteroConfig(
+            compute_scales=(compute_scale,) * 3,
+            device_order=(0, 2, 1),
+            network=PPNetwork.from_json(
+                json.dumps(
+                    dict(
+                        bandwidth_gbps=[[8, 8 / 3], [8 / 6], []],
+                    )
+                )
+            ),
+        )
     from tests.distributed.test_pp_layer_trace import Decoder
 
     decoder_layers = torch.nn.ModuleList([Decoder(now, 0.010 / 16) for _ in range(48)])
@@ -171,6 +188,8 @@ def test_worker_comm_delay_excludes_peer_wait(
         assert record["batch_shape"] == [
             dict(query_tokens=1, context_tokens=32, prompt_tokens=0)
         ]
+        if network:
+            assert record["device_id"] == (0, 2, 1)[rank]
         assert record["num_generation_tokens"] == 1
         assert record["compute_wall_ms"] == pytest.approx(10 * compute_scale)
         assert record["compute_base_ms"] == pytest.approx(10)
@@ -180,9 +199,9 @@ def test_worker_comm_delay_excludes_peer_wait(
             )
             assert record["non_layer_compute_ms"] == pytest.approx(0, abs=1e-8)
         if rank:
-            assert (record["recv_end_ns"] - record["recv_start_ns"]) / 1e6 == pytest.approx(
-                100 + baseline_ms * (4, 7)[rank - 1]
-            )
+            assert (
+                record["recv_end_ns"] - record["recv_start_ns"]
+            ) / 1e6 == pytest.approx(100 + baseline_ms * (4, 7)[rank - 1])
             assert record["recv_bytes"] == wire_bytes
             assert record["recv_ms"] == pytest.approx(
                 100 + baseline_ms * (4, 7)[rank - 1]
@@ -191,7 +210,7 @@ def test_worker_comm_delay_excludes_peer_wait(
             assert record["send_bytes"] == wire_bytes
             assert record["send_ms"] == pytest.approx(300 + baseline_ms * (4, 7)[rank])
             assert "send_transfer_ms" not in record
-            assert record["send_tensor_spec"][0]["shape"] == [1_000_000]
+            assert "send_tensor_spec" not in record
         else:
             assert "send_transfer_ms" not in record
 
@@ -201,4 +220,13 @@ def test_worker_comm_delay_excludes_peer_wait(
 def test_worker_wrapper_layer_measurement(backend, rank, tmp_path, monkeypatch):
     test_worker_comm_delay_excludes_peer_wait(
         backend, rank, True, 1, tmp_path, monkeypatch, compute_model="layer-measured"
+    )
+
+
+@pytest.mark.parametrize("backend", ["cuda", "ascend", "ascend_sp"])
+@pytest.mark.parametrize("rank", [0, 1, 2])
+@pytest.mark.parametrize("tracing", [False, True])
+def test_worker_uses_device_pair_network(backend, rank, tracing, tmp_path, monkeypatch):
+    test_worker_comm_delay_excludes_peer_wait(
+        backend, rank, tracing, 1, tmp_path, monkeypatch, network=True
     )

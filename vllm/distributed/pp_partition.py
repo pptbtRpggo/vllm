@@ -7,9 +7,9 @@ partitions identify fixed and per-layer costs using actual microbatch shapes.
 When exact shapes do not recur, a nonnegative token/context feature fit is used.
 The primary trace defines the reference workload distribution for every rank.
 Alternatively, layer-measured uses a representative decoder mean per device,
-separate endpoint measurements and an arithmetic mean of prefill/decode means.
-Communication comes from paired serving timestamps (default) or measured idle
-replay (explicit). No configured bandwidth or slowdown is a planner cost.
+separate endpoint measurements and an observed microbatch mean by default.
+Communication comes only from paired serving timestamps. No configured
+bandwidth or slowdown is a planner cost.
 The shape-affine fit keeps device order/PP size and excludes unprofiled lengths.
 Representative layer measurements additionally support device subset/order DP.
 This is a mean occupancy surrogate, not an E2E serving schedule simulation.
@@ -40,9 +40,6 @@ from vllm.distributed.pp_comm_trace import (
     attach_paired_communication,
     select_serving_communication,
 )
-from vllm.distributed.pp_link_profile import (
-    attach_link_measurements,
-)
 from vllm.distributed.pp_memory import PPMemoryProfile, resolve_memory_profile
 
 Objective = Literal["latency", "throughput"]
@@ -70,7 +67,7 @@ class RankCost:
     t_head_ms: float | None = None
     t_final_norm_ms: float | None = None
     phase_summary: tuple[dict[str, Any], ...] = ()
-    layer_aggregation: str = "phase-balanced"
+    layer_aggregation: str = "microbatch"
 
 
 @dataclass(frozen=True)
@@ -175,7 +172,8 @@ class PPPartitionPlan:
                     "t_final_norm_ms": cost.t_final_norm_ms,
                     "phase_summary": list(cost.phase_summary),
                     "layer_aggregation": cost.layer_aggregation
-                    if cost.compute_model == "layer-measured" else None,
+                    if cost.compute_model == "layer-measured"
+                    else None,
                     "t_layer_ms_kind": (
                         "representative_layer_mean"
                         if cost.compute_model == "layer-measured"
@@ -188,7 +186,7 @@ class PPPartitionPlan:
 
 
 def load_trace_records(
-    dump_dir: str | Path, *, comm_source: str = "serving"
+    dump_dir: str | Path,
 ) -> dict[int, list[dict[str, Any]]]:
     """Load ``pp_stage_pp*_tp0.jsonl`` (or any tp rank if tp0 is absent)."""
     dump_dir = Path(dump_dir)
@@ -205,12 +203,8 @@ def load_trace_records(
             rec = json.loads(line)
             by_key[(int(rec["pp_rank"]), int(rec["tp_rank"]))].append(rec)
 
-    attach_link_measurements(dump_dir, [r for rows in by_key.values() for r in rows])
     attach_paired_communication(by_key)
-    if comm_source == "serving":
-        select_serving_communication([r for rows in by_key.values() for r in rows])
-    elif comm_source != "replay":
-        raise ValueError(f"unknown communication source: {comm_source}")
+    select_serving_communication([r for rows in by_key.values() for r in rows])
     by_rank: dict[int, list[dict[str, Any]]] = {}
     ranks = sorted({rank for rank, _ in by_key})
     for rank in ranks:
@@ -222,7 +216,21 @@ def load_trace_records(
     # Optional mapping for endpoint profiles collected with a different order.
     # IDs refer to the primary run's devices, not to CUDA/NPU visible indices.
     mapping_path = dump_dir / "pp_device_map.json"
-    mapping = json.loads(mapping_path.read_text()) if mapping_path.exists() else ranks
+    recorded_ids = [{row.get("device_id") for row in by_rank[rank]} for rank in ranks]
+    if any(len(ids) != 1 for ids in recorded_ids):
+        raise ValueError("trace mixes device IDs within a rank")
+    observed = [next(iter(ids)) for ids in recorded_ids]
+    if any(d is not None for d in observed) and any(d is None for d in observed):
+        raise ValueError("trace has incomplete device IDs")
+    mapping = (
+        json.loads(mapping_path.read_text())
+        if mapping_path.exists()
+        else observed
+        if observed and observed[0] is not None
+        else ranks
+    )
+    if observed and observed[0] is not None and observed != mapping:
+        raise ValueError("pp_device_map.json conflicts with recorded device IDs")
     if (
         not isinstance(mapping, list)
         or any(type(d) is not int for d in mapping)
@@ -233,6 +241,41 @@ def load_trace_records(
         for row in rows:
             row["profile_device_id"] = mapping[rank]
     return by_rank
+
+
+def require_complete_traces(
+    dump_dir: str | Path,
+    pp_size: int | None = None,
+) -> dict[int, list[dict[str, Any]]]:
+    """Load traces and fail if any expected PP rank is missing or empty.
+
+    Args:
+        dump_dir: Directory of ``pp_stage_pp*_tp*.jsonl`` files.
+        pp_size: If set, require exactly this many contiguous ranks from 0.
+
+    Returns:
+        Records grouped by PP rank.
+
+    Raises:
+        FileNotFoundError: Missing files or missing ranks.
+        ValueError: A rank file exists but has no records.
+    """
+    records = load_trace_records(dump_dir)
+    if not records:
+        raise ValueError(f"empty traces in {dump_dir}")
+    ranks = sorted(records)
+    if ranks != list(range(len(ranks))):
+        raise FileNotFoundError(
+            f"PP ranks must be contiguous from 0, found {ranks} in {dump_dir}"
+        )
+    if pp_size is not None and len(ranks) != pp_size:
+        raise FileNotFoundError(
+            f"expected traces for {pp_size} PP ranks, found {ranks} in {dump_dir}"
+        )
+    empty = [rank for rank, recs in records.items() if not recs]
+    if empty:
+        raise ValueError(f"empty traces for PP ranks {empty} in {dump_dir}")
+    return records
 
 
 def _keep_record(
@@ -473,30 +516,35 @@ def plan_from_trace_dir(
     num_layers: int | None = None,
     min_pp_size: int = 1,
     max_pp_size: int | None = None,
-    overlap_comm: bool = False,
     memory_profile: PPMemoryProfile | str | Path | None = None,
     allow_unchecked_memory: bool = False,
-    hetero: str | None = None,
     compute_model: ComputeModel = "shape-affine",
     fit_trace_dirs: Sequence[str | Path] = (),
-    comm_source: str = "serving",
     device_selection: bool = False,
-    layer_aggregation: str = "phase-balanced",
+    layer_aggregation: str = "microbatch",
+    expected_pp_size: int | None = None,
 ) -> PPPartitionPlan:
     if device_selection and compute_model != "layer-measured":
         raise ValueError("device selection requires layer-measured")
-    if hetero:
-        raise ValueError(
-            "planner costs must come from measured traces; changed hetero scales "
-            "require recollecting traces, not rescaling costs"
-        )
-    records = load_trace_records(dump_dir, comm_source=comm_source)
+    records = require_complete_traces(dump_dir, pp_size=expected_pp_size)
     if any(
         row.get("profile_device_id", rank) != rank
         for rank, rows in records.items()
         for row in rows
     ):
         raise ValueError("primary trace must use the identity device mapping")
+    memory_profile = resolve_memory_profile(
+        memory_profile, dump_dir, allow_unchecked_memory=allow_unchecked_memory
+    )
+    if memory_profile is not None:
+        trace_tp_sizes = {
+            rec["tp_size"]
+            for rows in records.values()
+            for rec in rows
+            if "tp_size" in rec
+        }
+        if trace_tp_sizes and trace_tp_sizes != {memory_profile.tp_size}:
+            raise ValueError("memory profile TP size does not match timing traces")
     if compute_model in ("shape-affine", "layer-measured"):
         from vllm.distributed.pp_layer_cost import measured_layer_rank_costs
         from vllm.distributed.pp_shape_cost import fit_shape_rank_costs
@@ -506,9 +554,7 @@ def plan_from_trace_dir(
             if compute_model == "layer-measured"
             else fit_shape_rank_costs
         )
-        trace_sets = [records] + [
-            load_trace_records(p, comm_source=comm_source) for p in fit_trace_dirs
-        ]
+        trace_sets = [records] + [load_trace_records(p) for p in fit_trace_dirs]
         if compute_model == "shape-affine" and any(
             row.get("profile_device_id", rank) != rank
             for traces in trace_sets
@@ -532,24 +578,12 @@ def plan_from_trace_dir(
         )
     else:
         raise ValueError(f"unknown compute_model: {compute_model}")
-    memory_profile = resolve_memory_profile(
-        memory_profile, dump_dir, allow_unchecked_memory=allow_unchecked_memory
-    )
-    if memory_profile is not None:
-        trace_tp_sizes = {
-            rec["tp_size"]
-            for rows in records.values()
-            for rec in rows
-            if "tp_size" in rec
-        }
-        if trace_tp_sizes and trace_tp_sizes != {memory_profile.tp_size}:
-            raise ValueError("memory profile TP size does not match timing traces")
     if device_selection:
         from vllm.distributed.pp_device_partition import partition_devices
         from vllm.distributed.pp_link_profile import load_topology_measurements
 
         links = load_topology_measurements(
-            Path(dump_dir), records, workload, warmup_steps
+            trace_sets, workload, warmup_steps, layer_aggregation
         )
         return partition_devices(
             costs,
@@ -560,7 +594,6 @@ def plan_from_trace_dir(
             max_pp_size=max_pp_size,
             memory_profile=memory_profile,
             allow_unchecked_memory=allow_unchecked_memory,
-            overlap_comm=overlap_comm,
         )
     return partition_layers(
         costs,
@@ -568,7 +601,6 @@ def plan_from_trace_dir(
         num_layers=num_layers,
         min_pp_size=min_pp_size,
         max_pp_size=max_pp_size,
-        overlap_comm=overlap_comm,
         memory_profile=memory_profile,
         allow_unchecked_memory=allow_unchecked_memory,
     )
@@ -619,22 +651,16 @@ def add_cost_model_args(parser: Any) -> None:
     parser.add_argument(
         "--layer-aggregation",
         choices=("phase-balanced", "microbatch"),
-        default="phase-balanced",
+        default="microbatch",
         help=(
-            "Direct layer timing: equal prefill/decode means (legacy default), "
-            "or equal weight per observed microbatch, including mixed steps."
+            "Direct layer timing: optional equal prefill/decode means, "
+            "or equal weight per observed microbatch (default), including mixed steps."
         ),
     )
     parser.add_argument(
         "--device-selection",
         action="store_true",
         help="Select device subset/order using layer-measured costs and topology.",
-    )
-    parser.add_argument(
-        "--comm-source",
-        choices=("replay", "serving"),
-        default="serving",
-        help="Idle link replay or paired same-host serving send/recv windows.",
     )
     parser.add_argument(
         "--compute-model",
@@ -661,20 +687,6 @@ def add_cost_model_args(parser: Any) -> None:
         action="store_true",
         help="Explicit timing-only analysis without memory bounds; no deployable plan.",
     )
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--overlap-comm",
-        dest="overlap_comm",
-        action="store_true",
-        help="Use ideal compute/communication overlap (does not change runtime).",
-    )
-    group.add_argument(
-        "--no-overlap-comm",
-        dest="overlap_comm",
-        action="store_false",
-        help="Use blocking recv+compute+send occupancy (default).",
-    )
-    parser.set_defaults(overlap_comm=False)
 
 
 def main(argv: Iterable[str] | None = None) -> None:
@@ -724,12 +736,10 @@ def main(argv: Iterable[str] | None = None) -> None:
         num_layers=args.num_layers,
         min_pp_size=min_pp,
         max_pp_size=max_pp,
-        overlap_comm=args.overlap_comm,
         memory_profile=args.memory_profile,
         allow_unchecked_memory=args.allow_unchecked_memory,
         compute_model=args.compute_model,
         fit_trace_dirs=args.fit_trace_dirs,
-        comm_source=args.comm_source,
         device_selection=args.device_selection,
         layer_aggregation=args.layer_aggregation,
     )

@@ -19,7 +19,6 @@ from vllm_ascend.worker.worker import NPUWorker
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.distributed.pp_batch_shape import scheduled_batch_id, scheduled_batch_shape
 from vllm.distributed.pp_hetero import PPHeteroConfig, sync_torch_device, time_call
-from vllm.distributed.pp_link_profile import profile_worker_links, tensor_spec
 from vllm.distributed.pp_stage_trace import (
     PPStageTracer,
     layer_range_from_runner,
@@ -48,6 +47,7 @@ class PPAscendWorker(NPUWorker):
         super().init_device()
         self._pp_stage_tracer = maybe_create_pp_stage_tracer(self.device)
         self._pp_hetero = PPHeteroConfig.from_env()
+        self._pp_hetero.validate_pp_size(get_pp_group().world_size)
 
     def shutdown(self) -> None:
         if tracer := getattr(self, "_pp_stage_tracer", None):
@@ -74,11 +74,6 @@ class PPAscendWorker(NPUWorker):
         from vllm.distributed.pp_memory import observe_worker_memory
 
         return observe_worker_memory(self)
-
-    def profile_pp_links(
-        self, warmup: int = 3, repeats: int = 10, all_pairs: bool = False
-    ) -> None:
-        profile_worker_links(self, warmup, repeats, all_pairs=all_pairs)
 
     def set_pp_profile_warmup(self, enabled: bool) -> None:
         if tracer := getattr(self, "_pp_stage_tracer", None):
@@ -161,23 +156,23 @@ class PPAscendWorker(NPUWorker):
             send_ms = hetero.stretch_send(pp_rank, send_ms, payload_bytes=send_bytes)
             if tracer is not None:
                 send_ms = tracer.finish_comm("send")
-            if tracer is not None:
-                tracer.record(
-                    num_tokens=scheduler_output.total_num_scheduled_tokens,
-                    num_reqs=len(scheduler_output.num_scheduled_tokens),
-                    **batch,
-                    batch_id=batch_id,
-                    **compute_timing,
-                    recv_ms=recv_ms,
-                    send_ms=send_ms,
-                    recv_bytes=recv_bytes,
-                    send_bytes=send_bytes,
-                    start_layer=start_layer,
-                    end_layer=end_layer,
-                    send_tensor_spec=tensor_spec(output.tensors),
-                    compute_scale=hetero.compute_scale(pp_rank),
-                    comm_scale=hetero.comm_scale(pp_rank),
-                )
+
+        if tracer is not None:
+            tracer.record_step(
+                scheduler_output,
+                batch=batch,
+                batch_id=batch_id,
+                compute_timing=compute_timing,
+                recv_ms=recv_ms,
+                send_ms=send_ms,
+                recv_bytes=recv_bytes,
+                send_bytes=send_bytes,
+                start_layer=start_layer,
+                end_layer=end_layer,
+                compute_scale=hetero.compute_scale(pp_rank),
+                comm_scale=hetero.comm_scale(pp_rank),
+            )
+        if isinstance(output, IntermediateTensors):
             kv_connector_output = getattr(output, "kv_connector_output", None)
             if not kv_connector_output:
                 return None
@@ -190,22 +185,6 @@ class PPAscendWorker(NPUWorker):
             result.kv_connector_output = kv_connector_output
             return result
 
-        if tracer is not None:
-            tracer.record(
-                num_tokens=scheduler_output.total_num_scheduled_tokens,
-                num_reqs=len(scheduler_output.num_scheduled_tokens),
-                **batch,
-                batch_id=batch_id,
-                **compute_timing,
-                recv_ms=recv_ms,
-                send_ms=None,
-                recv_bytes=recv_bytes,
-                send_bytes=None,
-                start_layer=start_layer,
-                end_layer=end_layer,
-                compute_scale=hetero.compute_scale(pp_rank),
-                comm_scale=hetero.comm_scale(pp_rank),
-            )
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
         raise TypeError(f"Unexpected traced PP output type: {type(output)}")

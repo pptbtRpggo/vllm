@@ -48,14 +48,16 @@ def layer_trace(cut=4, repeats=(1, 9)):
                         final_norm_ms=norm,
                         compute_wall_ms=sum(layers.values()) + residual,
                         send_service_ms=factor if rank == 0 else None,
-                        send_service_source="measured_idle_replay",
+                        send_service_source="measured_serving_overlap",
                     )
                 )
     return result
 
 
 def aggregate(profiles, workload="all"):
-    return measured_layer_rank_costs(profiles, workload=workload, warmup_steps=0)
+    return measured_layer_rank_costs(
+        profiles, workload=workload, warmup_steps=0, layer_aggregation="phase-balanced"
+    )
 
 
 def test_phase_means_are_equal_weighted_and_mixed_excluded():
@@ -137,12 +139,11 @@ def test_offline_planner_layer_mode(tmp_path):
     plan = plan_from_trace_dir(
         tmp_path,
         compute_model="layer-measured",
-        comm_source="replay",
         warmup_steps=0,
         allow_unchecked_memory=True,
     )
     assert plan.partitions == [7, 1]
-    assert plan.to_dict()["workload_aggregation"] == "arithmetic_mean_of_phase_means"
+    assert plan.to_dict()["workload_aggregation"] == "observed_microbatch_mean"
 
 
 def test_layer_mode_preserves_memory_constraints():
@@ -189,9 +190,10 @@ def test_representative_cost_averages_different_layers():
 def test_microbatch_mean_includes_mixed_and_uses_observed_frequencies():
     records = layer_trace()  # one prefill, nine decode steps per rank
     for rows in records.values():
-        mixed = dict(rows[0], batch_shape=[
-            dict(query_tokens=32, prompt_tokens=31, context_tokens=32)
-        ])
+        mixed = dict(
+            rows[0],
+            batch_shape=[dict(query_tokens=32, prompt_tokens=31, context_tokens=32)],
+        )
         rows.append(mixed)
         # Exclusion must apply to computation, endpoints and communication alike.
         rows.append(dict(mixed, is_warmup=True, compute_wall_ms=99999))
@@ -213,7 +215,9 @@ def test_microbatch_mean_includes_mixed_and_uses_observed_frequencies():
 @pytest.mark.parametrize("workload", ["all", "decode"])
 def test_microbatch_mean_does_not_require_absent_prefill(workload):
     costs = measured_layer_rank_costs(
-        [layer_trace(repeats=(0, 9))], workload=workload, warmup_steps=0,
+        [layer_trace(repeats=(0, 9))],
+        workload=workload,
+        warmup_steps=0,
         layer_aggregation="microbatch",
     )
     assert [c.t_layer_ms for c in costs] == [1, 2]
@@ -222,6 +226,8 @@ def test_microbatch_mean_does_not_require_absent_prefill(workload):
 def test_invalid_layer_aggregation_rejected():
     with pytest.raises(ValueError, match="unknown layer aggregation"):
         measured_layer_rank_costs(
-            [layer_trace()], workload="all", warmup_steps=0,
+            [layer_trace()],
+            workload="all",
+            warmup_steps=0,
             layer_aggregation="unknown",
         )

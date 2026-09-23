@@ -124,41 +124,17 @@ def test_unmeasured_endpoint_or_link_cannot_be_chosen():
         partition_devices(c, {(0, 1): 1}, num_layers=6, allow_unchecked_memory=True)
     plan = partition_devices(c, {(0, 2): 1}, num_layers=6, allow_unchecked_memory=True)
     assert plan.device_order == (0, 2)
-    with pytest.raises(ValueError, match="blocking"):
-        partition_devices(
-            c, {(0, 2): 1}, overlap_comm=True, allow_unchecked_memory=True
-        )
 
 
-def test_cli_device_selection_uses_raw_topology_and_keeps_pool_memory(tmp_path):
+def test_cli_device_selection_uses_serving_traces_and_keeps_pool_memory(tmp_path):
     import json
 
     from tests.distributed.pp_trace_fixtures import write_trace
     from tests.distributed.test_pp_layer_cost import layer_trace
-    from vllm.distributed.pp_link_profile import payload_key
     from vllm.distributed.pp_profile import profile_pp_partition
 
     for rank, rows in layer_trace().items():
         write_trace(tmp_path / f"pp_stage_pp{rank}_tp0.jsonl", rows)
-    rows = [
-        json.loads(line)
-        for line in (tmp_path / "pp_stage_pp0_tp0.jsonl").read_text().splitlines()
-    ]
-    specs = {payload_key(r["send_tensor_spec"]) for r in rows}
-    raw = [
-        dict(
-            trace_id=rows[0]["trace_id"],
-            pp_rank=0,
-            dst_rank=1,
-            reference_rank=0,
-            payload_key=key,
-            source="measured_idle_replay",
-            samples=[dict(sender_ms=2, receiver_ms=1)] * 2,
-        )
-        for key in specs
-    ]
-    topology = tmp_path / "pp_topology_pp0_to1.jsonl"
-    topology.write_text("".join(json.dumps(r) + "\n" for r in raw))
     memory = _profile(
         [
             _device(r, 100, [1] * 8, first_stage_bytes=2, last_stage_bytes=4)
@@ -168,30 +144,29 @@ def test_cli_device_selection_uses_raw_topology_and_keeps_pool_memory(tmp_path):
     path = tmp_path / "pp_memory_profile.json"
     path.write_text(json.dumps(memory.to_dict()))
     original = path.read_bytes()
-    # Device selection uses its topology; adjacent clock pairing/replay may be
-    # unavailable (e.g. cross-host clocks). It must not depend on those costs.
-    for adjacent in tmp_path.glob("pp_link_*.jsonl"):
-        adjacent.unlink()
     plan = profile_pp_partition(
         dump_dir=tmp_path,
         skip_run=True,
         compute_model="layer-measured",
-        comm_source="replay",
         warmup_steps=0,
         device_selection=True,
     )
     assert plan.device_order == (0, 1)
+    from vllm.distributed.pp_profile import format_serve_command
+
+    assert "VLLM_PP_DEVICE_ORDER=0,1" in format_serve_command(plan)
     assert plan.partitions == [7, 1]
     assert path.read_bytes() == original
     assert (tmp_path / "pp_selected_memory_profile.json").exists()
-    raw[0]["trace_id"] = "stale"
-    topology.write_text("".join(json.dumps(r) + "\n" for r in raw))
-    with pytest.raises(ValueError, match="stale"):
-        profile_pp_partition(
-            dump_dir=tmp_path,
-            skip_run=True,
-            compute_model="layer-measured",
-            comm_source="replay",
-            warmup_steps=0,
-            device_selection=True,
-        )
+    assert plan.rank_costs[0].t_comm_out_ms == pytest.approx(1.2)
+    assert plan.rank_costs[0].t_layer_ms == pytest.approx(1.2)
+    # A fake topology file must neither override traces nor break planning.
+    (tmp_path / "pp_topology_pp0_to1.jsonl").write_text("corrupted stale replay")
+    again = profile_pp_partition(
+        dump_dir=tmp_path,
+        skip_run=True,
+        compute_model="layer-measured",
+        warmup_steps=0,
+        device_selection=True,
+    )
+    assert again.cost_ms == plan.cost_ms

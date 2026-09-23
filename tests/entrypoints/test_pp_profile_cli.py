@@ -43,7 +43,7 @@ def _rec(
         "send_ms": send_ms,
         "send_transfer_ms": 99999,
         "send_service_ms": send_ms,
-        "send_service_source": "measured_idle_replay",
+        "send_service_source": "measured_serving_overlap",
         "recv_bytes": None if pp_rank == 0 else 4096,
         "send_bytes": 4096 if send_ms is not None else None,
     }
@@ -186,8 +186,6 @@ def test_cmd_skip_run_prints_partition(
             str(tmp_path),
             "--fit-trace-dir",
             str(tmp_path / "fit"),
-            "--comm-source",
-            "replay",
             "--warmup-steps",
             "5",
             "--min-pp-size",
@@ -220,8 +218,6 @@ def test_cmd_skip_run_hetero_env_prints_env(
             str(tmp_path),
             "--fit-trace-dir",
             str(tmp_path / "fit"),
-            "--comm-source",
-            "replay",
             "--warmup-steps",
             "5",
             "--min-pp-size",
@@ -252,15 +248,7 @@ def test_cli_main_registers_pp_profile():
     assert "pp_profile" in source
 
 
-@pytest.mark.parametrize(
-    "flag,model,cost",
-    [
-        (None, "blocking", 16.2),
-        ("--no-overlap-comm", "blocking", 16.2),
-        ("--overlap-comm", "ideal_overlap", 16.0),
-    ],
-)
-def test_cost_model_flags_reach_planner(pp_profile_parser, tmp_path, flag, model, cost):
+def test_cli_uses_blocking_cost_model(pp_profile_parser, tmp_path):
     _write_two_rank_traces(tmp_path)
     argv = [
         "pp-profile",
@@ -270,30 +258,25 @@ def test_cost_model_flags_reach_planner(pp_profile_parser, tmp_path, flag, model
         str(tmp_path),
         "--fit-trace-dir",
         str(tmp_path / "fit"),
-        "--comm-source",
-        "replay",
         "--min-pp-size",
         "2",
         "--max-pp-size",
         "2",
     ]
-    if flag:
-        argv.append(flag)
     args = pp_profile_parser.parse_args(argv)
-    if flag == "--overlap-comm":
-        with pytest.raises(ValueError, match="blocking"):
-            PPProfileSubcommand.cmd(args)
-        return
     PPProfileSubcommand.cmd(args)
     payload = json.loads((tmp_path / "pp_partition_plan.json").read_text())
-    assert payload["cost_model"] == model
-    assert payload["predicted_cost_ms"] == pytest.approx(cost)
+    assert payload["cost_model"] == "blocking"
+    assert payload["predicted_cost_ms"] == pytest.approx(16.2)
 
 
-def test_legacy_trace_cli_requires_explicit_approximation(pp_profile_parser, tmp_path):
+def test_cli_rejects_missing_serving_timestamps(pp_profile_parser, tmp_path):
     _write_two_rank_traces(tmp_path)
-    for path in tmp_path.glob("pp_link_*.jsonl"):
-        path.unlink()
+    for path in tmp_path.glob("pp_stage_*.jsonl"):
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        for row in rows:
+            row.pop("send_start_ns", None)
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     argv = [
         "pp-profile",
         "--allow-unchecked-memory",
@@ -302,8 +285,6 @@ def test_legacy_trace_cli_requires_explicit_approximation(pp_profile_parser, tmp
         str(tmp_path),
         "--fit-trace-dir",
         str(tmp_path / "fit"),
-        "--comm-source",
-        "replay",
         "--min-pp-size",
         "2",
         "--max-pp-size",
@@ -316,7 +297,9 @@ def test_legacy_trace_cli_requires_explicit_approximation(pp_profile_parser, tmp
         pp_profile_parser.parse_args(argv)
 
 
-@pytest.mark.parametrize("aggregation,mean", [("phase-balanced", 2), ("microbatch", 1.2)])
+@pytest.mark.parametrize(
+    "aggregation,mean", [("phase-balanced", 2), ("microbatch", 1.2)]
+)
 def test_layer_mode_cli_reaches_planner(pp_profile_parser, tmp_path, aggregation, mean):
     from tests.distributed.test_pp_layer_cost import layer_trace
 
@@ -332,8 +315,6 @@ def test_layer_mode_cli_reaches_planner(pp_profile_parser, tmp_path, aggregation
             "layer-measured",
             "--layer-aggregation",
             aggregation,
-            "--comm-source",
-            "replay",
             "--allow-unchecked-memory",
             "--warmup-steps",
             "0",
@@ -346,6 +327,7 @@ def test_layer_mode_cli_reaches_planner(pp_profile_parser, tmp_path, aggregation
     assert payload["rank_costs"][0]["t_layer_ms"] == mean
     assert payload["rank_costs"][0]["t_embedding_ms"] == 2 * mean
     assert payload["workload_aggregation"] == (
-        "observed_microbatch_mean" if aggregation == "microbatch"
+        "observed_microbatch_mean"
+        if aggregation == "microbatch"
         else "arithmetic_mean_of_phase_means"
     )

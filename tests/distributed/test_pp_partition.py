@@ -8,7 +8,6 @@ from tests.distributed.pp_trace_fixtures import write_trace
 from vllm.distributed.pp_partition import (
     RankCost,
     partition_layers,
-    plan_from_trace_dir,
 )
 
 
@@ -50,7 +49,7 @@ def _rec(
         "send_ms": send_ms,
         "send_transfer_ms": 99999,
         "send_service_ms": send_ms,
-        "send_service_source": "measured_idle_replay",
+        "send_service_source": "measured_serving_overlap",
         "recv_bytes": None if pp_rank == 0 else send_bytes,
         "send_bytes": send_bytes if send_ms is not None else None,
     }
@@ -110,23 +109,6 @@ def test_forced_pp2_puts_more_layers_on_faster_rank():
     assert plan.partitions[0] in (2, 3)
     assert plan.partitions[1] == 32 - plan.partitions[0]
     assert plan.cost_ms == pytest.approx(31.0)
-
-
-@pytest.mark.parametrize("hetero", ["1,2", "/4"])
-def test_planner_rejects_posthoc_simulated_scaling(tmp_path, hetero):
-    for rank in range(2):
-        rec = _rec(
-            pp_rank=rank,
-            pp_size=2,
-            step=6,
-            start=rank * 16,
-            end=(rank + 1) * 16,
-            compute_ms=16,
-            send_ms=0.5 if rank == 0 else None,
-        )
-        _write_rank_jsonl(tmp_path / f"pp_stage_pp{rank}_tp0.jsonl", [rec])
-    with pytest.raises(ValueError, match="measured traces"):
-        plan_from_trace_dir(tmp_path, allow_unchecked_memory=True, hetero=hetero)
 
 
 def _simulate_blocking(compute, hops, num_batches=64):

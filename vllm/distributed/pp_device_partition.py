@@ -27,7 +27,6 @@ def partition_devices(
     max_pp_size=None,
     memory_profile=None,
     allow_unchecked_memory=False,
-    overlap_comm=False,
 ):
     if not costs or any(c.compute_model != "layer-measured" for c in costs):
         raise ValueError(
@@ -35,8 +34,6 @@ def partition_devices(
         )
     if objective not in ("latency", "throughput"):
         raise ValueError("unknown objective")
-    if overlap_comm:
-        raise ValueError("device selection uses vLLM blocking occupancy only")
     size = len(costs)
     n = sum(c.n_layers for c in costs) if num_layers is None else num_layers
     lo, hi = min_pp_size, min(size if max_pp_size is None else max_pp_size, size, n)
@@ -138,7 +135,7 @@ def partition_devices(
             costs[d],
             pp_rank=r,
             t_comm_out_ms=links[d, order[r + 1]] if r + 1 < len(order) else None,
-            comm_source="measured_idle_replay" if r + 1 < len(order) else "none",
+            comm_source="measured_serving_overlap" if r + 1 < len(order) else "none",
         )
         for r, d in enumerate(order)
     ]

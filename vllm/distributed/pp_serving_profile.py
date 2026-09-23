@@ -16,6 +16,7 @@ import json
 import math
 import random
 import time
+from collections import Counter
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -77,8 +78,7 @@ async def replay(
                 usage=response["usage"],
             )
 
-    # Drain successful requests even if another request fails; do not run link
-    # profiling after a failed workload or while requests are still in flight.
+    # Drain successful requests even if another request fails.
     results = await asyncio.gather(
         *(send(i, row) for i, row in enumerate(rows)), return_exceptions=True
     )
@@ -94,10 +94,18 @@ async def collect(
     model: str,
     concurrency: int,
     warmup_rounds: int,
-    measure_links: bool = False,
+    *,
+    warmup_rows: list[dict],
 ) -> dict:
     if warmup_rounds < 1:
         raise ValueError("at least one warmup round is required")
+    if not rows or not warmup_rows:
+        raise ValueError("measured and warmup request samples must both be nonempty")
+    measured_prompts = {json.dumps(row["request"]["prompt"]) for row in rows}
+    if any(
+        json.dumps(row["request"]["prompt"]) in measured_prompts for row in warmup_rows
+    ):
+        raise ValueError("warmup prompts must differ from measured prompts")
 
     async def rpc(method: str, args: list) -> None:
         response = await asyncio.to_thread(
@@ -108,31 +116,81 @@ async def collect(
 
     await rpc("set_pp_profile_warmup", [True])
     for _ in range(warmup_rounds):
-        await replay(rows, base_url, model, concurrency)
+        await replay(warmup_rows, base_url, model, concurrency)
     await rpc("set_pp_profile_warmup", [False])
     results = await replay(rows, base_url, model, concurrency)
-    if measure_links:
-        await rpc("profile_pp_links", [])
     return dict(
         model=model,
         concurrency=concurrency,
         warmup_rounds=warmup_rounds,
+        warmup_requests=len(warmup_rows),
         requests=results,
     )
 
 
-def sample_request_window(rows: list[dict], size: int, seed: int) -> list[dict]:
-    """Sample a contiguous arrival window, preserving spacing and request fields.
+def split_request_samples(
+    rows: list[dict], size: int | None, concurrency: int, seed: int
+) -> tuple[list[dict], list[dict], dict]:
+    """Randomly split one dataset into disjoint warmup and measured samples.
 
-    Independent random request selection would silently dilute arrival rate.
-    Do not mutate the source rows, since they may also be used for validation.
+    Keep the measured window contiguous to preserve its arrival rate. Warmup
+    is drawn from outside that window, excluding identical prompts even when
+    they occur at different dataset indices. Select a feasible window with
+    reservoir sampling and a sliding counter, without quadratic rescanning.
     """
-    if not 0 < size <= len(rows):
-        raise ValueError("sample size must be between 1 and the number of requests")
-    start = random.Random(seed).randrange(len(rows) - size + 1)
-    selected = rows[start : start + size]
-    origin = selected[0]["at_s"]
-    return [row | {"at_s": row["at_s"] - origin} for row in selected]
+    if len(rows) < 2 or concurrency < 1:
+        raise ValueError("need at least two requests and positive concurrency")
+    warmup_size = min(concurrency, max(1, len(rows) // 10))
+    if size is None:
+        size = len(rows) - warmup_size
+    if not 0 < size < len(rows):
+        raise ValueError("sample size must leave requests available for warmup")
+    warmup_size = min(warmup_size, len(rows) - size)
+    keys = [json.dumps(row["request"]["prompt"]) for row in rows]
+    totals = Counter(keys)
+    window = Counter(keys[:size])
+    available = len(rows) - sum(totals[key] for key in window)
+    rng = random.Random(seed)
+    selected_start = None
+    candidates = 0
+    for start in range(len(rows) - size + 1):
+        if available >= warmup_size:
+            candidates += 1
+            if rng.randrange(candidates) == 0:
+                selected_start = start
+        if start + size == len(rows):
+            break
+        old, new = keys[start], keys[start + size]
+        window[old] -= 1
+        if window[old] == 0:
+            available += totals[old]
+        if window[new] == 0:
+            available -= totals[new]
+        window[new] += 1
+    if selected_start is None:
+        raise ValueError(
+            "no disjoint warmup prompts available; reduce --sample-size "
+            "or use a dataset with more distinct prompts"
+        )
+    stop = selected_start + size
+    measured_keys = set(keys[selected_start:stop])
+    warmup_indices = sorted(
+        rng.sample(
+            [i for i, key in enumerate(keys) if key not in measured_keys], warmup_size
+        )
+    )
+
+    def rebase(indices):
+        origin = rows[indices[0]]["at_s"]
+        return [rows[i] | {"at_s": rows[i]["at_s"] - origin} for i in indices]
+
+    return (
+        rebase(warmup_indices),
+        rebase(range(selected_start, stop)),
+        dict(
+            measured_index_range=[selected_start, stop], warmup_indices=warmup_indices
+        ),
+    )
 
 
 def main() -> None:
@@ -143,21 +201,16 @@ def main() -> None:
     parser.add_argument(
         "--sample-size",
         type=int,
-        help="Sample a contiguous window of service requests.",
+        help="Measured window size; default reserves an automatic warmup sample.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--concurrency", type=int, required=True)
     parser.add_argument("--warmup-rounds", type=int, default=2)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
-        "--measure-links",
-        action="store_true",
-        help="Also collect idle link measurements for --comm-source replay.",
-    )
     args = parser.parse_args()
-    rows = load_requests(args.requests)
-    if args.sample_size is not None:
-        rows = sample_request_window(rows, args.sample_size, args.seed)
+    warmup_rows, rows, selection = split_request_samples(
+        load_requests(args.requests), args.sample_size, args.concurrency, args.seed
+    )
     # urlopen runs in a thread; allocate enough threads to avoid an implicit
     # default thread-pool cap changing the intended request arrival pattern.
     from concurrent.futures import ThreadPoolExecutor
@@ -172,7 +225,7 @@ def main() -> None:
                 args.model,
                 args.concurrency,
                 args.warmup_rounds,
-                measure_links=args.measure_links,
+                warmup_rows=warmup_rows,
             )
 
     if args.concurrency < 1:
@@ -182,7 +235,8 @@ def main() -> None:
         source=str(args.requests),
         size=len(rows),
         seed=args.seed,
-        contiguous_window=args.sample_size is not None,
+        contiguous_window=True,
+        **selection,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")

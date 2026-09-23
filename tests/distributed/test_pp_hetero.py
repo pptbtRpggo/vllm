@@ -4,16 +4,13 @@
 import pytest
 
 from vllm.distributed.pp_hetero import (
-    PP_ASCEND_WORKER,
     PPHeteroConfig,
-    format_hetero_spec,
-    hetero_spec_from_text,
-    maybe_override_pp_worker,
     parse_hetero_spec,
     parse_scale_list,
     scale_at,
     stretch_after,
 )
+from vllm.pp_hetero_env import PP_ASCEND_WORKER, maybe_override_pp_worker
 
 
 def test_parse_scale_list_empty():
@@ -72,10 +69,6 @@ def test_parse_hetero_spec():
     assert parse_hetero_spec("1,2/4") == ((1.0, 2.0), (4.0,))
     assert parse_hetero_spec("/4") == ((), (4.0,))
     assert parse_hetero_spec("1,2/") == ((1.0, 2.0), ())
-    assert format_hetero_spec((1.0, 2.0), (4.0,)) == "1,2/4"
-    assert hetero_spec_from_text("1,2", "4") == "1,2/4"
-    assert hetero_spec_from_text("1,2", None) == "1,2"
-    assert hetero_spec_from_text(None, "4") == "/4"
 
 
 def test_from_env_reads_unified_spec(monkeypatch):
@@ -141,27 +134,34 @@ def test_comm_bandwidth_rejects_invalid_values(value):
         PPHeteroConfig(comm_bandwidth_gbps=(value,))
 
 
-def test_export_env_preserves_comm_baseline(monkeypatch):
-    for name in (
-        "VLLM_PP_HETERO",
-        "VLLM_PP_COMM_BANDWIDTH_GBPS",
-        "VLLM_PP_COMM_LATENCY_MS",
-    ):
-        # Register an undo even when the variable was originally absent;
-        # export_env writes directly to os.environ.
-        monkeypatch.setenv(name, "")
-    cfg = PPHeteroConfig.from_text(
-        "1,2", "4", comm_bandwidth_gbps="8", comm_latency_ms="0"
-    )
-    cfg.export_env()
-    assert PPHeteroConfig.from_env() == cfg
-
-
-def test_maybe_override_swaps_npu_worker(monkeypatch):
-    monkeypatch.setenv("VLLM_PP_HETERO", "1,2")
+@pytest.mark.parametrize(
+    "trigger", ["VLLM_PP_HETERO", "VLLM_PP_STAGE_TRACE", "VLLM_PP_NETWORK"]
+)
+def test_maybe_override_swaps_npu_worker(monkeypatch, trigger):
+    monkeypatch.delenv("VLLM_PP_HETERO", raising=False)
+    monkeypatch.delenv("VLLM_PP_STAGE_TRACE", raising=False)
+    monkeypatch.setenv(trigger, "1,2" if trigger == "VLLM_PP_HETERO" else "/tmp/trace")
     cfg = type("PC", (), {"worker_cls": "vllm_ascend.worker.worker.NPUWorker"})()
     maybe_override_pp_worker(cfg)
     assert cfg.worker_cls == PP_ASCEND_WORKER
+
+
+@pytest.mark.parametrize(
+    "worker_cls",
+    [
+        "mock_layer_worker.MockLayerWorker",
+        "my_project.CustomNPUWorker",
+        "vllm_ascend.custom.Worker",
+        type("CustomNPUWorker", (), {}),
+        PP_ASCEND_WORKER,
+        "auto",
+    ],
+)
+def test_maybe_override_preserves_custom_or_unresolved_worker(monkeypatch, worker_cls):
+    monkeypatch.setenv("VLLM_PP_STAGE_TRACE", "/tmp/trace")
+    cfg = type("PC", (), {"worker_cls": worker_cls})()
+    maybe_override_pp_worker(cfg)
+    assert cfg.worker_cls == worker_cls
 
 
 def test_maybe_override_leaves_gpu_worker(monkeypatch):
@@ -177,3 +177,90 @@ def test_maybe_override_noop_without_env(monkeypatch):
     cfg = type("PC", (), {"worker_cls": "vllm_ascend.worker.worker.NPUWorker"})()
     maybe_override_pp_worker(cfg)
     assert cfg.worker_cls == "vllm_ascend.worker.worker.NPUWorker"
+
+
+def test_network_is_symmetric_and_follows_devices_after_reordering(monkeypatch):
+    import json
+
+    monkeypatch.setenv(
+        "VLLM_PP_NETWORK",
+        json.dumps(
+            dict(
+                bandwidth_gbps=[[8, 4], [0.5], []],
+                latency_ms=[[1, 2], [6], []],
+            )
+        ),
+    )
+    monkeypatch.setenv("VLLM_PP_DEVICE_ORDER", "0,2,1")
+    monkeypatch.setenv("VLLM_PP_HETERO", "1,2,3")
+    monkeypatch.delenv("VLLM_PP_COMM_BANDWIDTH_GBPS", raising=False)
+    monkeypatch.delenv("VLLM_PP_COMM_LATENCY_MS", raising=False)
+    cfg = PPHeteroConfig.from_env()
+    cfg.validate_pp_size(3)
+    assert cfg.enabled
+    assert cfg.compute_scale(1) == 3  # stage 1 is device 2
+    assert cfg.transfer_ms(0, 1_000_000) == 4  # device 0->2: 2+2 ms
+    assert cfg.transfer_ms(1, 1_000_000) == 22  # device 2->1: 6+16 ms
+    assert cfg.network.delay_ms(1, 2, 1_000_000) == 22  # reverse shares the same entry
+    delays = []
+    monkeypatch.setattr("vllm.distributed.pp_hetero.time.sleep", delays.append)
+    assert cfg.stretch_send(1, 300, payload_bytes=1_000_000) == 322
+    assert cfg.stretch_recv(2, 100, payload_bytes=1_000_000) == 122
+    assert delays == [0.022, 0.022]  # peer waiting is never multiplied
+    assert cfg.stretch_send(1, 300, payload_bytes=0) == 300
+    with pytest.raises(ValueError, match="PP size"):
+        cfg.validate_pp_size(2)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {},
+        {"bandwidth_gbps": [[8]]},
+        {"bandwidth_gbps": [[8], [8]]},
+        {"bandwidth_gbps": [[0], []]},
+        {"bandwidth_gbps": [[float("nan")], []]},
+        {"bandwidth_gbps": [[0, 8], [8, 0]]},
+        {"bandwidth_gbps": [[8], []], "latency_ms": [[-1], []]},
+        {"bandwidth_gbps": [[8], []], "latency_ms": [[0]]},
+        {"bandwidth_gbps": [[8], []], "unknown": 1},
+    ],
+)
+def test_network_rejects_invalid_matrices(data):
+    import json
+
+    from vllm.distributed.pp_hetero import PPNetwork
+
+    with pytest.raises(ValueError):
+        PPNetwork.from_json(json.dumps(data))
+
+
+def test_network_rejects_ambiguous_legacy_settings_and_bad_device_ids():
+    from vllm.distributed.pp_hetero import PPNetwork, parse_device_order
+
+    network = PPNetwork.from_json('{"bandwidth_gbps":[[8],[]]}')
+    with pytest.raises(ValueError, match="per-hop"):
+        PPHeteroConfig(network=network, comm_scales=(2,), comm_bandwidth_gbps=(8,))
+    with pytest.raises(ValueError, match="outside"):
+        PPHeteroConfig(network=network, device_order=(0, 2))
+    with pytest.raises(ValueError, match="reordered"):
+        PPHeteroConfig(device_order=(1, 0), comm_bandwidth_gbps=(8,))
+    with pytest.raises(ValueError, match="distinct"):
+        parse_device_order("0,0")
+
+
+def test_upper_triangle_four_devices_and_default_latency():
+    from vllm.distributed.pp_hetero import PPNetwork
+
+    network = PPNetwork.from_json('{"bandwidth_gbps":[[1,2,4],[8,16],[32],[]]}')
+    # Check every offset, including pairs beyond adjacent device IDs.
+    for (a, b), bandwidth in {
+        (0, 1): 1,
+        (0, 2): 2,
+        (0, 3): 4,
+        (1, 2): 8,
+        (1, 3): 16,
+        (2, 3): 32,
+    }.items():
+        assert network.delay_ms(a, b, 1_000_000) == 8 / bandwidth
+        assert network.delay_ms(b, a, 1_000_000) == 8 / bandwidth

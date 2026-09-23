@@ -1,42 +1,55 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Synthetic raw trace fixtures, including independently stored link samples."""
+"""Synthetic raw trace fixtures, including paired serving communication windows."""
 
 import json
 from copy import deepcopy
 
-from vllm.distributed.pp_link_profile import payload_key
-
 
 def write_trace(path, records):
-    links = {}
-    for record in records:
+    # Generate raw paired timestamps from fixture costs. Production code must
+    # derive the cost afresh and must not trust send_service_ms stored in JSONL.
+    steps = [r.get("step", 0) for r in records]
+    for index, record in enumerate(records):
         record["trace_id"] = "test-run"
-        value = record.get("send_service_ms")
-        if value is not None:
-            # Distinct costs in a fixture represent distinct payload layouts.
-            spec = [
-                dict(
-                    name="hidden_states",
-                    shape=[int(value * 1000)],
-                    dtype="uint8",
-                    device_type="cpu",
-                )
-            ]
-            record["send_tensor_spec"] = spec
-            key = payload_key(spec)
-            links[key] = dict(
-                trace_id=record["trace_id"],
-                pp_rank=record["pp_rank"],
-                tp_rank=record["tp_rank"],
-                payload_key=key,
-                source="measured_idle_replay",
-                samples=[dict(sender_ms=value, receiver_ms=value)] * 2,
+        if "send_start_ns" not in record and "recv_start_ns" not in record:
+            step = (
+                (min(steps) + index) if len(set(steps)) != len(steps) else steps[index]
             )
+            record.update(
+                step=step,
+                trace_session="test-session",
+                clock_domain="test-clock",
+                batch_id=f"batch-{step}",
+                tp_size=record.get("tp_size", 1),
+                comm_delay_in_window=True,
+            )
+            value = record.get("send_service_ms")
+            if value is not None:
+                record.update(
+                    send_bytes=record.get("send_bytes") or 64,
+                    send_start_ns=step * 1_000_000_000
+                    + record["pp_rank"] * 100_000_000,
+                )
+                record["send_end_ns"] = record["send_start_ns"] + int(value * 1e6)
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
-    link_path = path.with_name(path.name.replace("pp_stage_", "pp_link_"))
-    if links:
-        link_path.write_text("".join(json.dumps(r) + "\n" for r in links.values()))
+    files = sorted(path.parent.glob("pp_stage_pp*_tp0.jsonl"))
+    by_rank = {}
+    for file in files:
+        rows = [json.loads(line) for line in file.read_text().splitlines()]
+        if rows:
+            by_rank[rows[0]["pp_rank"]] = (file, rows)
+    for rank, (file, rows) in by_rank.items():
+        senders = {r["step"]: r for r in by_rank.get(rank - 1, (None, []))[1]}
+        for row in rows:
+            sender = senders.get(row.get("step"))
+            if sender and "send_start_ns" in sender and "recv_start_ns" not in row:
+                row.update(
+                    recv_start_ns=sender["send_start_ns"],
+                    recv_end_ns=sender["send_end_ns"],
+                    recv_bytes=sender["send_bytes"],
+                )
+        file.write_text("".join(json.dumps(r) + "\n" for r in rows))
 
 
 def write_fit_profile(directory, records_by_rank):
