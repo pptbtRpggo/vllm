@@ -26,6 +26,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from vllm import envs
 from vllm.distributed.pp_memory import PPMemoryProfile, resolve_memory_profile
 from vllm.distributed.pp_partition import (
     ComputeModel,
@@ -415,22 +416,32 @@ def profile_pp_partition(
                 "pipeline_parallel_size must be > 1 to profile PP stages "
                 f"(got {pp_size})"
             )
-        dump_dir = prepare_trace_dir(dump_dir)
-        clear_trace_files(dump_dir)
-        if workload is None:
-            workload = build_profile_workload(
-                num_prompts=num_prompts,
-                input_len=input_len,
-                output_len=output_len,
-                seed=seed,
-                vocab_size=vocab_size,
-                num_iters=num_iters,
-                num_iters_warmup=num_iters_warmup,
+        previous_environment = {
+            name: os.environ.get(name)
+            for name in (
+                "VLLM_PP_STAGE_TRACE",
+                "VLLM_PP_TRACE_SESSION",
+                "VLLM_PP_COMPUTE_MODEL",
             )
-        previous_mode = os.environ.get("VLLM_PP_COMPUTE_MODEL")
-        os.environ["VLLM_PP_COMPUTE_MODEL"] = compute_model
+        }
         llm = None
         try:
+            dump_dir = prepare_trace_dir(dump_dir)
+            clear_trace_files(dump_dir)
+            if workload is None:
+                workload = build_profile_workload(
+                    num_prompts=num_prompts,
+                    input_len=input_len,
+                    output_len=output_len,
+                    seed=seed,
+                    vocab_size=vocab_size,
+                    num_iters=num_iters,
+                    num_iters_warmup=num_iters_warmup,
+                )
+            os.environ["VLLM_PP_COMPUTE_MODEL"] = compute_model
+            # A previous in-process engine may have cached the old settings.
+            if envs._is_envs_cache_enabled():
+                envs.__getattr__.cache_clear()
             llm = llm_factory()
             if memory_profile is not None:
                 config = getattr(getattr(llm, "llm_engine", None), "vllm_config", None)
@@ -445,10 +456,14 @@ def profile_pp_partition(
                 if llm is not None:
                     shutdown_llm(llm)
             finally:
-                if previous_mode is None:
-                    os.environ.pop("VLLM_PP_COMPUTE_MODEL", None)
-                else:
-                    os.environ["VLLM_PP_COMPUTE_MODEL"] = previous_mode
+                for name, value in previous_environment.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+                # EngineCore can enable this cache during llm_factory().
+                if envs._is_envs_cache_enabled():
+                    envs.__getattr__.cache_clear()
     else:
         if dump_dir is None:
             raise ValueError("--trace-dir is required with --skip-run")

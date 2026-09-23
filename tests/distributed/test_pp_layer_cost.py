@@ -309,3 +309,28 @@ def test_actual_mock_trace_flows_through_costs_to_dp(tmp_path, monkeypatch, obje
     assert cost.t_fixed_ms == pytest.approx(4)
     assert plan.partitions == [2]
     assert plan.cost_ms == pytest.approx(23)
+
+
+@pytest.mark.parametrize("different", ["scale", "placement"])
+def test_reject_mixed_compute_environment_for_same_device(different):
+    first, second = layer_trace(), layer_trace()
+    for rows in second.values():
+        for row in rows:
+            row["compute_delay_placement"] = "layer"
+            row["compute_scale"] = 2 if different == "scale" else 1
+    with pytest.raises(ValueError, match="mix compute slowdown"):
+        aggregate([first, second])
+
+
+def test_compute_environment_validation_uses_device_identity_not_rank():
+    first, reordered = layer_trace(), layer_trace()
+    for traces, order in [(first, [0, 1]), (reordered, [1, 0])]:
+        for rank, rows in traces.items():
+            for row in rows:
+                row["profile_device_id"] = order[rank]
+                row["compute_scale"] = [2, 4][order[rank]]
+                row["compute_delay_placement"] = "layer"
+    assert len(aggregate([first, reordered])) == 2
+    reordered[0][0]["compute_scale"] = 2  # Wrong scale for device 1.
+    with pytest.raises(ValueError, match="mix compute slowdown"):
+        aggregate([first, reordered])

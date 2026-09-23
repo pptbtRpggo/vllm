@@ -3,6 +3,7 @@
 
 import json
 import os
+from functools import cache
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -661,3 +662,68 @@ def test_serve_command_preserves_layer_simulation_mode(mode):
     )
     assert ("--enforce-eager" in command) == (mode == "layer-measured")
     assert "VLLM_PP_STAGE_TRACE" not in command
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize(
+    "failure", [None, "workload", "factory", "generate", "shutdown"]
+)
+def test_profile_restores_trace_environment(
+    tmp_path, monkeypatch, existing, failure, cached
+):
+    from vllm import envs
+
+    names = ("VLLM_PP_STAGE_TRACE", "VLLM_PP_TRACE_SESSION", "VLLM_PP_COMPUTE_MODEL")
+    before = {}
+    for name in names:
+        if existing:
+            before[name] = "previous-" + name
+            monkeypatch.setenv(name, before[name])
+        else:
+            before[name] = None
+            monkeypatch.delenv(name, raising=False)
+    getter = getattr(envs.__getattr__, "__wrapped__", envs.__getattr__)
+    # Simulate EngineCore's caching without evaluating unrelated device settings.
+    monkeypatch.setattr(envs, "__getattr__", cache(getter) if cached else getter)
+    for name in names:
+        getattr(envs, name)
+    llm = FakeLLM(tmp_path, _two_rank_recs())
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("intentional failure")
+
+    def factory():
+        assert os.environ["VLLM_PP_STAGE_TRACE"] == str(tmp_path)
+        assert os.environ["VLLM_PP_TRACE_SESSION"] != before["VLLM_PP_TRACE_SESSION"]
+        assert os.environ["VLLM_PP_COMPUTE_MODEL"] == "layer-measured"
+        for name in names:
+            assert getattr(envs, name) == os.environ[name]
+        if not cached:
+            monkeypatch.setattr(envs, "__getattr__", cache(getter))
+        for name in names:
+            getattr(envs, name)
+        if failure == "factory":
+            fail()
+        return llm
+
+    if failure == "generate":
+        monkeypatch.setattr(llm, "generate", fail)
+    if failure == "shutdown":
+        monkeypatch.setattr(llm.llm_engine.engine_core, "shutdown", fail)
+    kwargs = dict(
+        dump_dir=tmp_path,
+        llm_factory=factory,
+        collect_only=True,
+        compute_model="layer-measured",
+        num_iters=0 if failure == "workload" else 1,
+        num_iters_warmup=0,
+    )
+    if failure:
+        with pytest.raises((ValueError, RuntimeError)):
+            profile_pp_partition(**kwargs)
+    else:
+        profile_pp_partition(**kwargs)
+    assert {name: os.environ.get(name) for name in names} == before
+    for name in names:
+        assert getattr(envs, name) == getter(name)

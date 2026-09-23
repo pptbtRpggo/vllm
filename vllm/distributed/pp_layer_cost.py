@@ -146,6 +146,17 @@ def measured_layer_rank_costs(
                 raise ValueError(
                     "endpoint times plus runner overhead must match residual"
                 )
+        # These rows have already been grouped by stable device identity, not
+        # stage rank. Reordered runs may use different roles/links, but must
+        # describe the same compute environment on each device.
+        compute_settings = {
+            (r.get("compute_scale", 1.0), r.get("compute_delay_placement") == "layer")
+            for r in rows
+        }
+        if len(compute_settings) != 1:
+            raise ValueError(
+                f"profiles mix compute slowdown settings for device {rank}"
+            )
         scales = {r.get("comm_scale", 1.0) for r in rows}
         if any(not math.isfinite(v) or v <= 0 for v in scales):
             raise ValueError("profiles have invalid communication scales")

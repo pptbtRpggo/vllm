@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_PP_STAGE_TRACE: str | None = None
+    VLLM_PP_TRACE_SESSION: str | None = None
     VLLM_PP_COMPUTE_MODEL: str = "shape-affine"
     VLLM_PP_NETWORK: str | None = None
     VLLM_PP_DEVICE_ORDER: str | None = None
@@ -694,6 +695,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
     # Directory to dump per-PP-rank compute/comm JSONL traces. Unset disables.
     "VLLM_PP_STAGE_TRACE": lambda: os.getenv("VLLM_PP_STAGE_TRACE", None),
+    "VLLM_PP_TRACE_SESSION": lambda: os.getenv("VLLM_PP_TRACE_SESSION", None),
     "VLLM_PP_COMPUTE_MODEL": lambda: os.getenv("VLLM_PP_COMPUTE_MODEL", "shape-affine"),
     # Unified PP hetero emulator: "1,2" or "1,2/4" (compute[/comm]).
     "VLLM_PP_NETWORK": lambda: os.getenv("VLLM_PP_NETWORK", None),
@@ -1664,6 +1666,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PP_STAGE_TRACE",
+        "VLLM_PP_TRACE_SESSION",
         "VLLM_PP_COMPUTE_MODEL",
         "VLLM_PP_HETERO",
         "VLLM_PP_NETWORK",

@@ -264,3 +264,17 @@ def test_upper_triangle_four_devices_and_default_latency():
     }.items():
         assert network.delay_ms(a, b, 1_000_000) == 8 / bandwidth
         assert network.delay_ms(b, a, 1_000_000) == 8 / bandwidth
+
+
+def test_trace_session_is_forwarded_to_ray_but_not_compilation_hash(monkeypatch):
+    import vllm.envs as envs
+    from vllm.ray.ray_env import get_env_vars_to_copy
+
+    name = "VLLM_PP_TRACE_SESSION"
+    monkeypatch.setenv(name, "test-session")
+    assert name in get_env_vars_to_copy()
+    getter = envs.environment_variables[name]
+    assert getter() == "test-session"
+    # Isolate this variable from unrelated platform-dependent env getters.
+    monkeypatch.setattr(envs, "environment_variables", {name: getter})
+    assert name not in envs.compile_factors()
