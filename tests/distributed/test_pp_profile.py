@@ -642,3 +642,22 @@ def test_custom_workload_cannot_reuse_measured_prompts_for_warmup():
     with pytest.raises(ValueError, match="warmup prompts must differ"):
         run_traced_generate(llm, replace(workload, warmup_prompts=workload.prompts))
     assert llm.generate_calls == []
+
+
+@pytest.mark.parametrize("mode", ["layer-measured", "shape-affine"])
+def test_serve_command_preserves_layer_simulation_mode(mode):
+    plan = SimpleNamespace(
+        compute_model=mode,
+        device_order=None,
+        env_value="8,8",
+        pp_size=2,
+        memory_profile=SimpleNamespace(
+            tp_size=1, serving_config={"model": "test-model"}
+        ),
+    )
+    command = format_serve_command(plan)
+    assert ("VLLM_PP_COMPUTE_MODEL=layer-measured" in command) == (
+        mode == "layer-measured"
+    )
+    assert ("--enforce-eager" in command) == (mode == "layer-measured")
+    assert "VLLM_PP_STAGE_TRACE" not in command

@@ -126,7 +126,6 @@ def test_stage_trace_serializes_layers_and_residual(tmp_path, monkeypatch):
     [
         (False, 1, 1, 0, "enforce-eager"),
         (True, 2, 1, 0, "TP=1"),
-        (True, 1, 2, 0, "mock compute delay"),
         (True, 1, 1, 3, "compilation mode NONE"),
     ],
 )
@@ -193,3 +192,172 @@ def test_endpoints_are_separate_and_not_double_counted(tmp_path, monkeypatch):
             assert not m._forward_hooks and not m._forward_pre_hooks
     finally:
         tracer.close()
+
+
+@pytest.mark.parametrize("backend", ["cpu", "cuda", "npu"])
+def test_layer_mock_measures_actual_wait_and_endpoints(backend, tmp_path, monkeypatch):
+    model, layers, now = model_and_clock(monkeypatch)
+    model.model.embed_tokens = Decoder(now, 0.004)
+    model.model.norm = Decoder(now, 0.002)
+    model.logits_processor = Decoder(now, 0.006)
+    syncs = []
+    if backend != "cpu":
+
+        class Event:
+            def __init__(self, **kwargs):
+                pass
+
+            def record(self):
+                pytest.fail("mock costs must measure synchronized wall time")
+
+        monkeypatch.setattr(
+            torch,
+            backend,
+            SimpleNamespace(
+                Event=Event,
+                is_available=lambda: True,
+                synchronize=lambda *args: syncs.append(now[0]),
+            ),
+            raising=False,
+        )
+    device = SimpleNamespace(type=backend)
+    timer = PPLayerTimer(model, device)
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds + 0.001  # Include actual oversleep in measured costs.
+
+    monkeypatch.setattr("time.sleep", sleep)
+
+    def forward():
+        now[0] += 0.003  # Runner overhead must not be multiplied.
+        x = model.model.embed_tokens(0)
+        x = layers[2](layers[1](x))
+        return model.logits_processor(model.model.norm(x))
+
+    with timer.capture(2):
+        assert forward() == 5
+    assert sleeps == pytest.approx([0.004, 0.002, 0.003, 0.002, 0.006])
+    assert timer.elapsed_ms() == pytest.approx({"1": 5, "2": 7})
+    assert timer.endpoint_elapsed_ms() == pytest.approx(
+        dict(embedding_ms=9, final_norm_ms=5, lm_head_ms=13)
+    )
+    assert timer.mock_delay_ms == pytest.approx(22)
+    assert timer.mock_requested_delay_ms == pytest.approx(17)
+    assert now[0] == pytest.approx(0.042)
+    assert len(syncs) == (0 if backend == "cpu" else 10)
+    for module in [*layers, *timer.endpoints.values()]:
+        assert not module._forward_hooks and not module._forward_pre_hooks
+
+
+def test_tracer_layer_mock_does_not_apply_stage_delay(tmp_path, monkeypatch):
+    model, layers, now = model_and_clock(monkeypatch)
+
+    def sleep(seconds):
+        now[0] += seconds + 0.001
+
+    monkeypatch.setattr("time.sleep", sleep)
+    tracer = PPStageTracer(
+        str(tmp_path), 1, 2, torch.device("cpu"), compute_model="layer-measured"
+    )
+
+    def forward():
+        now[0] += 0.004
+        return layers[2](layers[1](0))
+
+    try:
+        result, timing = tracer.measure_stretched_compute(
+            forward,
+            lambda ms: pytest.fail("duplicate stage delay"),
+            model_runner=SimpleNamespace(model=model),
+            vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(enforce_eager=True)
+            ),
+            compute_scale=2,
+        )
+        assert result == 2
+        assert timing == pytest.approx(
+            dict(
+                compute_ms=14, compute_base_ms=9, compute_wall_ms=16, compute_delay_ms=7
+            )
+        )
+        assert tracer._layer_measurement["layer_compute_ms"] == pytest.approx(
+            {"1": 5, "2": 7}
+        )
+        assert tracer._layer_measurement["runner_overhead_ms"] == pytest.approx(4)
+    finally:
+        tracer.close()
+
+
+def test_mock_hooks_removed_after_forward_failure(monkeypatch):
+    model, layers, now = model_and_clock(monkeypatch)
+    monkeypatch.setattr("time.sleep", lambda s: now.__setitem__(0, now[0] + s))
+    timer = PPLayerTimer(model, torch.device("cpu"))
+    with pytest.raises(RuntimeError, match="failed"), timer.capture(2):
+        layers[1](0)
+        raise RuntimeError("failed")
+    for layer in layers:
+        assert not layer._forward_hooks and not layer._forward_pre_hooks
+    with timer.capture(2):
+        layers[2](layers[1](0))
+    assert timer.elapsed_ms() == pytest.approx({"1": 4, "2": 6})
+
+
+@pytest.mark.parametrize(
+    "eager,tp,compiled,error",
+    [
+        (False, 1, 0, "enforce-eager"),
+        (True, 2, 0, "TP=1"),
+        (True, 1, 3, "compilation mode NONE"),
+    ],
+)
+def test_untraced_layer_mock_rejects_unsupported_execution(
+    eager, tp, compiled, error, monkeypatch
+):
+    from vllm.distributed.pp_hetero import PPHeteroConfig, execute_pp_compute
+
+    monkeypatch.setenv("VLLM_PP_COMPUTE_MODEL", "layer-measured")
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=eager),
+            compilation_config=SimpleNamespace(mode=compiled),
+            parallel_config=SimpleNamespace(tensor_parallel_size=tp),
+        )
+    )
+    with pytest.raises(ValueError, match=error):
+        execute_pp_compute(
+            worker,
+            lambda: pytest.fail("unexpected forward"),
+            None,
+            PPHeteroConfig(compute_scales=(2,)),
+            0,
+        )
+
+
+def test_untraced_fast_rank_keeps_mock_hooks_when_other_rank_is_slow(monkeypatch):
+    from vllm.distributed.pp_hetero import PPHeteroConfig, execute_pp_compute
+
+    model, layers, now = model_and_clock(monkeypatch)
+    monkeypatch.setenv("VLLM_PP_COMPUTE_MODEL", "layer-measured")
+    monkeypatch.setattr("time.sleep", lambda s: pytest.fail("fast rank must not sleep"))
+    worker = SimpleNamespace(
+        device=torch.device("cpu"),
+        model_runner=SimpleNamespace(model=model),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=True),
+            parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        ),
+    )
+    for _ in range(2):
+        value, _ = execute_pp_compute(
+            worker,
+            lambda: layers[2](layers[1](0)),
+            None,
+            PPHeteroConfig(compute_scales=(1, 2)),
+            0,
+        )
+        assert value == 2
+        assert worker._pp_layer_mock_timer.wall_timing
+        assert worker._pp_layer_mock_timer.mock_delay_ms == 0
+    assert now[0] == pytest.approx(0.010)

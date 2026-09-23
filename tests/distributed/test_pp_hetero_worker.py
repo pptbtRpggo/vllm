@@ -55,6 +55,7 @@ def test_worker_comm_delay_excludes_peer_wait(
     network=False,
 ):
     module, worker_cls = _worker_module(backend, monkeypatch)
+    monkeypatch.setenv("VLLM_PP_COMPUTE_MODEL", compute_model)
     now = [0.0]
     sleeps = []
     calls = []
@@ -154,7 +155,9 @@ def test_worker_comm_delay_excludes_peer_wait(
     worker.annotate_profile = lambda _: nullcontext()
     worker.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=True),
-        parallel_config=SimpleNamespace(pipeline_parallel_size=3),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=3, tensor_parallel_size=tp.world_size
+        ),
         compilation_config=SimpleNamespace(
             pass_config=SimpleNamespace(enable_sp=False)
         ),
@@ -178,7 +181,10 @@ def test_worker_comm_delay_excludes_peer_wait(
     if rank:
         expected_delays.append(baseline_ms * ((4, 7)[rank - 1] - 1) / 1000)
     if compute_scale > 1:
-        expected_delays.append(0.010 * (compute_scale - 1))
+        if compute_model == "layer-measured":
+            expected_delays.extend([0.010 / 16 * (compute_scale - 1)] * 16)
+        else:
+            expected_delays.append(0.010 * (compute_scale - 1))
     if rank < 2:
         expected_delays.append(baseline_ms * ((4, 7)[rank] - 1) / 1000)
     assert sleeps == pytest.approx(expected_delays)
@@ -195,7 +201,10 @@ def test_worker_comm_delay_excludes_peer_wait(
         assert record["compute_base_ms"] == pytest.approx(10)
         if compute_model == "layer-measured":
             assert record["layer_compute_ms"] == pytest.approx(
-                {str(i): 10 / 16 for i in range(rank * 16, (rank + 1) * 16)}
+                {
+                    str(i): 10 / 16 * compute_scale
+                    for i in range(rank * 16, (rank + 1) * 16)
+                }
             )
             assert record["non_layer_compute_ms"] == pytest.approx(0, abs=1e-8)
         if rank:
@@ -217,9 +226,19 @@ def test_worker_comm_delay_excludes_peer_wait(
 
 @pytest.mark.parametrize("backend", ["cuda", "ascend", "ascend_sp"])
 @pytest.mark.parametrize("rank", [0, 1, 2])
-def test_worker_wrapper_layer_measurement(backend, rank, tmp_path, monkeypatch):
+@pytest.mark.parametrize("tracing", [False, True])
+@pytest.mark.parametrize("scale", [1, 2, 4])
+def test_worker_wrapper_layer_measurement(
+    backend, rank, tracing, scale, tmp_path, monkeypatch
+):
     test_worker_comm_delay_excludes_peer_wait(
-        backend, rank, True, 1, tmp_path, monkeypatch, compute_model="layer-measured"
+        backend,
+        rank,
+        tracing,
+        scale,
+        tmp_path,
+        monkeypatch,
+        compute_model="layer-measured",
     )
 
 

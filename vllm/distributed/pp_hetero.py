@@ -34,10 +34,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import torch
 
@@ -179,6 +180,52 @@ def time_call(
     if sync is not None:
         sync()
     return result, (time.perf_counter() - t0) * 1000.0
+
+
+def execute_pp_compute(
+    worker: Any, fn: Callable[[], T], tracer: Any, hetero: PPHeteroConfig, rank: int
+) -> tuple[T, dict[str, float]]:
+    """Use identical compute slowdown placement in profiling and serving."""
+    mode = (
+        tracer.compute_model
+        if tracer is not None
+        else os.environ.get("VLLM_PP_COMPUTE_MODEL", "shape-affine")
+    )
+    if mode not in ("shape-affine", "layer-measured"):
+        raise ValueError(f"unknown compute profiling mode: {mode}")
+    simulate_layers = mode == "layer-measured" and any(
+        s > 1 for s in hetero.compute_scales
+    )
+    scale = hetero.compute_scale(rank)
+    if tracer is not None:
+        return tracer.measure_stretched_compute(
+            fn,
+            lambda ms: hetero.stretch_compute(rank, ms),
+            model_runner=worker.model_runner,
+            vllm_config=worker.vllm_config,
+            compute_scale=scale,
+            simulate_layers=simulate_layers,
+        )
+    if simulate_layers:
+        from vllm.distributed.pp_layer_trace import (
+            PPLayerTimer,
+            validate_layer_execution,
+        )
+
+        validate_layer_execution(
+            worker.vllm_config,
+            worker.vllm_config.parallel_config.tensor_parallel_size,
+        )
+        model = worker.model_runner.model
+        if getattr(worker, "_pp_layer_mock_model", None) is not model:
+            worker._pp_layer_mock_timer = PPLayerTimer(model, worker.device)
+            worker._pp_layer_mock_model = model
+        with worker._pp_layer_mock_timer.capture(scale):
+            result, _ = time_call(fn, lambda: sync_torch_device(worker.device))
+    else:
+        result, base_ms = time_call(fn, lambda: sync_torch_device(worker.device))
+        hetero.stretch_compute(rank, base_ms)
+    return result, {}
 
 
 @dataclass(frozen=True)

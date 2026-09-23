@@ -33,7 +33,12 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
 )
 from vllm.distributed.pp_batch_shape import scheduled_batch_id, scheduled_batch_shape
-from vllm.distributed.pp_hetero import PPHeteroConfig, sync_torch_device, time_call
+from vllm.distributed.pp_hetero import (
+    PPHeteroConfig,
+    execute_pp_compute,
+    sync_torch_device,
+    time_call,
+)
 from vllm.distributed.pp_stage_trace import (
     PPStageTracer,
     layer_range_from_runner,
@@ -654,17 +659,9 @@ class Worker(WorkerBase):
                     scheduler_output, intermediate_tensors
                 )
 
-        if tracer is not None:
-            output, compute_timing = tracer.measure_stretched_compute(
-                _run_forward,
-                lambda ms: hetero.stretch_compute(pp_rank, ms),
-                model_runner=self.model_runner,
-                vllm_config=self.vllm_config,
-                compute_scale=hetero.compute_scale(pp_rank),
-            )
-        else:
-            output, compute_ms = time_call(_run_forward, _sync)
-            hetero.stretch_compute(pp_rank, compute_ms)
+        output, compute_timing = execute_pp_compute(
+            self, _run_forward, tracer, hetero, pp_rank
+        )
 
         send_ms: float | None = None
         send_bytes: int | None = None

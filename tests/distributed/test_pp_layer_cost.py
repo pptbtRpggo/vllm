@@ -231,3 +231,81 @@ def test_invalid_layer_aggregation_rejected():
             warmup_steps=0,
             layer_aggregation="unknown",
         )
+
+
+@pytest.mark.parametrize("objective", ["latency", "throughput"])
+def test_actual_mock_trace_flows_through_costs_to_dp(tmp_path, monkeypatch, objective):
+    from types import SimpleNamespace
+
+    import torch
+
+    from tests.distributed.test_pp_layer_trace import Decoder
+    from vllm.distributed.pp_stage_trace import PPStageTracer
+
+    now = [0.0]
+    monkeypatch.setattr("time.perf_counter", lambda: now[0])
+    monkeypatch.setattr("time.sleep", lambda s: now.__setitem__(0, now[0] + s + 0.001))
+    layers = torch.nn.ModuleList([Decoder(now, 0.001), Decoder(now, 0.003)])
+    inner = SimpleNamespace(
+        start_layer=0,
+        end_layer=2,
+        layers=layers,
+        embed_tokens=Decoder(now, 0.001),
+        norm=Decoder(now, 0.001),
+    )
+    model = SimpleNamespace(model=inner, logits_processor=Decoder(now, 0.001))
+
+    def forward():
+        now[0] += 0.004
+        x = inner.embed_tokens(0)
+        for layer in layers:
+            x = layer(x)
+        return model.logits_processor(inner.norm(x))
+
+    tracer = PPStageTracer(
+        str(tmp_path), 0, 1, torch.device("cpu"), compute_model="layer-measured"
+    )
+    try:
+        _, timing = tracer.measure_stretched_compute(
+            forward,
+            lambda ms: pytest.fail("extra stage wait"),
+            model_runner=SimpleNamespace(model=model),
+            vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(enforce_eager=True)
+            ),
+            compute_scale=2,
+        )
+        tracer.record(
+            num_tokens=1,
+            num_reqs=1,
+            num_ctx_requests=1,
+            num_ctx_tokens=1,
+            num_generation_requests=0,
+            num_generation_tokens=0,
+            batch_shape=[dict(query_tokens=1, prompt_tokens=1, context_tokens=0)],
+            recv_ms=None,
+            send_ms=None,
+            recv_bytes=None,
+            send_bytes=None,
+            start_layer=0,
+            end_layer=2,
+            compute_scale=2,
+            **timing,
+        )
+    finally:
+        tracer.close()
+    plan = plan_from_trace_dir(
+        tmp_path,
+        compute_model="layer-measured",
+        objective=objective,
+        warmup_steps=0,
+        allow_unchecked_memory=True,
+    )
+    cost = plan.rank_costs[0]
+    assert cost.t_layer_ms == pytest.approx(5)  # actual 3/7 ms, not scaled again
+    assert cost.t_embedding_ms == pytest.approx(3)
+    assert cost.t_head_ms == pytest.approx(3)
+    assert cost.t_final_norm_ms == pytest.approx(3)
+    assert cost.t_fixed_ms == pytest.approx(4)
+    assert plan.partitions == [2]
+    assert plan.cost_ms == pytest.approx(23)

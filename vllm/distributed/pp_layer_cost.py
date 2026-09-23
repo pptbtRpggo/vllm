@@ -114,8 +114,18 @@ def measured_layer_rank_costs(
                 raise ValueError("trace PP size does not match its ranks")
             if row.get("tp_size") != 1 or row.get("tp_rank") != 0:
                 raise ValueError("layer-measured currently requires TP=1")
-            if row.get("compute_scale", 1.0) != 1.0:
-                raise ValueError("layer-measured cannot use mock compute slowdown")
+            scale = row.get("compute_scale", 1.0)
+            if (
+                type(scale) not in (int, float)
+                or not math.isfinite(scale)
+                or scale <= 0
+            ):
+                raise ValueError("invalid compute scale in layer trace")
+            if scale != 1 and row.get("compute_delay_placement") != "layer":
+                raise ValueError(
+                    "layer-measured cannot use mock compute slowdown unless "
+                    "actual per-layer waits are included in the measurements"
+                )
             layers = row.get("layer_compute_ms")
             if not isinstance(layers, dict) or set(layers) != {
                 str(i) for i in range(row["start_layer"], row["end_layer"])

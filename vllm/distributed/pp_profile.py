@@ -264,6 +264,9 @@ def format_serve_command(plan: PPPartitionPlan) -> str:
         )
     lines.append("Re-serve with:")
     exports = [f"VLLM_PP_LAYER_PARTITION={plan.env_value}"]
+    layer_mode = plan.compute_model == "layer-measured"
+    if layer_mode:
+        exports.append("VLLM_PP_COMPUTE_MODEL=layer-measured")
     if plan.device_order:
         exports.append("VLLM_PP_DEVICE_ORDER=" + ",".join(map(str, plan.device_order)))
     for item in exports:
@@ -279,6 +282,8 @@ def format_serve_command(plan: PPPartitionPlan) -> str:
         "--tensor-parallel-size",
         str(plan.memory_profile.tp_size),
     ]
+    if layer_mode:
+        command.append("--enforce-eager")
     for key, value in scope.items():
         if key != "model" and value is not None:
             command.extend(["--" + key.replace("_", "-"), str(value)])

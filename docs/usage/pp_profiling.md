@@ -136,12 +136,22 @@ DP 在包含第一层的 stage 加 embedding，在包含最后一层的 stage �
 
 当前逐层采集要求模型暴露 `model[.model].layers`（按全局编号索引的 `ModuleList`）及
 `start_layer/end_layer`，每个本地 decoder 在一次 execute_model 中恰好调用一次。
-不支持 CUDA Graph replay、compilation、TP>1 或 stage 末尾的 mock compute slowdown；
-这些情况会报错。真实异构设备不需要 mock slowdown。逐层模式的模拟异构可采用
-设备实际资源限制（例如 NPU core quota），让 device events 测到真实执行时间。
-另一种实验方式是在各 layer 和 endpoint 的调用结束前实际加入 sleep，再记录结束 event；
-此时必须关闭原来的 stage compute sleep，避免重复减速，并在 profiling 与最终 serving
-中保留相同的模拟 hooks。不要把 stage 末尾 sleep 离线分摊到各层，冒充逐层实测。
+不支持 CUDA Graph replay、compilation 或 TP>1，这些情况会报错。
+真实异构设备不需要 mock slowdown，使用 device events 测量实际执行时间。
+
+内置逐层模拟直接使用 `VLLM_PP_COMPUTE_MODEL=layer-measured` 和
+`VLLM_PP_HETERO=1,2,3,4`。只要配置中存在计算减速，各 rank 都在每个 decoder 和
+实际执行的 embedding、final norm、logits processor 前后同步设备，再按该设备的
+compute scale 添加等待。逐层耗时使用同步后的实际 wall time，包含 sleep 超时；
+runner 开销不放大，也不会在 stage 末尾再等待一次。`compute_delay_ms` 是模块内
+实际等待之和，`compute_base_ms` 是 stage wall time 扣除这些等待。
+raw trace 用 `compute_delay_placement=layer` 标记等待已计入各层，DP 直接使用实测值，
+不会再乘倍数；缺少该标记的旧 stage 减速 trace 仍不能当作逐层减速数据。
+这套 hooks 同时用于 profiling 和关闭 tracing 后的 serving，不需要额外 worker 或 RPC。
+正式 serving 必须保留上述两个环境变量，仅移除 `VLLM_PP_STAGE_TRACE`；生成的
+serve 命令会保留 `VLLM_PP_COMPUTE_MODEL=layer-measured`，模拟参数仍需保持一致。
+若切回 `shape-affine`，计算减速仍放在 stage 末尾，两种模拟方式不可混用作同一组实验。
+
 逐层 hooks/events 本身有开销，且 eager 的结果不代表开启 compilation/graphs 后的性能；
 最终 serving 对照必须关闭 tracing，并使用目标执行设置重新测量。
 

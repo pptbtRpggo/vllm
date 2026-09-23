@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Direct decoder-layer timing during eager serving, without per-layer sync."""
+"""Direct layer timing and optional per-module slowdown for eager PP serving."""
 
 from __future__ import annotations
 
@@ -11,6 +11,19 @@ from typing import Any
 
 import torch
 
+from vllm.distributed.pp_hetero import stretch_after, sync_torch_device
+
+
+def validate_layer_execution(config: Any, tp_size: int) -> None:
+    """The same eager restrictions apply with and without trace recording."""
+    if not getattr(getattr(config, "model_config", None), "enforce_eager", False):
+        raise ValueError("layer-measured requires --enforce-eager")
+    compilation = getattr(config, "compilation_config", None)
+    if getattr(compilation, "mode", 0) not in (None, 0):
+        raise ValueError("layer-measured requires compilation mode NONE (0)")
+    if tp_size != 1:
+        raise ValueError("layer-measured currently requires TP=1")
+
 
 class PPLayerTimer:
     """Hook only local top-level decoder layers, not their nested modules.
@@ -19,6 +32,9 @@ class PPLayerTimer:
     synchronization; synchronizing inside each hook would change execution.
     CPU timing exists for CPU execution/tests. CUDA Graph/compiled execution,
     reentrant layers and forwards that skip layers are intentionally rejected.
+    Optional mock slowdown instead synchronizes each module and measures wall
+    time including the actual sleep. Serving uses these same hooks without a
+    tracer; runner work outside the modules is not scaled.
     """
 
     def __init__(self, model: Any, device: torch.device) -> None:
@@ -60,6 +76,9 @@ class PPLayerTimer:
         self.backend = getattr(torch, device.type) if device.type != "cpu" else None
         if self.backend is not None and not hasattr(self.backend, "Event"):
             raise ValueError(f"layer-measured requires {device.type} timing events")
+        self.wall_timing = False
+        self.mock_delay_ms = 0.0
+        self.mock_requested_delay_ms = 0.0
         self.events: dict[int | str, tuple[Any, Any]] = {}
         self.finished: list[int] = []
         self.device_events = (
@@ -70,19 +89,24 @@ class PPLayerTimer:
                 )
                 for i in (*self.layers, *self.endpoints)
             }
-            if self.backend is not None
+            if self.backend is not None and not self.wall_timing
             else {}
         )
 
     def _mark(self, index, endpoint):
-        if self.backend is None:
+        if self.backend is None or self.wall_timing:
             return time.perf_counter()
         event = self.device_events[index][endpoint]
         event.record()
         return event
 
     @contextmanager
-    def capture(self):
+    def capture(self, compute_scale: float | None = None):
+        # None means native event timing; 1.0 keeps the same synchronized mock
+        # hooks on the fastest device of a simulated heterogeneous deployment.
+        self.wall_timing = compute_scale is not None
+        self.mock_delay_ms = 0.0
+        self.mock_requested_delay_ms = 0.0
         self.events.clear()
         self.finished.clear()
         handles = []
@@ -90,10 +114,19 @@ class PPLayerTimer:
         def before(index, _module, _args):
             if index in self.events:
                 raise ValueError("layer-measured expects one call per decoder layer")
+            if self.wall_timing:
+                sync_torch_device(self.device)
             self.events[index] = (self._mark(index, 0), None)
 
         def after(index, _module, _args, _output):
             begin, _ = self.events[index]
+            if compute_scale is not None:
+                sync_torch_device(self.device)
+                delay_start = time.perf_counter()
+                base_ms = (delay_start - begin) * 1000
+                stretch_after(base_ms, compute_scale)
+                self.mock_delay_ms += (time.perf_counter() - delay_start) * 1000
+                self.mock_requested_delay_ms += base_ms * max(0.0, compute_scale - 1)
             self.events[index] = (begin, self._mark(index, 1))
             if isinstance(index, int):
                 self.finished.append(index)
@@ -116,7 +149,7 @@ class PPLayerTimer:
         """Read after the caller synchronizes the stage's device work."""
         return {
             str(index): float(start.elapsed_time(end))
-            if self.backend is not None
+            if self.backend is not None and not self.wall_timing
             else (end - start) * 1000
             for index, (start, end) in self.events.items()
             if isinstance(index, int)
@@ -130,7 +163,7 @@ class PPLayerTimer:
             result[name + "_ms"] = (
                 (
                     float(pair[0].elapsed_time(pair[1]))
-                    if self.backend is not None
+                    if self.backend is not None and not self.wall_timing
                     else (pair[1] - pair[0]) * 1000
                 )
                 if pair is not None

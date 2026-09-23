@@ -138,6 +138,7 @@ class PPStageTraceRecord:
     recv_start_ns: int | None = None
     recv_end_ns: int | None = None
     compute_model: str = "shape-affine"
+    compute_delay_placement: str = "stage"
     layer_compute_ms: dict[str, float] | None = None
     non_layer_compute_ms: float | None = None
     embedding_ms: float | None = None
@@ -266,38 +267,43 @@ class PPStageTracer:
         model_runner: Any = None,
         vllm_config: Any = None,
         compute_scale: float = 1.0,
+        simulate_layers: bool = False,
     ) -> tuple[T, dict[str, float]]:
         """Keep modeled slowdown separate from actual synchronized wall time."""
         timer = None
         self._layer_measurement.clear()
         if self.compute_model == "layer-measured":
-            from vllm.distributed.pp_layer_trace import PPLayerTimer
+            from vllm.distributed.pp_layer_trace import (
+                PPLayerTimer,
+                validate_layer_execution,
+            )
 
-            if not getattr(
-                getattr(vllm_config, "model_config", None), "enforce_eager", False
-            ):
-                raise ValueError("layer-measured requires --enforce-eager")
-            compilation = getattr(vllm_config, "compilation_config", None)
-            if getattr(compilation, "mode", 0) not in (None, 0):
-                raise ValueError("layer-measured requires compilation mode NONE (0)")
-            if self.tp_size != 1:
-                raise ValueError("layer-measured currently requires TP=1")
-            if compute_scale != 1.0:
-                raise ValueError(
-                    "layer-measured cannot attribute stage-level mock compute delay "
-                    "to individual layers; disable compute slowdown"
-                )
+            validate_layer_execution(vllm_config, self.tp_size)
+            simulate_layers = simulate_layers or compute_scale > 1
             model = getattr(model_runner, "model", None)
             if self._layer_timer is None or self._layer_model is not model:
                 self._layer_timer = PPLayerTimer(model, self.device)
                 self._layer_model = model
             timer = self._layer_timer
-        with timer.capture() if timer else nullcontext():
+        capture = (
+            timer.capture(compute_scale if simulate_layers else None)
+            if timer
+            else nullcontext()
+        )
+        with capture:
             start = time.perf_counter()
             result, base_ms = self.measure_compute(fn)
             delay_start = time.perf_counter()
-            modeled_ms = stretch(base_ms)
+            modeled_ms = base_ms if timer and simulate_layers else stretch(base_ms)
             end = time.perf_counter()
+        delay_ms = (end - delay_start) * 1000
+        if timer and simulate_layers:
+            # Layer hooks already slept. Do not apply another stage-level wait.
+            # Use actual elapsed time (including sleep overshoot), not scale *
+            # device event time, and leave runner overhead unscaled.
+            delay_ms = timer.mock_delay_ms
+            base_ms = (end - start) * 1000 - delay_ms
+            modeled_ms = base_ms + timer.mock_requested_delay_ms
         if timer:
             layers = timer.elapsed_ms()
             # Includes endpoint modules and runner/launch work, NOT communication.
@@ -309,6 +315,7 @@ class PPStageTracer:
             if overhead < -0.01:
                 raise ValueError("endpoint timing exceeds non-layer stage wall time")
             self._layer_measurement = dict(
+                compute_delay_placement="layer" if simulate_layers else "none",
                 layer_compute_ms=layers,
                 non_layer_compute_ms=max(0.0, residual),
                 runner_overhead_ms=max(0.0, overhead),
@@ -318,7 +325,7 @@ class PPStageTracer:
             compute_ms=modeled_ms,
             compute_base_ms=base_ms,
             compute_wall_ms=(end - start) * 1000,
-            compute_delay_ms=(end - delay_start) * 1000,
+            compute_delay_ms=delay_ms,
         )
 
     def record_step(
