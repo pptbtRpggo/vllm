@@ -314,3 +314,38 @@ def test_legacy_trace_cli_requires_explicit_approximation(pp_profile_parser, tmp
     argv.append("--allow-wall-time-comm")
     with pytest.raises(SystemExit):
         pp_profile_parser.parse_args(argv)
+
+
+@pytest.mark.parametrize("aggregation,mean", [("phase-balanced", 2), ("microbatch", 1.2)])
+def test_layer_mode_cli_reaches_planner(pp_profile_parser, tmp_path, aggregation, mean):
+    from tests.distributed.test_pp_layer_cost import layer_trace
+
+    for rank, rows in layer_trace().items():
+        write_trace(tmp_path / f"pp_stage_pp{rank}_tp0.jsonl", rows)
+    args = pp_profile_parser.parse_args(
+        [
+            "pp-profile",
+            "--skip-run",
+            "--trace-dir",
+            str(tmp_path),
+            "--compute-model",
+            "layer-measured",
+            "--layer-aggregation",
+            aggregation,
+            "--comm-source",
+            "replay",
+            "--allow-unchecked-memory",
+            "--warmup-steps",
+            "0",
+        ]
+    )
+    PPProfileSubcommand.cmd(args)
+    payload = json.loads((tmp_path / "pp_partition_plan.json").read_text())
+    assert payload["compute_model"] == "layer-measured"
+    assert payload["partitions"] == [7, 1]
+    assert payload["rank_costs"][0]["t_layer_ms"] == mean
+    assert payload["rank_costs"][0]["t_embedding_ms"] == 2 * mean
+    assert payload["workload_aggregation"] == (
+        "observed_microbatch_mean" if aggregation == "microbatch"
+        else "arithmetic_mean_of_phase_means"
+    )

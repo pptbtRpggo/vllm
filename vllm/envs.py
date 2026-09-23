@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_PP_STAGE_TRACE: str | None = None
+    VLLM_PP_COMPUTE_MODEL: str = "shape-affine"
     VLLM_PP_HETERO: str | None = None
     VLLM_PP_COMM_BANDWIDTH_GBPS: str | None = None
     VLLM_PP_COMM_LATENCY_MS: str | None = None
@@ -691,6 +692,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
     # Directory to dump per-PP-rank compute/comm JSONL traces. Unset disables.
     "VLLM_PP_STAGE_TRACE": lambda: os.getenv("VLLM_PP_STAGE_TRACE", None),
+    "VLLM_PP_COMPUTE_MODEL": lambda: os.getenv("VLLM_PP_COMPUTE_MODEL", "shape-affine"),
     # Unified PP hetero emulator: "1,2" or "1,2/4" (compute[/comm]).
     "VLLM_PP_HETERO": lambda: os.getenv("VLLM_PP_HETERO", None),
     # Per-hop, per-TP-lane baseline communication model for PP hetero slowdown.
@@ -1658,6 +1660,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PP_STAGE_TRACE",
+        "VLLM_PP_COMPUTE_MODEL",
         "VLLM_PP_HETERO",
         "VLLM_PP_COMM_BANDWIDTH_GBPS",
         "VLLM_PP_COMM_LATENCY_MS",

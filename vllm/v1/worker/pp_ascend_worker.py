@@ -75,8 +75,10 @@ class PPAscendWorker(NPUWorker):
 
         return observe_worker_memory(self)
 
-    def profile_pp_links(self, warmup: int = 3, repeats: int = 10) -> None:
-        profile_worker_links(self, warmup, repeats)
+    def profile_pp_links(
+        self, warmup: int = 3, repeats: int = 10, all_pairs: bool = False
+    ) -> None:
+        profile_worker_links(self, warmup, repeats, all_pairs=all_pairs)
 
     def set_pp_profile_warmup(self, enabled: bool) -> None:
         if tracer := getattr(self, "_pp_stage_tracer", None):
@@ -121,6 +123,8 @@ class PPAscendWorker(NPUWorker):
                 all_gather_size=1 if gather is None else gather.world_size,
             )
             recv_ms = hetero.stretch_recv(pp_rank, recv_ms, payload_bytes=recv_bytes)
+            if tracer is not None:
+                recv_ms = tracer.finish_comm("recv")
 
         def _run_forward():
             return self.model_runner.execute_model(
@@ -129,7 +133,11 @@ class PPAscendWorker(NPUWorker):
 
         if tracer is not None:
             output, compute_timing = tracer.measure_stretched_compute(
-                _run_forward, lambda ms: hetero.stretch_compute(pp_rank, ms)
+                _run_forward,
+                lambda ms: hetero.stretch_compute(pp_rank, ms),
+                model_runner=self.model_runner,
+                vllm_config=self.vllm_config,
+                compute_scale=hetero.compute_scale(pp_rank),
             )
         else:
             output, compute_ms = time_call(_run_forward, _sync)
@@ -151,6 +159,8 @@ class PPAscendWorker(NPUWorker):
             else:
                 _, send_ms = time_call(_send, _sync)
             send_ms = hetero.stretch_send(pp_rank, send_ms, payload_bytes=send_bytes)
+            if tracer is not None:
+                send_ms = tracer.finish_comm("send")
             if tracer is not None:
                 tracer.record(
                     num_tokens=scheduler_output.total_num_scheduled_tokens,

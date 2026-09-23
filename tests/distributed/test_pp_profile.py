@@ -502,3 +502,45 @@ def test_live_does_not_require_mock_link_parameters(tmp_path, monkeypatch):
         min_pp_size=2,
     )
     assert plan.partitions == [16, 16]
+
+
+@pytest.mark.parametrize("mode", ["shape-affine", "layer-measured"])
+@pytest.mark.parametrize("fail_at", [None, "construct", "generate"])
+def test_profile_selects_worker_mode_and_restores_environment(
+    mode, fail_at, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("VLLM_PP_COMPUTE_MODEL", "previous-value")
+    llm = FakeLLM(tmp_path, _two_rank_recs())
+    original_generate = llm.generate
+
+    def generate(*args, **kwargs):
+        assert os.environ["VLLM_PP_COMPUTE_MODEL"] == mode
+        if fail_at == "generate":
+            raise RuntimeError("test failure")
+        return original_generate(*args, **kwargs)
+
+    llm.generate = generate
+
+    def factory():
+        assert os.environ["VLLM_PP_COMPUTE_MODEL"] == mode
+        if fail_at == "construct":
+            raise RuntimeError("test failure")
+        return llm
+
+    def run():
+        return profile_pp_partition(
+            dump_dir=tmp_path,
+            llm_factory=factory,
+            collect_only=True,
+            compute_model=mode,
+            num_iters=1,
+            num_iters_warmup=0,
+        )
+
+    if fail_at:
+        with pytest.raises(RuntimeError, match="test failure"):
+            run()
+    else:
+        assert run() is None
+    assert os.environ["VLLM_PP_COMPUTE_MODEL"] == "previous-value"
+    assert llm.closed == (fail_at != "construct")

@@ -80,6 +80,17 @@ def test_mock_delay_is_not_silently_lost():
     )
 
 
+def test_mock_delay_inside_actual_windows_is_not_rescaled():
+    sender, receiver = records(se=13, re=13)
+    sender.update(comm_scale=100, comm_delay_in_window=True)
+    # Both endpoints must explicitly mark the new timing boundary.
+    assert paired_transfer(sender, receiver)[0] == "mock_delay_outside_window"
+    receiver["comm_delay_in_window"] = True
+    status, values = paired_transfer(sender, receiver)
+    assert status == "paired"
+    assert values["send_overlap_ms"] == 5  # 13 - max(0, 8), not a config multiple.
+
+
 def test_duplicate_or_missing_peer_does_not_pair_by_position():
     sender, receiver = records()
     for peers in [[], [receiver, receiver], [receiver | dict(step=7)]]:

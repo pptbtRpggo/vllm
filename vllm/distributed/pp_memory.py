@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -92,11 +92,14 @@ class DeviceMemory:
         ):
             raise ValueError("weight and KV vectors must have the same nonzero length")
 
-    def estimate(self, start: int, end: int, pp_size: int) -> dict[str, int]:
+    def estimate(
+        self, start: int, end: int, pp_size: int, *, stage_rank: int | None = None
+    ) -> dict[str, int]:
+        role = self.pp_rank if stage_rank is None else stage_rank
         weights = sum(self.layer_weights_bytes[start:end])
         kv = sum(self.layer_kv_bytes[start:end])
-        endpoints = (self.first_stage_bytes if self.pp_rank == 0 else 0) + (
-            self.last_stage_bytes if self.pp_rank == pp_size - 1 else 0
+        endpoints = (self.first_stage_bytes if role == 0 else 0) + (
+            self.last_stage_bytes if role == pp_size - 1 else 0
         )
         reserve = (
             self.runtime_bytes
@@ -206,6 +209,24 @@ class PPMemoryProfile:
             )
             start += count
         return result
+
+    def select_devices(self, order: tuple[int, ...]) -> PPMemoryProfile:
+        if (
+            not order
+            or len(set(order)) != len(order)
+            or any(d not in range(self.pp_size) for d in order)
+        ):
+            raise ValueError("invalid selected device order")
+        return replace(
+            self,
+            pp_size=len(order),
+            devices=tuple(
+                replace(d, pp_rank=stage)
+                for stage, original in enumerate(order)
+                for d in self.devices
+                if d.pp_rank == original
+            ),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {"version": 1, **asdict(self)}

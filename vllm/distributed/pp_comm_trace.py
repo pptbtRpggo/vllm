@@ -48,7 +48,9 @@ def paired_transfer(sender: dict, receiver: dict) -> tuple[str, dict]:
         return "unmatched_batch", {}
     if sender.get("send_bytes") != receiver.get("recv_bytes"):
         return "unmatched_payload", {}
-    if sender.get("comm_scale", 1) != 1:
+    if sender.get("comm_scale", 1) != 1 and not (
+        sender.get("comm_delay_in_window") and receiver.get("comm_delay_in_window")
+    ):
         return "mock_delay_outside_window", {}
     times = [
         sender.get("send_start_ns"),

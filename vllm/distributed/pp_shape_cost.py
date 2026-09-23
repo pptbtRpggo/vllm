@@ -235,6 +235,10 @@ def fit_shape_rank_costs(
                 raise ValueError("profile layer ranges must cover a contiguous model")
             end = stop
             for rec in rows:
+                if rec.get("compute_model", "shape-affine") != "shape-affine":
+                    raise ValueError(
+                        "shape-affine cannot consume layer-measured traces"
+                    )
                 if rec["pp_size"] != len(ranks):
                     raise ValueError("trace PP size does not match its ranks")
                 batch_shape_key(rec)

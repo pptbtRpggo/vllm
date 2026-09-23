@@ -17,7 +17,8 @@ self-contained. The ordinary NCCL send path in this checkout already inserts
 a wait on the compute stream; tracing adds host synchronization overhead.
 Leave the env unset for production.
 
-This is stage-level (one number per PP rank per step), not per-layer.
+``VLLM_PP_COMPUTE_MODEL=layer-measured`` additionally records every local
+decoder layer using device events. The default shape-affine mode is stage-only.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import os
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, TypeVar
@@ -133,6 +135,14 @@ class PPStageTraceRecord:
     send_end_ns: int | None = None
     recv_start_ns: int | None = None
     recv_end_ns: int | None = None
+    compute_model: str = "shape-affine"
+    layer_compute_ms: dict[str, float] | None = None
+    non_layer_compute_ms: float | None = None
+    embedding_ms: float | None = None
+    lm_head_ms: float | None = None
+    final_norm_ms: float | None = None
+    runner_overhead_ms: float | None = None
+    comm_delay_in_window: bool = False
 
 
 class PPStageTracer:
@@ -147,7 +157,14 @@ class PPStageTracer:
         tp_rank: int = 0,
         use_cuda: bool | None = None,
         tp_size: int = 1,
+        compute_model: str = "shape-affine",
     ) -> None:
+        if compute_model not in ("shape-affine", "layer-measured"):
+            raise ValueError(f"unknown compute profiling mode: {compute_model}")
+        self.compute_model = compute_model
+        self._layer_measurement: dict[str, Any] = {}
+        self._layer_timer = None
+        self._layer_model = None
         os.makedirs(dump_dir, exist_ok=True)
         self.pp_rank = pp_rank
         self.pp_size = pp_size
@@ -224,15 +241,70 @@ class PPStageTracer:
             )
         return result, (time.perf_counter() - t0) * 1000.0
 
+    def finish_comm(self, kind: str) -> float:
+        """Close the window after runtime mock delay, measuring actual wall time."""
+        start = self._comm_windows[f"{kind}_start_ns"]
+        end = time.perf_counter_ns()
+        self._comm_windows[f"{kind}_end_ns"] = end
+        self._comm_windows["comm_delay_in_window"] = True
+        return (end - start) / 1e6
+
     def measure_stretched_compute(
-        self, fn: Callable[[], T], stretch: Callable[[float], float]
+        self,
+        fn: Callable[[], T],
+        stretch: Callable[[float], float],
+        *,
+        model_runner: Any = None,
+        vllm_config: Any = None,
+        compute_scale: float = 1.0,
     ) -> tuple[T, dict[str, float]]:
         """Keep modeled slowdown separate from actual synchronized wall time."""
-        start = time.perf_counter()
-        result, base_ms = self.measure_compute(fn)
-        delay_start = time.perf_counter()
-        modeled_ms = stretch(base_ms)
-        end = time.perf_counter()
+        timer = None
+        self._layer_measurement.clear()
+        if self.compute_model == "layer-measured":
+            from vllm.distributed.pp_layer_trace import PPLayerTimer
+
+            if not getattr(
+                getattr(vllm_config, "model_config", None), "enforce_eager", False
+            ):
+                raise ValueError("layer-measured requires --enforce-eager")
+            compilation = getattr(vllm_config, "compilation_config", None)
+            if getattr(compilation, "mode", 0) not in (None, 0):
+                raise ValueError("layer-measured requires compilation mode NONE (0)")
+            if self.tp_size != 1:
+                raise ValueError("layer-measured currently requires TP=1")
+            if compute_scale != 1.0:
+                raise ValueError(
+                    "layer-measured cannot attribute stage-level mock compute delay "
+                    "to individual layers; disable compute slowdown"
+                )
+            model = getattr(model_runner, "model", None)
+            if self._layer_timer is None or self._layer_model is not model:
+                self._layer_timer = PPLayerTimer(model, self.device)
+                self._layer_model = model
+            timer = self._layer_timer
+        with timer.capture() if timer else nullcontext():
+            start = time.perf_counter()
+            result, base_ms = self.measure_compute(fn)
+            delay_start = time.perf_counter()
+            modeled_ms = stretch(base_ms)
+            end = time.perf_counter()
+        if timer:
+            layers = timer.elapsed_ms()
+            # Includes endpoint modules and runner/launch work, NOT communication.
+            residual = (end - start) * 1000 - sum(layers.values())
+            if residual < -0.01:
+                raise ValueError("layer timing exceeds synchronized stage wall time")
+            endpoints = timer.endpoint_elapsed_ms()
+            overhead = residual - sum(v for v in endpoints.values() if v is not None)
+            if overhead < -0.01:
+                raise ValueError("endpoint timing exceeds non-layer stage wall time")
+            self._layer_measurement = dict(
+                layer_compute_ms=layers,
+                non_layer_compute_ms=max(0.0, residual),
+                runner_overhead_ms=max(0.0, overhead),
+                **endpoints,
+            )
         return result, dict(
             compute_ms=modeled_ms,
             compute_base_ms=base_ms,
@@ -265,6 +337,8 @@ class PPStageTracer:
         send_tensor_spec: list[dict[str, Any]] | None = None,
         batch_id: str | None = None,
     ) -> PPStageTraceRecord:
+        if self.compute_model == "layer-measured" and not self._layer_measurement:
+            raise ValueError("layer-measured record requires a fresh layer measurement")
         rec = PPStageTraceRecord(
             step=self._step,
             ts_unix=time.time(),
@@ -297,6 +371,8 @@ class PPStageTracer:
             trace_session=self.trace_session,
             clock_domain=self.clock_domain,
             batch_id=batch_id,
+            compute_model=self.compute_model,
+            **self._layer_measurement,
             **self._comm_windows,
         )
         self._fp.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
@@ -304,6 +380,7 @@ class PPStageTracer:
         self._records.append(rec)
         self._step += 1
         self._comm_windows.clear()
+        self._layer_measurement.clear()
         return rec
 
     def close(self) -> None:
@@ -360,4 +437,5 @@ def maybe_create_pp_stage_tracer(
         device=device,
         tp_rank=tp_rank,
         tp_size=tp_size,
+        compute_model=envs.VLLM_PP_COMPUTE_MODEL,
     )

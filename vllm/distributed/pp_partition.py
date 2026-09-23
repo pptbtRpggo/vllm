@@ -6,11 +6,13 @@ Trace files measure stage work, including fixed endpoint work. Multiple
 partitions identify fixed and per-layer costs using actual microbatch shapes.
 When exact shapes do not recur, a nonnegative token/context feature fit is used.
 The primary trace defines the reference workload distribution for every rank.
+Alternatively, layer-measured uses a representative decoder mean per device,
+separate endpoint measurements and an arithmetic mean of prefill/decode means.
 Communication comes from paired serving timestamps (default) or measured idle
 replay (explicit). No configured bandwidth or slowdown is a planner cost.
-Only fixed device order and the profiled PP size are supported by this fit;
-layer counts outside measured coverage are excluded. This is a mean occupancy
-surrogate, not an E2E serving schedule simulation.
+The shape-affine fit keeps device order/PP size and excludes unprofiled lengths.
+Representative layer measurements additionally support device subset/order DP.
+This is a mean occupancy surrogate, not an E2E serving schedule simulation.
 
 Two objectives, adapted from EdgeShard:
 
@@ -45,7 +47,7 @@ from vllm.distributed.pp_memory import PPMemoryProfile, resolve_memory_profile
 
 Objective = Literal["latency", "throughput"]
 Workload = Literal["all", "decode", "prefill", "mixed"]
-ComputeModel = Literal["provided", "shape-affine"]
+ComputeModel = Literal["provided", "shape-affine", "layer-measured"]
 
 _INF = math.inf
 
@@ -64,6 +66,11 @@ class RankCost:
     max_layers: int | None = None
     profiled_pp_size: int | None = None
     shape_fits: tuple[dict[str, Any], ...] = ()
+    t_embedding_ms: float | None = None
+    t_head_ms: float | None = None
+    t_final_norm_ms: float | None = None
+    phase_summary: tuple[dict[str, Any], ...] = ()
+    layer_aggregation: str = "phase-balanced"
 
 
 @dataclass(frozen=True)
@@ -74,6 +81,8 @@ class PPPartitionPlan:
     rank_costs: list[RankCost]
     overlap_comm: bool = False
     memory_profile: PPMemoryProfile | None = None
+    # Original profiling device IDs, in selected pipeline order.
+    device_order: tuple[int, ...] = ()
 
     @property
     def cost_model(self) -> str:
@@ -95,6 +104,13 @@ class PPPartitionPlan:
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-serializable view used by ``vllm pp-profile``."""
+        start = 0
+        stage_compute = []
+        for rank, count in enumerate(self.partitions):
+            stage_compute.append(
+                _compute_ms(self.rank_costs, rank, count, start, sum(self.partitions))
+            )
+            start += count
         return {
             "objective": self.objective,
             "cost_model": self.cost_model,
@@ -102,23 +118,28 @@ class PPPartitionPlan:
             "tie_breaker": "sequential_cost"
             if self.objective == "throughput"
             else None,
-            "predicted_sequential_ms": sum(
-                c.t_fixed_ms + n * c.t_layer_ms
-                for c, n in zip(self.rank_costs, self.partitions)
-            )
+            "predicted_stage_compute_ms": stage_compute,
+            "predicted_sequential_ms": sum(stage_compute)
             + sum(c.t_comm_out_ms or 0.0 for c in self.rank_costs[:-1]),
             "cost_kind": (
                 (
                     "mean_stage_occupancy_ms"
-                    if self.compute_model == "shape-affine"
+                    if self.compute_model in ("shape-affine", "layer-measured")
                     else "steady_state_cycle_ms"
                 )
                 if self.objective == "throughput"
                 else "sequential_latency_ms"
             ),
+            "device_order": list(self.device_order or range(self.pp_size)),
             "workload_aggregation": (
-                "reference_shape_weighted_mean"
-                if self.compute_model == "shape-affine"
+                (
+                    "observed_microbatch_mean"
+                    if self.rank_costs[0].layer_aggregation == "microbatch"
+                    else "arithmetic_mean_of_phase_means"
+                )
+                if self.compute_model == "layer-measured"
+                else "reference_shape_weighted_mean"
+                if self.compute_model in ("shape-affine", "layer-measured")
                 else "provided_costs"
             ),
             "memory_feasibility_checked": self.memory_profile is not None,
@@ -149,6 +170,17 @@ class PPPartitionPlan:
                     "min_layers": cost.min_layers,
                     "max_layers": cost.max_layers,
                     "shape_fits": list(cost.shape_fits),
+                    "t_embedding_ms": cost.t_embedding_ms,
+                    "t_head_ms": cost.t_head_ms,
+                    "t_final_norm_ms": cost.t_final_norm_ms,
+                    "phase_summary": list(cost.phase_summary),
+                    "layer_aggregation": cost.layer_aggregation
+                    if cost.compute_model == "layer-measured" else None,
+                    "t_layer_ms_kind": (
+                        "representative_layer_mean"
+                        if cost.compute_model == "layer-measured"
+                        else "marginal_cost"
+                    ),
                 }
                 for cost in self.rank_costs
             ],
@@ -187,6 +219,19 @@ def load_trace_records(
         else:
             tp_ranks = sorted(tp for r, tp in by_key if r == rank)
             by_rank[rank] = by_key[(rank, tp_ranks[0])]
+    # Optional mapping for endpoint profiles collected with a different order.
+    # IDs refer to the primary run's devices, not to CUDA/NPU visible indices.
+    mapping_path = dump_dir / "pp_device_map.json"
+    mapping = json.loads(mapping_path.read_text()) if mapping_path.exists() else ranks
+    if (
+        not isinstance(mapping, list)
+        or any(type(d) is not int for d in mapping)
+        or sorted(mapping) != ranks
+    ):
+        raise ValueError("pp_device_map.json must be a permutation of profiling IDs")
+    for rank, rows in by_rank.items():
+        for row in rows:
+            row["profile_device_id"] = mapping[rank]
     return by_rank
 
 
@@ -227,9 +272,27 @@ def _comm_ms(costs: Sequence[RankCost], from_rank: int) -> float:
     return value
 
 
-def _compute_ms(costs: Sequence[RankCost], rank: int, n_layers: int) -> float:
+def _compute_ms(
+    costs: Sequence[RankCost],
+    rank: int,
+    n_layers: int,
+    start_layer: int = 0,
+    total_layers: int | None = None,
+) -> float:
     cost = costs[rank]
-    return cost.t_fixed_ms + n_layers * cost.t_layer_ms
+    compute = cost.t_fixed_ms + n_layers * cost.t_layer_ms
+    if cost.compute_model == "layer-measured":
+        if total_layers is None:
+            total_layers = sum(c.n_layers for c in costs)
+        if start_layer == 0:
+            if cost.t_embedding_ms is None:
+                return _INF
+            compute += cost.t_embedding_ms
+        if start_layer + n_layers == total_layers:
+            if cost.t_head_ms is None or cost.t_final_norm_ms is None:
+                return _INF
+            compute += cost.t_head_ms + cost.t_final_norm_ms
+    return compute
 
 
 def partition_layers(
@@ -275,6 +338,10 @@ def partition_layers(
         raise ValueError("cannot mix compute models across ranks")
     n_ranks = len(costs)
     n_layers = num_layers if num_layers is not None else sum(c.n_layers for c in costs)
+    for cost in costs:
+        values = (cost.t_embedding_ms, cost.t_head_ms, cost.t_final_norm_ms)
+        if any(v is not None and (not math.isfinite(v) or v < 0) for v in values):
+            raise ValueError("endpoint costs must be finite and nonnegative")
     if n_layers < 1:
         raise ValueError("num_layers must be >= 1")
     memory_profile = resolve_memory_profile(
@@ -284,15 +351,16 @@ def partition_layers(
         memory_profile.validate_dimensions(n_layers, n_ranks)
     max_pp = n_ranks if max_pp_size is None else min(max_pp_size, n_ranks)
     min_pp = max(1, min_pp_size)
-    if models == {"shape-affine"}:
+    if models <= {"shape-affine", "layer-measured"}:
+        model = costs[0].compute_model
         if overlap_comm:
-            raise ValueError("shape-affine currently supports blocking occupancy only")
+            raise ValueError(f"{model} currently supports blocking occupancy only")
         if any(c.profiled_pp_size != n_ranks for c in costs):
-            raise ValueError("shape-affine costs require the profiled PP size")
+            raise ValueError(f"{model} costs require the profiled PP size")
         # Changing PP size changes endpoint work; never reuse a middle-stage
         # intercept as the last-stage intercept.
         if min_pp > n_ranks or max_pp < n_ranks:
-            raise ValueError("shape-affine cannot change the profiled PP size")
+            raise ValueError(f"{model} cannot change the profiled PP size")
         min_pp = max_pp = n_ranks
     if min_pp > max_pp:
         raise ValueError(f"invalid pp_size range [{min_pp}, {max_pp}]")
@@ -328,7 +396,9 @@ def partition_layers(
                             r - 1, k, i, pp_size
                         ):
                             continue
-                        compute = _compute_ms(costs, r - 1, i - k)
+                        compute = _compute_ms(costs, r - 1, i - k, k, n_layers)
+                        if not math.isfinite(compute):
+                            continue
                         occupancy = (
                             max(incoming, compute)
                             if overlap_comm
@@ -376,6 +446,10 @@ def partition_layers(
             memory_profile=memory_profile,
         )
     if best_plan is None:
+        if models == {"layer-measured"}:
+            raise ValueError(
+                "No partition within measured endpoint coverage and memory bounds"
+            )
         if models == {"shape-affine"}:
             raise ValueError(
                 "No partition within both profiled shard-length coverage and "
@@ -406,24 +480,55 @@ def plan_from_trace_dir(
     compute_model: ComputeModel = "shape-affine",
     fit_trace_dirs: Sequence[str | Path] = (),
     comm_source: str = "serving",
+    device_selection: bool = False,
+    layer_aggregation: str = "phase-balanced",
 ) -> PPPartitionPlan:
+    if device_selection and compute_model != "layer-measured":
+        raise ValueError("device selection requires layer-measured")
     if hetero:
         raise ValueError(
             "planner costs must come from measured traces; changed hetero scales "
             "require recollecting traces, not rescaling costs"
         )
     records = load_trace_records(dump_dir, comm_source=comm_source)
-    if compute_model == "shape-affine":
+    if any(
+        row.get("profile_device_id", rank) != rank
+        for rank, rows in records.items()
+        for row in rows
+    ):
+        raise ValueError("primary trace must use the identity device mapping")
+    if compute_model in ("shape-affine", "layer-measured"):
+        from vllm.distributed.pp_layer_cost import measured_layer_rank_costs
         from vllm.distributed.pp_shape_cost import fit_shape_rank_costs
 
+        aggregate = (
+            measured_layer_rank_costs
+            if compute_model == "layer-measured"
+            else fit_shape_rank_costs
+        )
         trace_sets = [records] + [
             load_trace_records(p, comm_source=comm_source) for p in fit_trace_dirs
         ]
-        costs = fit_shape_rank_costs(
+        if compute_model == "shape-affine" and any(
+            row.get("profile_device_id", rank) != rank
+            for traces in trace_sets
+            for rank, rows in traces.items()
+            for row in rows
+        ):
+            raise ValueError("shape-affine cannot consume reordered device profiles")
+        costs = aggregate(
             trace_sets,
             workload=workload,
             warmup_steps=warmup_steps,
             num_layers=num_layers,
+            **(
+                {
+                    "include_communication": not device_selection,
+                    "layer_aggregation": layer_aggregation,
+                }
+                if compute_model == "layer-measured"
+                else {}
+            ),
         )
     else:
         raise ValueError(f"unknown compute_model: {compute_model}")
@@ -439,6 +544,24 @@ def plan_from_trace_dir(
         }
         if trace_tp_sizes and trace_tp_sizes != {memory_profile.tp_size}:
             raise ValueError("memory profile TP size does not match timing traces")
+    if device_selection:
+        from vllm.distributed.pp_device_partition import partition_devices
+        from vllm.distributed.pp_link_profile import load_topology_measurements
+
+        links = load_topology_measurements(
+            Path(dump_dir), records, workload, warmup_steps
+        )
+        return partition_devices(
+            costs,
+            links,
+            objective=objective,
+            num_layers=num_layers,
+            min_pp_size=min_pp_size,
+            max_pp_size=max_pp_size,
+            memory_profile=memory_profile,
+            allow_unchecked_memory=allow_unchecked_memory,
+            overlap_comm=overlap_comm,
+        )
     return partition_layers(
         costs,
         objective=objective,
@@ -458,6 +581,7 @@ def format_plan(plan: PPPartitionPlan) -> str:
         f"compute_model={plan.compute_model}",
         f"predicted_cost_ms={plan.cost_ms:.4f}",
         f"pp_size={plan.pp_size}",
+        f"device_order={list(plan.device_order or range(plan.pp_size))}",
         f"VLLM_PP_LAYER_PARTITION={plan.env_value}",
         f"memory_feasibility_checked={plan.memory_profile is not None}",
         "rank t_layer_ms n_layers_selected t_comm_out_ms steps comm_source fixed_ms",
@@ -467,6 +591,13 @@ def format_plan(plan: PPPartitionPlan) -> str:
         lines.append(
             f"  {cost.pp_rank} {cost.t_layer_ms:.4f} {n} {comm} "
             f"{cost.n_steps} {cost.comm_source} {cost.t_fixed_ms:.4f}"
+        )
+    if plan.compute_model == "layer-measured":
+        lines.append(
+            "DP uses one representative layer mean per device, explicit endpoint "
+            "times and runner overhead. "
+            f"Aggregation: {plan.rank_costs[0].layer_aggregation}; "
+            "serving performance still requires validation."
         )
     if plan.compute_model == "shape-affine":
         lines.append(
@@ -486,6 +617,20 @@ def format_plan(plan: PPPartitionPlan) -> str:
 
 def add_cost_model_args(parser: Any) -> None:
     parser.add_argument(
+        "--layer-aggregation",
+        choices=("phase-balanced", "microbatch"),
+        default="phase-balanced",
+        help=(
+            "Direct layer timing: equal prefill/decode means (legacy default), "
+            "or equal weight per observed microbatch, including mixed steps."
+        ),
+    )
+    parser.add_argument(
+        "--device-selection",
+        action="store_true",
+        help="Select device subset/order using layer-measured costs and topology.",
+    )
+    parser.add_argument(
         "--comm-source",
         choices=("replay", "serving"),
         default="serving",
@@ -493,9 +638,9 @@ def add_cost_model_args(parser: Any) -> None:
     )
     parser.add_argument(
         "--compute-model",
-        choices=("shape-affine",),
+        choices=("shape-affine", "layer-measured"),
         default="shape-affine",
-        help="Measured multi-shard fit with microbatch token/context features.",
+        help="Stage cost fitting or direct decoder-layer timing (requires eager TP=1).",
     )
     parser.add_argument(
         "--fit-trace-dir",
@@ -585,6 +730,8 @@ def main(argv: Iterable[str] | None = None) -> None:
         compute_model=args.compute_model,
         fit_trace_dirs=args.fit_trace_dirs,
         comm_source=args.comm_source,
+        device_selection=args.device_selection,
+        layer_aggregation=args.layer_aggregation,
     )
     print(format_plan(plan))
 

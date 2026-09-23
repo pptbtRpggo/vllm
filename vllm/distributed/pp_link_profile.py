@@ -49,7 +49,9 @@ def _broadcast(group: Any, value: Any, src: int) -> Any:
     return objects[0]
 
 
-def profile_worker_links(worker: Any, warmup: int = 3, repeats: int = 10) -> None:
+def profile_worker_links(
+    worker: Any, warmup: int = 3, repeats: int = 10, all_pairs: bool = False
+) -> None:
     from vllm.distributed.parallel_state import get_pp_group, get_tp_group
     from vllm.distributed.pp_hetero import sync_torch_device
 
@@ -68,10 +70,39 @@ def profile_worker_links(worker: Any, warmup: int = 3, repeats: int = 10) -> Non
             raise ValueError("enable VLLM_PP_STAGE_TRACE on every worker")
     assert tracer is not None
     hetero = worker._pp_hetero
-    for hop in range(group.world_size - 1):
+    if all_pairs:
+        for source in range(group.world_size):
+            mocked = _broadcast(
+                group,
+                bool(
+                    any(v != 1 for v in hetero.comm_scales)
+                    or hetero.comm_bandwidth_gbps
+                    or hetero.comm_latency_ms
+                ),
+                source,
+            )
+            if mocked:
+                raise ValueError(
+                    "all-pair replay requires real links; "
+                    "disable rank-based mock communication"
+                )
+    pairs = (
+        [
+            (a, b)
+            for a in range(group.world_size)
+            for b in range(group.world_size)
+            if a != b
+        ]
+        if all_pairs
+        else [(a, a + 1) for a in range(group.world_size - 1)]
+    )
+    for hop, destination in pairs:
+        # Homogeneous decoder architecture: use actual first-stage payloads
+        # as the common activation workload for every candidate link.
+        reference = 0 if all_pairs else hop
         specs = {}
         error = None
-        if rank == hop:
+        if rank == reference:
             for record in tracer._records:
                 if record.is_warmup:
                     continue
@@ -81,7 +112,8 @@ def profile_worker_links(worker: Any, warmup: int = 3, repeats: int = 10) -> Non
                 specs[payload_key(record.send_tensor_spec)] = record.send_tensor_spec
             if not specs:
                 error = error or "no non-warmup payloads to measure"
-        error, specs = _broadcast(group, (error, specs), hop)
+        error, specs = _broadcast(group, (error, specs), reference)
+        reference_trace_id = _broadcast(group, tracer.trace_id, reference)
         if error:
             raise ValueError(error)
         rows = []
@@ -116,15 +148,15 @@ def profile_worker_links(worker: Any, warmup: int = 3, repeats: int = 10) -> Non
                 group.barrier()
                 start = time.perf_counter()
                 if rank == hop:
-                    group.send_tensor_dict(tensors, dst=hop + 1)
-                elif rank == hop + 1:
+                    group.send_tensor_dict(tensors, dst=destination)
+                elif rank == destination:
                     received = group.recv_tensor_dict(src=hop)
                 sync_torch_device(worker.device)
                 # Optional emulation executes on the worker, just as in serving.
                 # Its *measured* elapsed time is recorded; no modeled time is
                 # ever exported as a planner cost.
                 elapsed = (time.perf_counter() - start) * 1000
-                if rank in (hop, hop + 1):
+                if rank in (hop, destination):
                     from vllm.distributed.pp_stage_trace import tensor_dict_nbytes
 
                     payload = tensors if rank == hop else received
@@ -134,14 +166,16 @@ def profile_worker_links(worker: Any, warmup: int = 3, repeats: int = 10) -> Non
                 elapsed = (time.perf_counter() - start) * 1000
                 group.barrier()
                 sender_ms = _broadcast(group, elapsed, hop)
-                receiver_ms = _broadcast(group, elapsed, hop + 1)
+                receiver_ms = _broadcast(group, elapsed, destination)
                 if iteration >= warmup:
                     samples.append(dict(sender_ms=sender_ms, receiver_ms=receiver_ms))
             if rank == hop:
                 rows.append(
                     dict(
-                        trace_id=tracer.trace_id,
+                        trace_id=reference_trace_id,
                         pp_rank=rank,
+                        dst_rank=destination,
+                        reference_rank=reference,
                         tp_rank=0,
                         payload_key=key,
                         source="measured_idle_replay",
@@ -149,10 +183,15 @@ def profile_worker_links(worker: Any, warmup: int = 3, repeats: int = 10) -> Non
                     )
                 )
             tensors.clear()
-            if rank == hop + 1:
+            if rank == destination:
                 del received
         if rank == hop:
-            path = Path(tracer.path).with_name(f"pp_link_pp{rank}_tp0.jsonl")
+            filename = (
+                f"pp_topology_pp{rank}_to{destination}.jsonl"
+                if all_pairs
+                else f"pp_link_pp{rank}_tp0.jsonl"
+            )
+            path = Path(tracer.path).with_name(filename)
             temporary = path.with_suffix(".tmp")
             temporary.write_text("".join(json.dumps(r) + "\n" for r in rows))
             temporary.replace(path)
@@ -214,3 +253,56 @@ def measured_transfer_ms(record: dict) -> float:
     if not math.isfinite(value) or value <= 0:
         raise ValueError("invalid measured send_service_ms")
     return value
+
+
+def load_topology_measurements(directory, records, workload, warmup_steps):
+    """Aggregate raw all-pair replay with the same phase weights as compute."""
+    from vllm.distributed.pp_layer_cost import phase_groups, phase_mean
+
+    groups = phase_groups(records[0], workload, warmup_steps)
+    trace_ids = {r["trace_id"] for rs in groups.values() for r in rs}
+    if len(trace_ids) != 1:
+        raise ValueError("topology reference must belong to one trace run")
+    measurements = {}
+    for path in directory.glob("pp_topology_pp*_to*.jsonl"):
+        for line in path.read_text().splitlines():
+            row = json.loads(line)
+            if (
+                row.get("source") != "measured_idle_replay"
+                or row.get("trace_id") not in trace_ids
+                or row.get("reference_rank") != 0
+            ):
+                raise ValueError("stale or unmeasured topology data")
+            values = []
+            for sample in row["samples"]:
+                endpoints = [sample["sender_ms"], sample["receiver_ms"]]
+                if any(
+                    type(v) not in (int, float) or not math.isfinite(v) or v <= 0
+                    for v in endpoints
+                ):
+                    raise ValueError("invalid topology measurement")
+                values.append(max(endpoints))
+            if len(values) < 2:
+                raise ValueError("topology requires repeated link measurements")
+            key = row["pp_rank"], row["dst_rank"], row["payload_key"]
+            if key in measurements:
+                raise ValueError("duplicate topology measurement")
+            measurements[key] = sum(values) / len(values)
+    if not measurements:
+        raise ValueError(
+            "device selection needs all-pair link replay: "
+            "collective_rpc('profile_pp_links', args=(3, 10, True))"
+        )
+    result = {}
+    pairs = {(a, b) for a, b, _ in measurements}
+    for a, b in pairs:
+
+        def cost(row, a=a, b=b):
+            spec = row.get("send_tensor_spec")
+            key = a, b, payload_key(spec)
+            if not spec or key not in measurements:
+                raise ValueError("topology is missing a reference payload measurement")
+            return measurements[key]
+
+        result[a, b] = phase_mean(groups, cost)
+    return result

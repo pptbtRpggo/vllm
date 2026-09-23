@@ -59,7 +59,7 @@ def test_payload_spec_preserves_tensor_count_shape_dtype():
     assert tensor_spec(dict(extra="unsupported")) is None
 
 
-def _gloo_replay(rank, init_file, directory):
+def _gloo_replay(rank, init_file, directory, all_pairs=False):
     import vllm.distributed.parallel_state as parallel
     from vllm.distributed.pp_hetero import PPHeteroConfig
     from vllm.distributed.pp_stage_trace import PPStageTracer
@@ -102,7 +102,7 @@ def _gloo_replay(rank, init_file, directory):
         _pp_stage_tracer=tracer, _pp_hetero=PPHeteroConfig(), device=torch.device("cpu")
     )
     try:
-        profile_worker_links(worker, warmup=1, repeats=3)
+        profile_worker_links(worker, warmup=1, repeats=3, all_pairs=all_pairs)
     finally:
         tracer._records = []
         tracer.close()
@@ -125,3 +125,20 @@ def test_real_two_process_transfer_without_bandwidth_config(tmp_path, monkeypatc
     assert len(row["samples"]) == 3
     assert all(s["sender_ms"] > 0 and s["receiver_ms"] > 0 for s in row["samples"])
     assert not (tmp_path / "pp_link_pp1_tp0.jsonl").exists()
+
+
+def test_all_pair_replay_includes_reverse_direction(tmp_path):
+    torch.multiprocessing.spawn(
+        _gloo_replay,
+        args=(str(tmp_path / "init"), str(tmp_path), True),
+        nprocs=2,
+        join=True,
+    )
+    for source, target in ((0, 1), (1, 0)):
+        row = json.loads(
+            (tmp_path / f"pp_topology_pp{source}_to{target}.jsonl").read_text()
+        )
+        assert row["pp_rank"] == source and row["dst_rank"] == target
+        assert row["reference_rank"] == 0
+        assert len(row["samples"]) == 3
+        assert all(s["sender_ms"] > 0 and s["receiver_ms"] > 0 for s in row["samples"])
