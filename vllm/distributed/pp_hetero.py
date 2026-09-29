@@ -25,7 +25,8 @@ completion of the same transfer, without exchanging additional messages.
 
 For device-pair networks, VLLM_PP_NETWORK supplies upper-triangular bandwidth_gbps
 and latency_ms rows, without the diagonal. Both directions share each entry.
-Their transfer time is added to real communication.
+Their transfer time is added to real communication. A null bandwidth with zero
+latency leaves a pair on its native transport without adding synthetic delay.
 VLLM_PP_DEVICE_ORDER maps ranks to stable device IDs, including compute factors.
 Network matrices and legacy per-hop communication settings are mutually exclusive.
 """
@@ -62,9 +63,10 @@ class PPNetwork:
     Delay is added to real transport, not substituted for it. Bandwidth is
     per TP lane. These configured values never become planner costs.
     Row i stores pairs (i, i+1), ..., (i, N-1); the last row is empty.
+    Null bandwidth with zero latency means no extra delay for that pair.
     """
 
-    bandwidth_gbps: tuple[tuple[float, ...], ...]
+    bandwidth_gbps: tuple[tuple[float | None, ...], ...]
     latency_ms: tuple[tuple[float, ...], ...]
 
     @classmethod
@@ -89,10 +91,18 @@ class PPNetwork:
                         "(no diagonal or lower triangle; last row is empty)"
                     )
                 for value in row:
+                    if name == "bandwidth" and value is None:
+                        continue
                     if type(value) not in (int, float) or not math.isfinite(value):
                         raise ValueError("PP network values must be finite numbers")
                     if value < 0 or (name == "bandwidth" and value == 0):
                         raise ValueError("PP bandwidth must be > 0 and latency >= 0")
+        for source, row in enumerate(bandwidth):
+            if any(
+                value is None and latency[source][offset] != 0
+                for offset, value in enumerate(row)
+            ):
+                raise ValueError("native PP network pairs need zero extra latency")
         return cls(tuple(map(tuple, bandwidth)), tuple(map(tuple, latency)))
 
     def delay_ms(self, source: int, target: int, payload_bytes: int) -> float:
@@ -106,8 +116,11 @@ class PPNetwork:
             return 0.0
         source, target = sorted((source, target))
         offset = target - source - 1
+        bandwidth = self.bandwidth_gbps[source][offset]
+        if bandwidth is None:
+            return 0.0
         return self.latency_ms[source][offset] + 8 * payload_bytes / (
-            self.bandwidth_gbps[source][offset] * 1_000_000
+            bandwidth * 1_000_000
         )
 
 

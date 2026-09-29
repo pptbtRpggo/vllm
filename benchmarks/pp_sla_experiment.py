@@ -9,6 +9,7 @@ Memory bounds are for this driver's fixed KV pool, not engine auto-partitioning.
 import argparse
 import asyncio
 import json
+import math
 import os
 import signal
 import socket
@@ -25,6 +26,23 @@ from pp_sla import capacity_summary, read_samples, run_load, save
 
 GIB = 1024**3
 REPO = Path(__file__).resolve().parents[1]
+
+
+def two_group_network(bandwidth_gbps, latency_ms):
+    """Devices 0/1 and 2/3 retain native links; all cross-group pairs slow."""
+    if not (math.isfinite(bandwidth_gbps) and bandwidth_gbps > 0):
+        raise ValueError("cross-group bandwidth must be positive and finite")
+    if not (math.isfinite(latency_ms) and latency_ms > 0):
+        raise ValueError("cross-group extra latency must be positive and finite")
+    return dict(
+        bandwidth_gbps=[
+            [None, bandwidth_gbps, bandwidth_gbps],
+            [bandwidth_gbps, bandwidth_gbps],
+            [None],
+            [],
+        ],
+        latency_ms=[[0, latency_ms, latency_ms], [latency_ms, latency_ms], [0], []],
+    )
 
 
 def memory_bounds(observations, model_config, serving, blocks):
@@ -106,6 +124,9 @@ class Experiment:
         self.root = Path(args.output).resolve()
         self.url = f"http://127.0.0.1:{args.port}"
         self.model_name = "pp-sla-34b"
+        self.network = two_group_network(
+            args.cross_bandwidth_gbps, args.cross_extra_latency_ms
+        )
         self.serving = dict(
             model=str(Path(args.model).resolve()),
             revision=None,
@@ -161,6 +182,7 @@ class Experiment:
             VLLM_PP_HETERO="1,1,2,4",
             VLLM_PP_COMPUTE_MODEL="layer-measured",
             VLLM_PP_DEVICE_ORDER="0,1,2,3",
+            VLLM_PP_NETWORK=json.dumps(self.network, separators=(",", ":")),
             VLLM_SERVER_DEV_MODE="1",
             ASCEND_RT_VISIBLE_DEVICES="0,1,2,3",
             VLLM_WORKER_MULTIPROC_METHOD="spawn",
@@ -402,6 +424,8 @@ def main():
     )
     parser.add_argument("--profile-requests", type=int, default=32)
     parser.add_argument("--profile-concurrency", type=int, default=8)
+    parser.add_argument("--cross-bandwidth-gbps", type=float, default=25)
+    parser.add_argument("--cross-extra-latency-ms", type=float, default=1)
     parser.add_argument("--pilot-requests", type=int, default=16)
     parser.add_argument("--warmup-output-tokens", type=int, default=16)
     parser.add_argument("--requests", type=int, default=2048)
@@ -426,7 +450,7 @@ def main():
         serving=experiment.serving,
         kv_blocks=args.kv_blocks,
         compute_slowdown=[1, 1, 2, 4],
-        network="native_single_host_HCCL",
+        network=experiment.network,
         sample_manifest=json.loads((Path(args.data) / "manifest.json").read_text()),
     )
     protocol_path = experiment.root / "protocol.json"

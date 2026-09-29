@@ -3,7 +3,8 @@
 ## 实验范围
 
 - 单机4张910B，PP=4、TP=1；计算耗时分别模拟为原来的1、1、2、4倍。
-- 保留原生 HCCL 通信。本轮不模拟跨机100 Gbps网络，结果不能称为真实“两机四卡”结果。
+- 将设备0/1视作第一组，2/3视作第二组。组内0↔1、2↔3保留原生HCCS/HCCL通信；跨组设备对额外等待`1 ms + 8×payload_bytes/(25×10⁶)`。
+- 25 Gbps是附加等待公式的实验参数，并非真实网卡限速或实测有效带宽。4张卡在同一台机器上，不能把结果称为真实两机四卡性能。
 - CodeLlama-34b **base**，48层，FP16。均分为12/12/12/12。
 - 比较均分、Latency DP、Throughput DP；相同切分只测试一次。
 - 最终指标：P99 TTFT不超过150 ms或500 ms时，实测能支持多少并发用户；相对于均分是否提升50%。
@@ -34,6 +35,9 @@ python benchmarks/pp_sla.py prepare \
 固定服务参数：`max_model_len=4096`、`max_num_seqs=256`、
 `max_num_batched_tokens=2048`、chunked prefill开启、prefix cache关闭、eager执行。
 模拟减速使用主代码逐层计时和额外等待；profiling与实际对照服务使用同一设置。
+跨组通信只在原生HCCL传输之外增加等待，trace记录增加后的实际通信耗时并交给DP。
+可通过`--cross-bandwidth-gbps`和`--cross-extra-latency-ms`设置不同的跨组条件；
+组内额外等待固定为零。更改参数后使用新的output目录重采trace。
 
 所有切分固定1024个KV blocks，每个128 tokens，即131072 tokens容量。
 该模型FP16 KV每层约512 MiB。并发较高、累计context超过容量时可能出现preemption；

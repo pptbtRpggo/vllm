@@ -219,6 +219,7 @@ def test_network_is_symmetric_and_follows_devices_after_reordering(monkeypatch):
         {"bandwidth_gbps": [[8]]},
         {"bandwidth_gbps": [[8], [8]]},
         {"bandwidth_gbps": [[0], []]},
+        {"bandwidth_gbps": [[None], []], "latency_ms": [[1], []]},
         {"bandwidth_gbps": [[float("nan")], []]},
         {"bandwidth_gbps": [[0, 8], [8, 0]]},
         {"bandwidth_gbps": [[8], []], "latency_ms": [[-1], []]},
@@ -264,6 +265,21 @@ def test_upper_triangle_four_devices_and_default_latency():
     }.items():
         assert network.delay_ms(a, b, 1_000_000) == 8 / bandwidth
         assert network.delay_ms(b, a, 1_000_000) == 8 / bandwidth
+
+
+def test_two_groups_keep_native_intragroup_links_and_slow_cross_group():
+    from vllm.distributed.pp_hetero import PPNetwork
+
+    network = PPNetwork.from_json(
+        '{"bandwidth_gbps":[[null,25,25],[25,25],[null],[]],'
+        '"latency_ms":[[0,1,1],[1,1],[0],[]]}'
+    )
+    for a, b in ((0, 1), (2, 3)):
+        assert network.delay_ms(a, b, 1_000_000) == 0
+        assert network.delay_ms(b, a, 1_000_000) == 0
+    for a, b in ((0, 2), (0, 3), (1, 2), (1, 3)):
+        assert network.delay_ms(a, b, 1_000_000) == 1.32
+        assert network.delay_ms(b, a, 1_000_000) == 1.32
 
 
 def test_trace_session_is_forwarded_to_ray_but_not_compilation_hash(monkeypatch):

@@ -76,3 +76,13 @@ def test_memory_observations_must_cover_all_layers(experiment):
     del rows[0]["layer_storage_bytes"]["0"]
     with pytest.raises(ValueError, match="incomplete"):
         build(experiment, rows)
+
+
+def test_two_group_network_sets_only_cross_group_extra_delay(experiment):
+    matrix = experiment.two_group_network(25, 1)
+    assert matrix["bandwidth_gbps"] == [[None, 25, 25], [25, 25], [None], []]
+    assert matrix["latency_ms"] == [[0, 1, 1], [1, 1], [0], []]
+    with pytest.raises(ValueError, match="positive"):
+        experiment.two_group_network(0, 1)
+    with pytest.raises(ValueError, match="positive"):
+        experiment.two_group_network(25, 0)
