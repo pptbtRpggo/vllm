@@ -62,14 +62,17 @@ python benchmarks/pp_sla_experiment.py \
 
 该命令依次完成：
 
-1. 均分启动，8条独立warmup请求；正式32条请求、并发8采trace。
+1. 均分启动，8条独立warmup请求，每条生成16 tokens；正式32条请求、并发8采trace。
 2. 排除warmup，平均实际逐层耗时；通信使用匹配send/recv的trace。
 3. 用上述实测成本和新的内存预算，计算两个目标的DP切分。
 4. 分别启动均分和DP方案，关闭trace输出，先warmup，再验证请求。
-5. 每个方案测32条单输出token请求，检查单请求TTFT；另测32条原始输出长度请求、并发8。
+5. 每个方案测32条单输出token请求，检查单请求TTFT；另测16条原始输出长度请求、并发8。
 
 第5步的单token请求只是TTFT检查，不能用其throughput代表原始数据。
 这些少量请求只验证流程，不足以认定P99达标或确定最大并发数。
+可用`--profile-requests 8 --pilot-requests 8`进一步缩短首次验证；
+warmup长度由`--warmup-output-tokens`指定，正式请求不使用该长度。
+正式sweep仍使用原始输出长度进行warmup。
 
 正式测试可复用已生成的DP方案：
 

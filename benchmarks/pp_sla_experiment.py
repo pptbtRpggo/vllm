@@ -289,7 +289,9 @@ class Experiment:
 
         with self.server("profile", [12, 12, 12, 12], trace=True):
             self.rpc("set_pp_profile_warmup", [True])
-            self.load("profile/warmup.json", "warmup", 8, 8)
+            self.load(
+                "profile/warmup.json", "warmup", 8, 8, self.args.warmup_output_tokens
+            )
             self.rpc("set_pp_profile_warmup", [False])
             self.load("profile/requests.json", "profile", self.args.profile_requests, 8)
             observations = self.rpc("get_pp_memory_observation")
@@ -333,10 +335,18 @@ class Experiment:
             key = f"{self.args.mode}_{name}"
             with self.server(key, parts):
                 if self.args.mode == "pilot":
-                    self.load(f"{key}/warmup.json", "warmup", 8, 8)
+                    self.load(
+                        f"{key}/warmup.json",
+                        "warmup",
+                        8,
+                        8,
+                        self.args.warmup_output_tokens,
+                    )
                     # Isolated TTFT probe only: never use its throughput as a result.
                     self.load(f"{key}/ttft_probe.json", "evaluation", 32, 1, 1)
-                    self.load(f"{key}/c8.json", "evaluation", 32, 8)
+                    self.load(
+                        f"{key}/c8.json", "evaluation", self.args.pilot_requests, 8
+                    )
                 else:
                     points = []
                     for concurrency in self.args.concurrencies:
@@ -373,6 +383,8 @@ def main():
         "--mode", choices=("profile", "pilot", "sweep"), default="pilot"
     )
     parser.add_argument("--profile-requests", type=int, default=32)
+    parser.add_argument("--pilot-requests", type=int, default=16)
+    parser.add_argument("--warmup-output-tokens", type=int, default=16)
     parser.add_argument("--requests", type=int, default=2048)
     parser.add_argument(
         "--concurrencies",
@@ -381,8 +393,10 @@ def main():
         default=[1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256],
     )
     args = parser.parse_args()
-    if args.kv_blocks < 32 or args.profile_requests < 8:
-        parser.error("need at least 32 KV blocks and eight profile requests")
+    if args.kv_blocks < 32 or min(args.profile_requests, args.pilot_requests) < 8:
+        parser.error("need at least 32 KV blocks and eight profile/pilot requests")
+    if not 1 <= args.warmup_output_tokens <= 1024:
+        parser.error("warmup output must be between 1 and 1024 tokens")
     if not all(1 <= c <= 256 for c in args.concurrencies):
         parser.error("concurrency must be between 1 and 256")
     experiment = Experiment(args)
