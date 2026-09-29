@@ -373,6 +373,13 @@ class Experiment:
 
 
 def main():
+    def interrupt(_signum, _frame):
+        # Background shells may inherit SIGINT=ignore. Always unwind the server
+        # context so cancelling the driver also releases its NPU workers.
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, interrupt)
+    signal.signal(signal.SIGTERM, interrupt)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--data", required=True)

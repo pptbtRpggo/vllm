@@ -305,12 +305,13 @@ def capacity_summary(points, thresholds=(150, 500)):
     """No passing point means zero observed capacity, not a fictitious baseline."""
     result = {}
     for threshold in thresholds:
-        passes = sorted(
-            p["concurrency"] for p in points if p["summary"]["sla"][str(threshold)]
-        )
-        failures = sorted(
-            p["concurrency"] for p in points if not p["summary"]["sla"][str(threshold)]
-        )
+        attempts = defaultdict(list)
+        for point in points:
+            attempts[point["concurrency"]].append(
+                point["summary"]["sla"][str(threshold)]
+            )
+        passes = sorted(c for c, results in attempts.items() if all(results))
+        failures = sorted(c for c, results in attempts.items() if not all(results))
         result[str(threshold)] = dict(
             max_tested_passing_concurrency=max(passes, default=0),
             tested_passing=passes,

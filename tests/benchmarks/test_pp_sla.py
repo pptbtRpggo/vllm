@@ -71,3 +71,11 @@ def test_nonmonotonic_capacity_is_flagged():
     result = sla.capacity_summary(points)
     assert not result["500"]["monotonic_observations"]
     assert result["500"]["max_tested_passing_concurrency"] == 2
+
+
+def test_repeated_concurrency_must_pass_every_measured_run():
+    points = [
+        dict(concurrency=8, summary=sla.summarize([record(450)], 1)),
+        dict(concurrency=8, summary=sla.summarize([record(550)], 1)),
+    ]
+    assert sla.capacity_summary(points)["500"]["max_tested_passing_concurrency"] == 0
