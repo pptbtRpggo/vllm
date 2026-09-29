@@ -289,12 +289,22 @@ class Experiment:
         from vllm.distributed.pp_partition import load_trace_records, partition_layers
 
         with self.server("profile", [12, 12, 12, 12], trace=True):
+            concurrency = self.args.profile_concurrency
             self.rpc("set_pp_profile_warmup", [True])
             self.load(
-                "profile/warmup.json", "warmup", 8, 8, self.args.warmup_output_tokens
+                "profile/warmup.json",
+                "warmup",
+                max(8, concurrency),
+                concurrency,
+                self.args.warmup_output_tokens,
             )
             self.rpc("set_pp_profile_warmup", [False])
-            self.load("profile/requests.json", "profile", self.args.profile_requests, 8)
+            self.load(
+                "profile/requests.json",
+                "profile",
+                self.args.profile_requests,
+                concurrency,
+            )
             observations = self.rpc("get_pp_memory_observation")
             save(self.root / "profile/memory_observations.json", observations)
         bounds = memory_bounds(
@@ -391,6 +401,7 @@ def main():
         "--mode", choices=("profile", "pilot", "sweep"), default="pilot"
     )
     parser.add_argument("--profile-requests", type=int, default=32)
+    parser.add_argument("--profile-concurrency", type=int, default=8)
     parser.add_argument("--pilot-requests", type=int, default=16)
     parser.add_argument("--warmup-output-tokens", type=int, default=16)
     parser.add_argument("--requests", type=int, default=2048)
@@ -405,6 +416,8 @@ def main():
         parser.error("need at least 32 KV blocks and eight profile/pilot requests")
     if not 1 <= args.warmup_output_tokens <= 1024:
         parser.error("warmup output must be between 1 and 1024 tokens")
+    if not 1 <= args.profile_concurrency <= min(256, args.profile_requests):
+        parser.error("profiling concurrency must be 1..256 and <= profile requests")
     if not all(1 <= c <= 256 for c in args.concurrencies):
         parser.error("concurrency must be between 1 and 256")
     experiment = Experiment(args)

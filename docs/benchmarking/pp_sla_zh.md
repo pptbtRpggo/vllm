@@ -74,7 +74,7 @@ python benchmarks/pp_sla_experiment.py \
 warmup长度由`--warmup-output-tokens`指定，正式请求不使用该长度。
 正式sweep仍使用原始输出长度进行warmup。
 
-正式测试可复用已生成的DP方案：
+可复用已生成的DP方案检查它的服务表现：
 
 ```bash
 python benchmarks/pp_sla_experiment.py \
@@ -88,7 +88,10 @@ python benchmarks/pp_sla_experiment.py \
 结果包含有限请求列表的开始和结束阶段；正式测试应有足够样本，边界附近重启服务重复测量。
 `capacity.json`只报告**已测试并发点中**通过SLA的最大值；要找精确边界需补测中间点。
 若均分连并发1都未达标，“并发提升50%”没有可用分母，应如实报告，不能放宽SLA后仍称达标。
-若正式并发明显不同于profiling的并发8，应补采对应负载的trace，再验证切分。
+若要据此选择正式实验的切分，应使用新output目录增加profiling请求数，
+例如`--mode profile --profile-requests 1024 --profile-concurrency 8`。
+`--profile-concurrency`应接近最终测试的并发范围；并发明显变化时补采trace。
+8条请求的试运行结束阶段有大量低并发microbatch，不能当作持续并发8的代表性trace。
 
 脚本保留启动命令、commit、参数、逐请求结果、trace、DP输入与方案、内存观察和服务日志。
 不要覆盖既有结果；独立重复实验使用新的output目录。
