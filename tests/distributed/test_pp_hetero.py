@@ -225,6 +225,14 @@ def test_network_is_symmetric_and_follows_devices_after_reordering(monkeypatch):
         {"bandwidth_gbps": [[8], []], "latency_ms": [[-1], []]},
         {"bandwidth_gbps": [[8], []], "latency_ms": [[0]]},
         {"bandwidth_gbps": [[8], []], "unknown": 1},
+        {"mode": "target_total", "bandwidth_gbps": [[25], []]},
+        {"mode": "target_total", "bandwidth_gbps": [[25], []],
+         "native_bandwidth_gbps": [[None], []],
+         "native_latency_ms": [[0], []]},
+        {"mode": "target_total", "bandwidth_gbps": [[25], []],
+         "native_bandwidth_gbps": [[80]],
+         "native_latency_ms": [[0], []]},
+        {"mode": "unknown", "bandwidth_gbps": [[25], []]},
     ],
 )
 def test_network_rejects_invalid_matrices(data):
@@ -280,6 +288,48 @@ def test_two_groups_keep_native_intragroup_links_and_slow_cross_group():
     for a, b in ((0, 2), (0, 3), (1, 2), (1, 3)):
         assert network.delay_ms(a, b, 1_000_000) == 1.32
         assert network.delay_ms(b, a, 1_000_000) == 1.32
+
+
+def test_target_total_network_adds_only_gap_above_measured_native(monkeypatch):
+    import json
+
+    from vllm.distributed.pp_hetero import PPNetwork
+
+    network = PPNetwork.from_json(
+        json.dumps(
+            dict(
+                mode="target_total",
+                bandwidth_gbps=[[25], []],
+                latency_ms=[[1], []],
+                native_bandwidth_gbps=[[80], []],
+                native_latency_ms=[[0.1], []],
+            )
+        )
+    )
+    # 40 MB: target=13.8 ms, native model=4.1 ms, extra=9.7 ms.
+    assert network.delay_ms(0, 1, 40_000_000) == pytest.approx(9.7)
+    assert network.delay_ms(1, 0, 40_000_000) == pytest.approx(9.7)
+    sleeps = []
+    monkeypatch.setattr("vllm.distributed.pp_hetero.time.sleep", sleeps.append)
+    cfg = PPHeteroConfig(network=network)
+    assert cfg.stretch_send(0, 200, payload_bytes=40_000_000) == pytest.approx(
+        209.7
+    )
+    assert cfg.stretch_recv(1, 500, payload_bytes=40_000_000) == pytest.approx(
+        509.7
+    )
+    assert sleeps == [pytest.approx(0.0097), pytest.approx(0.0097)]
+
+
+def test_target_total_network_cannot_speed_up_native():
+    from vllm.distributed.pp_hetero import PPNetwork
+
+    network = PPNetwork.from_json(
+        '{"mode":"target_total","bandwidth_gbps":[[100],[]],'
+        '"native_bandwidth_gbps":[[80],[]],'
+        '"native_latency_ms":[[0],[]]}'
+    )
+    assert network.delay_ms(0, 1, 40_000_000) == 0
 
 
 def test_trace_session_is_forwarded_to_ray_but_not_compilation_hash(monkeypatch):

@@ -25,8 +25,11 @@ completion of the same transfer, without exchanging additional messages.
 
 For device-pair networks, VLLM_PP_NETWORK supplies upper-triangular bandwidth_gbps
 and latency_ms rows, without the diagonal. Both directions share each entry.
-Their transfer time is added to real communication. A null bandwidth with zero
-latency leaves a pair on its native transport without adding synthetic delay.
+The default ``extra`` mode adds that modeled time to native communication. The
+``target_total`` mode also requires measured native_bandwidth_gbps and
+native_latency_ms matrices; it adds only the positive difference between target
+and native modeled transfer time. Neither mode can speed up native transport.
+A null target bandwidth with zero target latency leaves a pair unchanged.
 VLLM_PP_DEVICE_ORDER maps ranks to stable device IDs, including compute factors.
 Network matrices and legacy per-hop communication settings are mutually exclusive.
 """
@@ -58,30 +61,57 @@ def parse_device_order(text: str | None) -> tuple[int, ...]:
 
 @dataclass(frozen=True)
 class PPNetwork:
-    """Symmetric extra network delay stored as a compact upper triangle.
+    """Symmetric network model stored as a compact upper triangle.
 
     Delay is added to real transport, not substituted for it. Bandwidth is
-    per TP lane. These configured values never become planner costs.
+    per TP lane. Target-total mode subtracts a separately calibrated native
+    model; it never subtracts a blocking send/recv window containing peer wait.
+    These configured values never become planner costs.
     Row i stores pairs (i, i+1), ..., (i, N-1); the last row is empty.
     Null bandwidth with zero latency means no extra delay for that pair.
     """
 
     bandwidth_gbps: tuple[tuple[float | None, ...], ...]
     latency_ms: tuple[tuple[float, ...], ...]
+    mode: str = "extra"
+    native_bandwidth_gbps: tuple[tuple[float | None, ...], ...] | None = None
+    native_latency_ms: tuple[tuple[float, ...], ...] | None = None
 
     @classmethod
     def from_json(cls, text: str) -> PPNetwork:
         data = json.loads(text)
-        if not isinstance(data, dict) or set(data) - {"bandwidth_gbps", "latency_ms"}:
+        if not isinstance(data, dict) or set(data) - {
+            "bandwidth_gbps", "latency_ms", "mode",
+            "native_bandwidth_gbps", "native_latency_ms",
+        }:
             raise ValueError(
-                "PP network accepts bandwidth_gbps and latency_ms matrices"
+                "PP network accepts mode and target/native bandwidth and latency matrices"
             )
+        mode = data.get("mode", "extra")
+        if mode not in ("extra", "target_total"):
+            raise ValueError("PP network mode must be extra or target_total")
         bandwidth = data.get("bandwidth_gbps")
         if not isinstance(bandwidth, list) or len(bandwidth) < 2:
             raise ValueError("PP network needs N upper-triangle rows, N >= 2")
         size = len(bandwidth)
         latency = data.get("latency_ms", [[0] * (size - i - 1) for i in range(size)])
-        for name, matrix in (("bandwidth", bandwidth), ("latency", latency)):
+        native_bandwidth = data.get("native_bandwidth_gbps")
+        native_latency = data.get("native_latency_ms")
+        if mode == "target_total":
+            if native_bandwidth is None or native_latency is None:
+                raise ValueError(
+                    "target_total needs measured native_bandwidth_gbps "
+                    "and native_latency_ms matrices"
+                )
+        elif native_bandwidth is not None or native_latency is not None:
+            raise ValueError("native network matrices require target_total mode")
+        matrices = [("bandwidth", bandwidth), ("latency", latency)]
+        if mode == "target_total":
+            matrices.extend(
+                [("native_bandwidth", native_bandwidth),
+                 ("native_latency", native_latency)]
+            )
+        for name, matrix in matrices:
             if not isinstance(matrix, list) or len(matrix) != size:
                 raise ValueError("PP network matrices must have the same dimensions")
             for source, row in enumerate(matrix):
@@ -91,11 +121,11 @@ class PPNetwork:
                         "(no diagonal or lower triangle; last row is empty)"
                     )
                 for value in row:
-                    if name == "bandwidth" and value is None:
+                    if name.endswith("bandwidth") and value is None:
                         continue
                     if type(value) not in (int, float) or not math.isfinite(value):
                         raise ValueError("PP network values must be finite numbers")
-                    if value < 0 or (name == "bandwidth" and value == 0):
+                    if value < 0 or (name.endswith("bandwidth") and value == 0):
                         raise ValueError("PP bandwidth must be > 0 and latency >= 0")
         for source, row in enumerate(bandwidth):
             if any(
@@ -103,7 +133,21 @@ class PPNetwork:
                 for offset, value in enumerate(row)
             ):
                 raise ValueError("native PP network pairs need zero extra latency")
-        return cls(tuple(map(tuple, bandwidth)), tuple(map(tuple, latency)))
+        if mode == "target_total":
+            for source, row in enumerate(bandwidth):
+                for offset, target in enumerate(row):
+                    baseline = native_bandwidth[source][offset]
+                    if target is not None and baseline is None:
+                        raise ValueError(
+                            "target_total needs native bandwidth for each target pair"
+                        )
+        return cls(
+            tuple(map(tuple, bandwidth)),
+            tuple(map(tuple, latency)),
+            mode,
+            tuple(map(tuple, native_bandwidth)) if native_bandwidth is not None else None,
+            tuple(map(tuple, native_latency)) if native_latency is not None else None,
+        )
 
     def delay_ms(self, source: int, target: int, payload_bytes: int) -> float:
         if (
@@ -119,9 +163,19 @@ class PPNetwork:
         bandwidth = self.bandwidth_gbps[source][offset]
         if bandwidth is None:
             return 0.0
-        return self.latency_ms[source][offset] + 8 * payload_bytes / (
+        target_ms = self.latency_ms[source][offset] + 8 * payload_bytes / (
             bandwidth * 1_000_000
         )
+        if self.mode == "extra":
+            return target_ms
+        assert self.native_bandwidth_gbps is not None
+        assert self.native_latency_ms is not None
+        native_bandwidth = self.native_bandwidth_gbps[source][offset]
+        assert native_bandwidth is not None
+        native_ms = self.native_latency_ms[source][offset] + 8 * payload_bytes / (
+            native_bandwidth * 1_000_000
+        )
+        return max(0.0, target_ms - native_ms)
 
 
 def parse_scale_list(text: str | None) -> tuple[float, ...]:

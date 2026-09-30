@@ -28,13 +28,22 @@ GIB = 1024**3
 REPO = Path(__file__).resolve().parents[1]
 
 
-def two_group_network(bandwidth_gbps, latency_ms):
-    """Devices 0/1 and 2/3 retain native links; all cross-group pairs slow."""
+def two_group_network(
+    bandwidth_gbps,
+    latency_ms,
+    *,
+    mode="extra",
+    native_bandwidth_gbps=None,
+    native_latency_ms=None,
+):
+    """Devices 0/1 and 2/3 retain native links; cross-group pairs are modeled."""
+    if mode == "native":
+        return dict(bandwidth_gbps=[[None, None, None], [None, None], [None], []])
     if not (math.isfinite(bandwidth_gbps) and bandwidth_gbps > 0):
         raise ValueError("cross-group bandwidth must be positive and finite")
-    if not (math.isfinite(latency_ms) and latency_ms > 0):
-        raise ValueError("cross-group extra latency must be positive and finite")
-    return dict(
+    if not (math.isfinite(latency_ms) and latency_ms >= 0):
+        raise ValueError("cross-group latency must be nonnegative and finite")
+    network = dict(
         bandwidth_gbps=[
             [None, bandwidth_gbps, bandwidth_gbps],
             [bandwidth_gbps, bandwidth_gbps],
@@ -43,6 +52,34 @@ def two_group_network(bandwidth_gbps, latency_ms):
         ],
         latency_ms=[[0, latency_ms, latency_ms], [latency_ms, latency_ms], [0], []],
     )
+    if mode == "target_total":
+        if not (
+            native_bandwidth_gbps is not None
+            and math.isfinite(native_bandwidth_gbps)
+            and native_bandwidth_gbps > 0
+            and native_latency_ms is not None
+            and math.isfinite(native_latency_ms)
+            and native_latency_ms >= 0
+        ):
+            raise ValueError("target_total needs measured native bandwidth and latency")
+        network.update(
+            mode=mode,
+            native_bandwidth_gbps=[
+                [None, native_bandwidth_gbps, native_bandwidth_gbps],
+                [native_bandwidth_gbps, native_bandwidth_gbps],
+                [None],
+                [],
+            ],
+            native_latency_ms=[
+                [0, native_latency_ms, native_latency_ms],
+                [native_latency_ms, native_latency_ms],
+                [0],
+                [],
+            ],
+        )
+    elif mode != "extra":
+        raise ValueError("network mode must be native, extra, or target_total")
+    return network
 
 
 def memory_bounds(observations, model_config, serving, blocks):
@@ -125,7 +162,11 @@ class Experiment:
         self.url = f"http://127.0.0.1:{args.port}"
         self.model_name = "pp-sla-34b"
         self.network = two_group_network(
-            args.cross_bandwidth_gbps, args.cross_extra_latency_ms
+            args.cross_bandwidth_gbps,
+            args.cross_extra_latency_ms,
+            mode=getattr(args, "network_mode", "extra"),
+            native_bandwidth_gbps=getattr(args, "native_bandwidth_gbps", None),
+            native_latency_ms=getattr(args, "native_latency_ms", None),
         )
         self.serving = dict(
             model=str(Path(args.model).resolve()),
@@ -426,6 +467,12 @@ def main():
     parser.add_argument("--profile-concurrency", type=int, default=8)
     parser.add_argument("--cross-bandwidth-gbps", type=float, default=25)
     parser.add_argument("--cross-extra-latency-ms", type=float, default=1)
+    parser.add_argument(
+        "--network-mode", choices=("native", "extra", "target_total"),
+        default="extra",
+    )
+    parser.add_argument("--native-bandwidth-gbps", type=float)
+    parser.add_argument("--native-latency-ms", type=float)
     parser.add_argument("--pilot-requests", type=int, default=16)
     parser.add_argument("--warmup-output-tokens", type=int, default=16)
     parser.add_argument("--requests", type=int, default=2048)
