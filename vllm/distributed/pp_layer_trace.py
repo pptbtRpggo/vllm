@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from functools import partial
 from typing import Any
@@ -101,7 +102,11 @@ class PPLayerTimer:
         return event
 
     @contextmanager
-    def capture(self, compute_scale: float | None = None):
+    def capture(
+        self,
+        compute_scale: float | None = None,
+        excluded_ms: Callable[[], float] | None = None,
+    ):
         # None means native event timing; 1.0 keeps the same synchronized mock
         # hooks on the fastest device of a simulated heterogeneous deployment.
         self.wall_timing = compute_scale is not None
@@ -110,12 +115,15 @@ class PPLayerTimer:
         self.events.clear()
         self.finished.clear()
         handles = []
+        excluded_at_start: dict[int | str, float] = {}
 
         def before(index, _module, _args):
             if index in self.events:
                 raise ValueError("layer-measured expects one call per decoder layer")
             if self.wall_timing:
                 sync_torch_device(self.device)
+            if excluded_ms is not None:
+                excluded_at_start[index] = excluded_ms()
             self.events[index] = (self._mark(index, 0), None)
 
         def after(index, _module, _args, _output):
@@ -124,6 +132,10 @@ class PPLayerTimer:
                 sync_torch_device(self.device)
                 delay_start = time.perf_counter()
                 base_ms = (delay_start - begin) * 1000
+                if excluded_ms is not None:
+                    base_ms = max(
+                        0.0, base_ms - (excluded_ms() - excluded_at_start[index])
+                    )
                 stretch_after(base_ms, compute_scale)
                 self.mock_delay_ms += (time.perf_counter() - delay_start) * 1000
                 self.mock_requested_delay_ms += base_ms * max(0.0, compute_scale - 1)

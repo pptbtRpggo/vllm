@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 PP_ASCEND_WORKER = "vllm.v1.worker.pp_ascend_worker.PPAscendWorker"
+TP_ASCEND_WORKER = "vllm.v1.worker.tp_ascend_worker.TPAscendWorker"
 
 
 def hetero_env_requested() -> bool:
@@ -27,19 +28,20 @@ def hetero_env_requested() -> bool:
 
 
 def maybe_override_pp_worker(parallel_config: Any) -> None:
-    """Use ``PPAscendWorker`` when hetero/trace is on and the platform picked NPUWorker.
-
-    CUDA ``gpu_worker.Worker`` already stretches, so it is left alone.
-    Must run *after* ``Platform.check_and_update_config``.
-    """
-    if not hetero_env_requested():
+    """Select an Ascend PP or TP experiment worker after platform setup."""
+    tp_requested = bool(
+        os.environ.get("VLLM_TP_COMPUTE_SCALES")
+        or os.environ.get("VLLM_TP_CROSS_EXTRA_BANDWIDTH_GBPS")
+    )
+    if tp_requested and hetero_env_requested():
+        raise ValueError("TP and PP heterogeneity settings cannot be combined")
+    if not tp_requested and not hetero_env_requested():
         return
     # The platform has already resolved "auto". Replace only its built-in
     # worker; custom worker names/classes must not be matched by substring.
-    if (
-        getattr(parallel_config, "worker_cls", None)
-        != "vllm_ascend.worker.worker.NPUWorker"
-    ):
+    if getattr(parallel_config, "worker_cls", None) != "vllm_ascend.worker.worker.NPUWorker":
+        if tp_requested:
+            raise ValueError("TP heterogeneity currently requires Ascend NPUWorker")
         return
-    parallel_config.worker_cls = PP_ASCEND_WORKER
-    logger.info("PP hetero/trace enabled: worker_cls=%s", PP_ASCEND_WORKER)
+    parallel_config.worker_cls = TP_ASCEND_WORKER if tp_requested else PP_ASCEND_WORKER
+    logger.info("heterogeneity worker_cls=%s", parallel_config.worker_cls)

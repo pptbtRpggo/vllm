@@ -57,6 +57,9 @@ if TYPE_CHECKING:
     VLLM_PP_HETERO: str | None = None
     VLLM_PP_COMM_BANDWIDTH_GBPS: str | None = None
     VLLM_PP_COMM_LATENCY_MS: str | None = None
+    VLLM_TP_COMPUTE_SCALES: str | None = None
+    VLLM_TP_CROSS_GROUP_SIZE: str | None = None
+    VLLM_TP_CROSS_EXTRA_BANDWIDTH_GBPS: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = ""
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -706,6 +709,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_PP_COMM_BANDWIDTH_GBPS", None
     ),
     "VLLM_PP_COMM_LATENCY_MS": lambda: os.getenv("VLLM_PP_COMM_LATENCY_MS", None),
+    "VLLM_TP_COMPUTE_SCALES": lambda: os.getenv("VLLM_TP_COMPUTE_SCALES", None),
+    "VLLM_TP_CROSS_GROUP_SIZE": lambda: os.getenv("VLLM_TP_CROSS_GROUP_SIZE", None),
+    "VLLM_TP_CROSS_EXTRA_BANDWIDTH_GBPS": lambda: os.getenv(
+        "VLLM_TP_CROSS_EXTRA_BANDWIDTH_GBPS", None
+    ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: int(os.getenv("VLLM_CPU_KVCACHE_SPACE", "0"))
@@ -1673,6 +1681,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_PP_DEVICE_ORDER",
         "VLLM_PP_COMM_BANDWIDTH_GBPS",
         "VLLM_PP_COMM_LATENCY_MS",
+        "VLLM_TP_COMPUTE_SCALES",
+        "VLLM_TP_CROSS_GROUP_SIZE",
+        "VLLM_TP_CROSS_EXTRA_BANDWIDTH_GBPS",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
         "LD_LIBRARY_PATH",
