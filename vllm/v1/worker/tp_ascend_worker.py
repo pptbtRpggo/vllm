@@ -54,11 +54,12 @@ class TPAscendWorker(NPUWorker):
             )
         logger.info(
             "TP mock rank=%d compute_scale=%g cross_group_size=%d "
-            "cross_extra_bandwidth_gbps=%s",
+            "cross_extra_bandwidth_gbps=%s cross_extra_latency_ms=%g",
             tp_group.rank_in_group,
             self._tp_hetero.scale(tp_group.rank_in_group),
             self._tp_hetero.cross_group_size,
             self._tp_hetero.cross_extra_bandwidth_gbps,
+            self._tp_hetero.cross_extra_latency_ms,
         )
 
     def shutdown(self) -> None:

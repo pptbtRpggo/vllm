@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     VLLM_TP_COMPUTE_SCALES: str | None = None
     VLLM_TP_CROSS_GROUP_SIZE: str | None = None
     VLLM_TP_CROSS_EXTRA_BANDWIDTH_GBPS: str | None = None
+    VLLM_TP_CROSS_EXTRA_LATENCY_MS: str | None = None
     VLLM_TP_MOCK_TRACE: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = ""
@@ -714,6 +715,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TP_CROSS_GROUP_SIZE": lambda: os.getenv("VLLM_TP_CROSS_GROUP_SIZE", None),
     "VLLM_TP_CROSS_EXTRA_BANDWIDTH_GBPS": lambda: os.getenv(
         "VLLM_TP_CROSS_EXTRA_BANDWIDTH_GBPS", None
+    ),
+    "VLLM_TP_CROSS_EXTRA_LATENCY_MS": lambda: os.getenv(
+        "VLLM_TP_CROSS_EXTRA_LATENCY_MS", None
     ),
     "VLLM_TP_MOCK_TRACE": lambda: os.getenv("VLLM_TP_MOCK_TRACE", None),
     # (CPU backend only) CPU key-value cache space.
@@ -1686,6 +1690,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_TP_COMPUTE_SCALES",
         "VLLM_TP_CROSS_GROUP_SIZE",
         "VLLM_TP_CROSS_EXTRA_BANDWIDTH_GBPS",
+        "VLLM_TP_CROSS_EXTRA_LATENCY_MS",
         "VLLM_TP_MOCK_TRACE",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",

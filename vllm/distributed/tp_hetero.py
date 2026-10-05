@@ -25,15 +25,18 @@ class TPHeteroConfig:
     compute_scales: tuple[float, ...]
     cross_group_size: int
     cross_extra_bandwidth_gbps: float | None
+    cross_extra_latency_ms: float = 0.0
 
     @classmethod
     def from_env(cls, tp_size: int) -> TPHeteroConfig:
         scales = parse_scale_list(os.getenv("VLLM_TP_COMPUTE_SCALES"))
         raw_bandwidth = os.getenv("VLLM_TP_CROSS_EXTRA_BANDWIDTH_GBPS")
         bandwidth = float(raw_bandwidth) if raw_bandwidth else None
+        raw_latency = os.getenv("VLLM_TP_CROSS_EXTRA_LATENCY_MS")
+        latency_ms = float(raw_latency) if raw_latency else 0.0
         raw_group_size = os.getenv("VLLM_TP_CROSS_GROUP_SIZE")
         group_size = int(raw_group_size) if raw_group_size else tp_size
-        config = cls(scales, group_size, bandwidth)
+        config = cls(scales, group_size, bandwidth, latency_ms)
         config.validate(tp_size)
         return config
 
@@ -44,12 +47,17 @@ class TPHeteroConfig:
             raise ValueError("VLLM_TP_COMPUTE_SCALES must have one value per TP rank")
         if any(scale < 1 for scale in self.compute_scales):
             raise ValueError("TP compute scales must be >= 1; sleep cannot speed up compute")
+        if not math.isfinite(self.cross_extra_latency_ms) or self.cross_extra_latency_ms < 0:
+            raise ValueError("TP cross-group extra latency must be finite and >= 0")
         if self.cross_extra_bandwidth_gbps is not None:
             if (
                 not math.isfinite(self.cross_extra_bandwidth_gbps)
                 or self.cross_extra_bandwidth_gbps <= 0
             ):
                 raise ValueError("TP cross-group bandwidth must be finite and > 0")
+            if not 0 < self.cross_group_size < tp_size:
+                raise ValueError("TP cross-group size must split the TP ranks")
+        elif self.cross_extra_latency_ms > 0:
             if not 0 < self.cross_group_size < tp_size:
                 raise ValueError("TP cross-group size must split the TP ranks")
         elif not 0 < self.cross_group_size <= tp_size:
@@ -78,8 +86,8 @@ class TPHeteroConfig:
 
     def extra_ms(self, op: str, input_bytes: int, tp_size: int) -> float:
         if self.cross_extra_bandwidth_gbps is None:
-            return 0.0
-        return (
+            return self.cross_extra_latency_ms
+        return self.cross_extra_latency_ms + (
             8 * self.cross_bytes(op, input_bytes, tp_size)
             / (self.cross_extra_bandwidth_gbps * 1_000_000)
         )

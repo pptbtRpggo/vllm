@@ -34,11 +34,31 @@ def test_tp_config_and_collective_cut_bytes(monkeypatch):
     assert config.cross_bytes("all_gather", 1_000_000, 4) == 2_000_000
     assert config.cross_bytes("reduce_scatter", 1_000_000, 4) == 500_000
     assert config.extra_ms("all_reduce", 1_000_000, 4) == pytest.approx(0.32)
+    monkeypatch.setenv("VLLM_TP_CROSS_EXTRA_LATENCY_MS", "1")
+    config = TPHeteroConfig.from_env(4)
+    assert config.extra_ms("all_reduce", 1_000_000, 4) == pytest.approx(1.32)
+    monkeypatch.setenv("VLLM_TP_CROSS_EXTRA_LATENCY_MS", "-1")
+    with pytest.raises(ValueError, match="extra latency"):
+        TPHeteroConfig.from_env(4)
+    monkeypatch.setenv("VLLM_TP_CROSS_EXTRA_LATENCY_MS", "0")
     monkeypatch.setenv("VLLM_TP_COMPUTE_SCALES", "1,2")
     with pytest.raises(ValueError, match="one value"):
         TPHeteroConfig.from_env(4)
     monkeypatch.setenv("VLLM_TP_COMPUTE_SCALES", "0.5,1,1,1")
     with pytest.raises(ValueError, match="cannot speed up"):
+        TPHeteroConfig.from_env(4)
+
+
+def test_tp_latency_only_selects_worker_and_requires_cross_group(monkeypatch):
+    monkeypatch.setenv("VLLM_TP_CROSS_EXTRA_LATENCY_MS", "1")
+    monkeypatch.setenv("VLLM_TP_CROSS_GROUP_SIZE", "2")
+    cfg = SimpleNamespace(worker_cls="vllm_ascend.worker.worker.NPUWorker")
+    maybe_override_pp_worker(cfg)
+    assert cfg.worker_cls == TP_ASCEND_WORKER
+    config = TPHeteroConfig.from_env(4)
+    assert config.extra_ms("all_reduce", 1_000_000, 4) == pytest.approx(1)
+    monkeypatch.setenv("VLLM_TP_CROSS_GROUP_SIZE", "4")
+    with pytest.raises(ValueError, match="must split"):
         TPHeteroConfig.from_env(4)
 
 

@@ -32,6 +32,7 @@ def maybe_override_pp_worker(parallel_config: Any) -> None:
     tp_requested = bool(
         os.environ.get("VLLM_TP_COMPUTE_SCALES")
         or os.environ.get("VLLM_TP_CROSS_EXTRA_BANDWIDTH_GBPS")
+        or os.environ.get("VLLM_TP_CROSS_EXTRA_LATENCY_MS")
     )
     if tp_requested and hetero_env_requested():
         raise ValueError("TP and PP heterogeneity settings cannot be combined")
