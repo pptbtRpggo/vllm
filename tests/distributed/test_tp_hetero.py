@@ -15,6 +15,8 @@ def test_tp_worker_selection_and_no_silent_cuda(monkeypatch):
     cfg = SimpleNamespace(worker_cls="vllm_ascend.worker.worker.NPUWorker")
     maybe_override_pp_worker(cfg)
     assert cfg.worker_cls == TP_ASCEND_WORKER
+    maybe_override_pp_worker(cfg)  # EngineCore may validate the config again.
+    assert cfg.worker_cls == TP_ASCEND_WORKER
     with pytest.raises(ValueError, match="Ascend"):
         maybe_override_pp_worker(SimpleNamespace(worker_cls="auto"))
     monkeypatch.setenv("VLLM_PP_HETERO", "1,2")
