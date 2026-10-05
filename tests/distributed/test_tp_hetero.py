@@ -35,6 +35,9 @@ def test_tp_config_and_collective_cut_bytes(monkeypatch):
     monkeypatch.setenv("VLLM_TP_COMPUTE_SCALES", "1,2")
     with pytest.raises(ValueError, match="one value"):
         TPHeteroConfig.from_env(4)
+    monkeypatch.setenv("VLLM_TP_COMPUTE_SCALES", "0.5,1,1,1")
+    with pytest.raises(ValueError, match="cannot speed up"):
+        TPHeteroConfig.from_env(4)
 
 
 def test_collective_delay_only_during_forward(monkeypatch):
@@ -78,6 +81,23 @@ def test_collective_delay_only_during_forward(monkeypatch):
     assert delay.counts["all_reduce"] == 1
     delay.uninstall()
     assert comm.all_reduce == original
+
+
+def test_native_baseline_uses_same_collective_wrapper(monkeypatch):
+    monkeypatch.setattr("vllm.distributed.tp_hetero.sync_torch_device", lambda _: None)
+    comm = SimpleNamespace(
+        all_reduce=lambda x: x,
+        all_gather=lambda x, dim: x,
+        reduce_scatter=lambda x, dim: x,
+    )
+    delay = TPCollectiveDelay(
+        comm, TPHeteroConfig((1, 1, 1, 1), 4, None), 4, torch.device("cpu")
+    )
+    delay.install()
+    delay.active = True
+    comm.all_reduce(torch.empty(1))
+    assert delay.counts["all_reduce"] == 1
+    delay.uninstall()
 
 
 def test_layer_compute_scale_excludes_collective_time(monkeypatch):

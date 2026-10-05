@@ -42,6 +42,8 @@ class TPHeteroConfig:
             raise ValueError("TP heterogeneity requires TP >= 2")
         if self.compute_scales and len(self.compute_scales) != tp_size:
             raise ValueError("VLLM_TP_COMPUTE_SCALES must have one value per TP rank")
+        if any(scale < 1 for scale in self.compute_scales):
+            raise ValueError("TP compute scales must be >= 1; sleep cannot speed up compute")
         if self.cross_extra_bandwidth_gbps is not None:
             if (
                 not math.isfinite(self.cross_extra_bandwidth_gbps)
@@ -108,8 +110,6 @@ class TPCollectiveDelay:
         self.originals: dict[str, Callable[..., Any]] = {}
 
     def install(self) -> None:
-        if self.config.cross_extra_bandwidth_gbps is None:
-            return
         for op in self.counts:
             original = getattr(self.communicator, op)
             self.originals[op] = original
