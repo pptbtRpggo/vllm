@@ -106,9 +106,44 @@ def test_collective_delay_only_during_forward(monkeypatch):
     comm.all_reduce(x)
     assert sleeps == pytest.approx([0.00032])
     assert delay.total_ms == pytest.approx(1.32)
+    assert delay.actual_extra_total_ms == pytest.approx(0.32)
     assert delay.counts["all_reduce"] == 1
     delay.uninstall()
     assert comm.all_reduce == original
+
+
+def test_short_sleep_compensates_measured_wakeup_overhead(monkeypatch):
+    now = [0.0]
+    sleeps = []
+    monkeypatch.setattr("vllm.distributed.tp_hetero.time.perf_counter", lambda: now[0])
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds + 0.0001
+
+    monkeypatch.setattr("vllm.distributed.tp_hetero.time.sleep", sleep)
+
+    class StreamDelay:
+        def enqueue(self, callback):
+            callback()
+
+    comm = SimpleNamespace(
+        all_reduce=lambda x: x,
+        all_gather=lambda x, dim: x,
+        reduce_scatter=lambda x, dim: x,
+    )
+    delay = TPCollectiveDelay(
+        comm, TPHeteroConfig((1, 1), 1, 25), 2, StreamDelay()
+    )
+    delay.install()
+    delay.active = True
+    x = torch.empty(1_000_000, dtype=torch.uint8)
+    comm.all_reduce(x)
+    comm.all_reduce(x)
+    assert sleeps[1] < sleeps[0]
+    assert delay.extra_total_ms == pytest.approx(0.64)
+    assert delay.actual_extra_total_ms < 0.84
+    delay.uninstall()
 
 
 def test_native_baseline_does_not_enqueue_callbacks():

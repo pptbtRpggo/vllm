@@ -106,6 +106,7 @@ class TPAscendWorker(NPUWorker):
         collectives.compute_delay = compute_delay
         collectives.total_ms = 0.0
         collectives.extra_total_ms = 0.0
+        collectives.actual_extra_total_ms = 0.0
         collectives.cross_bytes_total = 0
         before_counts = collectives.counts.copy()
         started = time.perf_counter()
@@ -127,6 +128,9 @@ class TPAscendWorker(NPUWorker):
                         "compute_extra_requested_ms": compute_delay.requested_delay_ms,
                         "collective_observed_with_extra_ms": collectives.total_ms,
                         "collective_extra_requested_ms": collectives.extra_total_ms,
+                        "collective_extra_actual_ms": (
+                            collectives.actual_extra_total_ms
+                        ),
                         "collective_cross_bytes": collectives.cross_bytes_total,
                         "collective_counts": {
                             op: count - before_counts[op]

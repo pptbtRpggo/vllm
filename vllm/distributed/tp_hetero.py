@@ -125,6 +125,7 @@ local compute segment without synchronizing the device on the caller thread.
         self.input_compute_ms = 0.0
         self.requested_delay_ms = 0.0
         self.actual_delay_ms = 0.0
+        self.sleep_overhead_ms = 0.0
         self.finished_layers = 0
         self.active = False
 
@@ -186,12 +187,19 @@ local compute segment without synchronizing the device on the caller thread.
         def stretch_segment() -> None:
             base_ms = (time.perf_counter() - segment[0]) * 1000
             requested_ms = base_ms * (self.scale - 1)
+            sleep_ms = max(0.0, requested_ms - self.sleep_overhead_ms)
             started = time.perf_counter()
-            if requested_ms > 0:
-                time.sleep(requested_ms / 1000)
+            if sleep_ms > 0:
+                time.sleep(sleep_ms / 1000)
+            actual_ms = (time.perf_counter() - started) * 1000
+            if sleep_ms > 0:
+                overhead_ms = max(0.0, actual_ms - sleep_ms)
+                self.sleep_overhead_ms = (
+                    0.75 * self.sleep_overhead_ms + 0.25 * overhead_ms
+                )
             self.input_compute_ms += base_ms
             self.requested_delay_ms += requested_ms
-            self.actual_delay_ms += (time.perf_counter() - started) * 1000
+            self.actual_delay_ms += actual_ms
 
         self.stream_delay.enqueue(stretch_segment)
 
@@ -230,6 +238,8 @@ class TPCollectiveDelay:
         self.compute_delay: TPComputeDelay | None = None
         self.total_ms = 0.0
         self.extra_total_ms = 0.0
+        self.actual_extra_total_ms = 0.0
+        self.sleep_overhead_ms = 0.0
         self.cross_bytes_total = 0
         self.active = False
         self.counts = {"all_reduce": 0, "all_gather": 0, "reduce_scatter": 0}
@@ -264,11 +274,18 @@ class TPCollectiveDelay:
 
                     def stretch_collective() -> None:
                         elapsed_ms = (time.perf_counter() - started[0]) * 1000
+                        sleep_ms = max(0.0, extra_ms - self.sleep_overhead_ms)
                         sleep_started = time.perf_counter()
-                        time.sleep(extra_ms / 1000)
-                        self.total_ms += elapsed_ms + (
-                            time.perf_counter() - sleep_started
-                        ) * 1000
+                        if sleep_ms > 0:
+                            time.sleep(sleep_ms / 1000)
+                        actual_ms = (time.perf_counter() - sleep_started) * 1000
+                        if sleep_ms > 0:
+                            overhead_ms = max(0.0, actual_ms - sleep_ms)
+                            self.sleep_overhead_ms = (
+                                0.75 * self.sleep_overhead_ms + 0.25 * overhead_ms
+                            )
+                        self.actual_extra_total_ms += actual_ms
+                        self.total_ms += elapsed_ms + actual_ms
 
                     self.stream_delay.enqueue(stretch_collective)
                 if self.compute_delay is not None:
