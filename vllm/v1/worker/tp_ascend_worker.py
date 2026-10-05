@@ -13,8 +13,12 @@ from vllm_ascend.worker.worker import NPUWorker
 
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.distributed.pp_hetero import sync_torch_device
-from vllm.distributed.pp_layer_trace import PPLayerTimer
-from vllm.distributed.tp_hetero import TPCollectiveDelay, TPHeteroConfig
+from vllm.distributed.tp_hetero import (
+    TPCollectiveDelay,
+    TPComputeDelay,
+    TPHeteroConfig,
+)
+from vllm.distributed.tp_stream_delay import TPStreamDelay
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -34,12 +38,16 @@ class TPAscendWorker(NPUWorker):
         communicator = tp_group.device_communicator
         if communicator is None:
             raise ValueError("TP heterogeneity requires a device communicator")
+        self._tp_stream_delay = TPStreamDelay()
         self._tp_collectives = TPCollectiveDelay(
-            communicator, self._tp_hetero, tp_group.world_size, self.device
+            communicator,
+            self._tp_hetero,
+            tp_group.world_size,
+            self._tp_stream_delay,
         )
         self._tp_collectives.install()
-        self._tp_layer_timer: PPLayerTimer | None = None
-        self._tp_layer_model: torch.nn.Module | None = None
+        self._tp_compute_delay: TPComputeDelay | None = None
+        self._tp_compute_model: torch.nn.Module | None = None
         self._tp_logged = False
         trace_dir = os.getenv("VLLM_TP_MOCK_TRACE")
         self._tp_trace = None
@@ -68,6 +76,11 @@ class TPAscendWorker(NPUWorker):
             self._tp_trace = None
         if collectives := getattr(self, "_tp_collectives", None):
             collectives.uninstall()
+        if compute_delay := getattr(self, "_tp_compute_delay", None):
+            compute_delay.uninstall()
+        if stream_delay := getattr(self, "_tp_stream_delay", None):
+            sync_torch_device(self.device)
+            stream_delay.close()
         parent = getattr(super(), "shutdown", None)
         if callable(parent):
             parent()
@@ -76,11 +89,21 @@ class TPAscendWorker(NPUWorker):
         if scheduler_output.total_num_scheduled_tokens <= 0:
             return super().execute_model(scheduler_output)
         model = self.model_runner.model
-        if self._tp_layer_model is not model:
-            self._tp_layer_timer = PPLayerTimer(model, self.device)
-            self._tp_layer_model = model
-        assert self._tp_layer_timer is not None
+        if self._tp_compute_model is not model:
+            if self._tp_compute_delay is not None:
+                self._tp_compute_delay.uninstall()
+            self._tp_compute_delay = TPComputeDelay(
+                model,
+                self._tp_hetero.scale(get_tp_group().rank_in_group),
+                self._tp_stream_delay,
+            )
+            self._tp_compute_delay.install()
+            self._tp_compute_model = model
+        compute_delay = self._tp_compute_delay
+        assert compute_delay is not None
+        compute_delay.reset()
         collectives = self._tp_collectives
+        collectives.compute_delay = compute_delay
         collectives.total_ms = 0.0
         collectives.extra_total_ms = 0.0
         collectives.cross_bytes_total = 0
@@ -88,12 +111,10 @@ class TPAscendWorker(NPUWorker):
         started = time.perf_counter()
         collectives.active = True
         try:
-            with self._tp_layer_timer.capture(
-                self._tp_hetero.scale(get_tp_group().rank_in_group),
-                excluded_ms=lambda: collectives.total_ms,
-            ):
-                output = super().execute_model(scheduler_output)
-                sync_torch_device(self.device)
+            output = super().execute_model(scheduler_output)
+            sync_torch_device(self.device)
+            self._tp_stream_delay.check()
+            compute_delay.validate()
             if self._tp_trace is not None:
                 try:
                     self._tp_trace.write(json.dumps({
@@ -101,9 +122,10 @@ class TPAscendWorker(NPUWorker):
                         "tp_rank": get_tp_group().rank_in_group,
                         "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
                         "compute_scale": self._tp_hetero.scale(get_tp_group().rank_in_group),
-                        "compute_base_ms": self._tp_layer_timer.mock_input_compute_ms,
-                        "compute_sleep_ms": self._tp_layer_timer.mock_delay_ms,
-                        "collective_total_ms": collectives.total_ms,
+                        "compute_base_ms": compute_delay.input_compute_ms,
+                        "compute_sleep_ms": compute_delay.actual_delay_ms,
+                        "compute_extra_requested_ms": compute_delay.requested_delay_ms,
+                        "collective_observed_with_extra_ms": collectives.total_ms,
                         "collective_extra_requested_ms": collectives.extra_total_ms,
                         "collective_cross_bytes": collectives.cross_bytes_total,
                         "collective_counts": {

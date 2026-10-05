@@ -5,8 +5,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.distributed.pp_layer_trace import PPLayerTimer
-from vllm.distributed.tp_hetero import TPCollectiveDelay, TPHeteroConfig
+from vllm.distributed.tp_hetero import (
+    TPCollectiveDelay,
+    TPComputeDelay,
+    TPHeteroConfig,
+)
 from vllm.pp_hetero_env import TP_ASCEND_WORKER, maybe_override_pp_worker
 
 
@@ -72,7 +75,10 @@ def test_collective_delay_only_during_forward(monkeypatch):
         now[0] += seconds
 
     monkeypatch.setattr("vllm.distributed.tp_hetero.time.sleep", sleep)
-    monkeypatch.setattr("vllm.distributed.tp_hetero.sync_torch_device", lambda _: None)
+
+    class StreamDelay:
+        def enqueue(self, callback):
+            callback()
 
     class Comm:
         def all_reduce(self, x):
@@ -90,7 +96,7 @@ def test_collective_delay_only_during_forward(monkeypatch):
     comm = Comm()
     original = comm.all_reduce
     delay = TPCollectiveDelay(
-        comm, TPHeteroConfig((1, 2, 4, 1), 2, 25), 4, torch.device("cpu")
+        comm, TPHeteroConfig((1, 2, 4, 1), 2, 25), 4, StreamDelay()
     )
     delay.install()
     x = torch.empty(1_000_000, dtype=torch.uint8)
@@ -105,15 +111,18 @@ def test_collective_delay_only_during_forward(monkeypatch):
     assert comm.all_reduce == original
 
 
-def test_native_baseline_uses_same_collective_wrapper(monkeypatch):
-    monkeypatch.setattr("vllm.distributed.tp_hetero.sync_torch_device", lambda _: None)
+def test_native_baseline_does_not_enqueue_callbacks():
+    class StreamDelay:
+        def enqueue(self, callback):
+            raise AssertionError("native TP must not enqueue stream callbacks")
+
     comm = SimpleNamespace(
         all_reduce=lambda x: x,
         all_gather=lambda x, dim: x,
         reduce_scatter=lambda x, dim: x,
     )
     delay = TPCollectiveDelay(
-        comm, TPHeteroConfig((1, 1, 1, 1), 4, None), 4, torch.device("cpu")
+        comm, TPHeteroConfig((1, 1, 1, 1), 4, None), 4, StreamDelay()
     )
     delay.install()
     delay.active = True
@@ -122,32 +131,65 @@ def test_native_baseline_uses_same_collective_wrapper(monkeypatch):
     delay.uninstall()
 
 
-def test_layer_compute_scale_excludes_collective_time(monkeypatch):
+def test_compute_delay_precedes_collectives_and_excludes_comm(monkeypatch):
     now = [0.0]
-    excluded = [0.0]
-    monkeypatch.setattr("vllm.distributed.pp_layer_trace.time.perf_counter", lambda: now[0])
-    monkeypatch.setattr("vllm.distributed.pp_layer_trace.sync_torch_device", lambda _: None)
+    order = []
+    monkeypatch.setattr("vllm.distributed.tp_hetero.time.perf_counter", lambda: now[0])
 
     def sleep(seconds):
+        order.append("delay")
         now[0] += seconds
 
-    monkeypatch.setattr("vllm.distributed.pp_hetero.time.sleep", sleep)
+    monkeypatch.setattr("vllm.distributed.tp_hetero.time.sleep", sleep)
+
+    class StreamDelay:
+        def enqueue(self, callback):
+            callback()
+
+    stream = StreamDelay()
+
+    class Comm:
+        def all_reduce(self, x):
+            order.append("all_reduce")
+            now[0] += 0.003
+            return x
+
+        def all_gather(self, x, dim):
+            return x
+
+        def reduce_scatter(self, x, dim):
+            return x
+
+    comm = Comm()
+    collective = TPCollectiveDelay(
+        comm, TPHeteroConfig((2, 1), 2, None), 2, stream
+    )
+    collective.install()
 
     class Layer(torch.nn.Module):
         def forward(self, x):
-            now[0] += 0.002  # compute before collective
-            now[0] += 0.003  # collective, including simulated link delay
-            excluded[0] += 3
-            now[0] += 0.001  # compute after collective
+            now[0] += 0.002
+            x = comm.all_reduce(x)
+            now[0] += 0.001
+            x = comm.all_reduce(x)
+            now[0] += 0.0005
             return x
 
     layer = Layer()
     model = SimpleNamespace(model=SimpleNamespace(
         start_layer=0, end_layer=1, layers=torch.nn.ModuleList([layer])
     ))
-    timer = PPLayerTimer(model, torch.device("cpu"))
-    with timer.capture(2, excluded_ms=lambda: excluded[0]):
-        layer(1)
-    assert now[0] == pytest.approx(0.009)  # 3 ms compute + 3 ms comm + 3 ms delay
-    assert timer.mock_requested_delay_ms == pytest.approx(3)
-    assert timer.mock_input_compute_ms == pytest.approx(3)
+    compute = TPComputeDelay(model, 2, stream)
+    compute.install()
+    compute.reset()
+    collective.compute_delay = compute
+    collective.active = True
+    layer(torch.empty(1))
+    compute.validate()
+    assert order == ["delay", "all_reduce", "delay", "all_reduce", "delay"]
+    assert now[0] == pytest.approx(0.013)
+    assert compute.input_compute_ms == pytest.approx(3.5)
+    assert compute.requested_delay_ms == pytest.approx(3.5)
+    assert collective.counts["all_reduce"] == 2
+    compute.uninstall()
+    collective.uninstall()

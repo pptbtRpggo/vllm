@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Software-only TP heterogeneity for single-host Ascend experiments.
 
-Compute factors apply separately to each TP rank's decoder layers.  The
-cross-group network knob adds a modeled delay after each TP collective; it
-does not change HCCL's physical bandwidth or promise a target link rate.
+Compute delay precedes each decoder-layer all-reduce. A cross-group delay
+follows each TP collective. Neither changes NPU compute capability or HCCL's
+physical bandwidth.
 """
 
 from __future__ import annotations
@@ -17,7 +17,8 @@ from typing import Any
 
 import torch
 
-from vllm.distributed.pp_hetero import parse_scale_list, sync_torch_device
+from vllm.distributed.pp_hetero import parse_scale_list
+from vllm.distributed.tp_stream_delay import TPStreamDelay
 
 
 @dataclass(frozen=True)
@@ -93,25 +94,140 @@ class TPHeteroConfig:
         )
 
 
-class TPCollectiveDelay:
-    """Wrap the TP communicator during forward only, tracking excluded time.
+class TPComputeDelay:
+    """Stretch local decoder compute before its two TP all-reduces.
 
-    Synchronizing before/after each collective makes this eager-only path
-    intentionally conservative.  It isolates collective time from the
-    per-layer compute factor and lets downstream kernels see the added delay.
-    """
+CodeLlama/Llama decoder layers have one all-reduce in attention's o_proj and
+one in MLP's down_proj. Stream callbacks mark the beginning and end of each
+local compute segment without synchronizing the device on the caller thread.
+"""
+
+    def __init__(self, model: Any, scale: float, stream_delay: TPStreamDelay) -> None:
+        inner = getattr(model, "model", model)
+        start = getattr(inner, "start_layer", None)
+        end = getattr(inner, "end_layer", None)
+        layers = getattr(inner, "layers", None)
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or not isinstance(layers, torch.nn.ModuleList)
+            or not 0 <= start < end <= len(layers)
+        ):
+            raise ValueError("TP compute mock requires indexed decoder layers")
+        self.layers = [layers[index] for index in range(start, end)]
+        if len({id(layer) for layer in self.layers}) != len(self.layers):
+            raise ValueError("TP compute mock does not support shared layers")
+        self.scale = scale
+        self.stream_delay = stream_delay
+        self.handles: list[Any] = []
+        self.segment: list[float] | None = None
+        self.collectives_in_layer = 0
+        self.input_compute_ms = 0.0
+        self.requested_delay_ms = 0.0
+        self.actual_delay_ms = 0.0
+        self.finished_layers = 0
+        self.active = False
+
+    def install(self) -> None:
+        if self.handles:
+            raise RuntimeError("TP compute hooks already installed")
+        if self.scale <= 1:
+            return
+        for layer in self.layers:
+            self.handles.append(layer.register_forward_pre_hook(self._before_layer))
+            self.handles.append(layer.register_forward_hook(self._after_layer))
+
+    def uninstall(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+    def reset(self) -> None:
+        self.segment = None
+        self.collectives_in_layer = 0
+        self.input_compute_ms = 0.0
+        self.requested_delay_ms = 0.0
+        self.actual_delay_ms = 0.0
+        self.finished_layers = 0
+        self.active = self.scale > 1
+
+    def _begin_segment(self) -> None:
+        if self.segment is not None:
+            raise RuntimeError("TP compute segment already started")
+        segment = [0.0]
+        self.segment = segment
+
+        def mark_start() -> None:
+            segment[0] = time.perf_counter()
+
+        self.stream_delay.enqueue(mark_start)
+
+    def _before_layer(self, _module: Any, _args: Any) -> None:
+        if not self.active:
+            return
+        if self.segment is not None or self.collectives_in_layer != 0:
+            raise RuntimeError("TP compute mock expects non-reentrant layers")
+        self._begin_segment()
+
+    def before_collective(self, op: str) -> None:
+        if not self.active or self.segment is None:
+            return
+        if op != "all_reduce" or self.collectives_in_layer >= 2:
+            raise RuntimeError("TP compute mock expects two layer all-reduces")
+        self._finish_segment()
+        self.collectives_in_layer += 1
+
+    def _finish_segment(self) -> None:
+        if self.segment is None:
+            raise RuntimeError("TP compute segment was not started")
+        segment = self.segment
+        self.segment = None
+
+        def stretch_segment() -> None:
+            base_ms = (time.perf_counter() - segment[0]) * 1000
+            requested_ms = base_ms * (self.scale - 1)
+            started = time.perf_counter()
+            if requested_ms > 0:
+                time.sleep(requested_ms / 1000)
+            self.input_compute_ms += base_ms
+            self.requested_delay_ms += requested_ms
+            self.actual_delay_ms += (time.perf_counter() - started) * 1000
+
+        self.stream_delay.enqueue(stretch_segment)
+
+    def after_collective(self, op: str) -> None:
+        if self.active and op == "all_reduce" and self.collectives_in_layer in (1, 2):
+            self._begin_segment()
+
+    def _after_layer(self, _module: Any, _args: Any, _output: Any) -> None:
+        if not self.active:
+            return
+        if self.segment is None or self.collectives_in_layer != 2:
+            raise RuntimeError("TP compute mock expects two layer all-reduces")
+        self._finish_segment()
+        self.collectives_in_layer = 0
+        self.finished_layers += 1
+
+    def validate(self) -> None:
+        if self.active and self.finished_layers != len(self.layers):
+            raise RuntimeError("TP compute mock did not observe all decoder layers")
+
+
+class TPCollectiveDelay:
+    """Wrap TP collectives, optionally adding stream-ordered link delay."""
 
     def __init__(
         self,
         communicator: Any,
         config: TPHeteroConfig,
         tp_size: int,
-        device: torch.device,
+        stream_delay: TPStreamDelay,
     ) -> None:
         self.communicator = communicator
         self.config = config
         self.tp_size = tp_size
-        self.device = device
+        self.stream_delay = stream_delay
+        self.compute_delay: TPComputeDelay | None = None
         self.total_ms = 0.0
         self.extra_total_ms = 0.0
         self.cross_bytes_total = 0
@@ -124,25 +240,43 @@ class TPCollectiveDelay:
             original = getattr(self.communicator, op)
             self.originals[op] = original
 
-            def wrapped(input_: torch.Tensor, *args: Any,
-                        _op: str = op, _original: Callable[..., Any] = original,
-                        **kwargs: Any) -> Any:
+            def wrapped(
+                input_: torch.Tensor,
+                *args: Any,
+                _op: str = op,
+                _original: Callable[..., Any] = original,
+                **kwargs: Any,
+            ) -> Any:
                 if not self.active:
                     return _original(input_, *args, **kwargs)
-                sync_torch_device(self.device)
-                start = time.perf_counter()
-                result = _original(input_, *args, **kwargs)
-                sync_torch_device(self.device)
+                if self.compute_delay is not None:
+                    self.compute_delay.before_collective(_op)
                 extra_ms = self.config.extra_ms(
                     _op, input_.numel() * input_.element_size(), self.tp_size
                 )
                 if extra_ms:
-                    time.sleep(extra_ms / 1000)
+                    started = [0.0]
+                    self.stream_delay.enqueue(
+                        lambda: started.__setitem__(0, time.perf_counter())
+                    )
+                result = _original(input_, *args, **kwargs)
+                if extra_ms:
+
+                    def stretch_collective() -> None:
+                        elapsed_ms = (time.perf_counter() - started[0]) * 1000
+                        sleep_started = time.perf_counter()
+                        time.sleep(extra_ms / 1000)
+                        self.total_ms += elapsed_ms + (
+                            time.perf_counter() - sleep_started
+                        ) * 1000
+
+                    self.stream_delay.enqueue(stretch_collective)
+                if self.compute_delay is not None:
+                    self.compute_delay.after_collective(_op)
                 self.extra_total_ms += extra_ms
                 self.cross_bytes_total += self.config.cross_bytes(
                     _op, input_.numel() * input_.element_size(), self.tp_size
                 )
-                self.total_ms += (time.perf_counter() - start) * 1000
                 self.counts[_op] += 1
                 return result
 
