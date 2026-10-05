@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+import json
+import os
+import time
+from pathlib import Path
+
 import torch
 from vllm_ascend.worker.worker import NPUWorker
 
@@ -36,6 +41,17 @@ class TPAscendWorker(NPUWorker):
         self._tp_layer_timer: PPLayerTimer | None = None
         self._tp_layer_model: torch.nn.Module | None = None
         self._tp_logged = False
+        trace_dir = os.getenv("VLLM_TP_MOCK_TRACE")
+        self._tp_trace = None
+        self._tp_trace_remaining = 1000
+        if trace_dir:
+            path = Path(trace_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            self._tp_trace = (
+                path / f"tp_mock_rank{tp_group.rank_in_group}_pid{os.getpid()}.jsonl"
+            ).open(
+                "x", buffering=1
+            )
         logger.info(
             "TP mock rank=%d compute_scale=%g cross_group_size=%d "
             "cross_extra_bandwidth_gbps=%s",
@@ -46,6 +62,9 @@ class TPAscendWorker(NPUWorker):
         )
 
     def shutdown(self) -> None:
+        if trace := getattr(self, "_tp_trace", None):
+            trace.close()
+            self._tp_trace = None
         if collectives := getattr(self, "_tp_collectives", None):
             collectives.uninstall()
         parent = getattr(super(), "shutdown", None)
@@ -62,6 +81,10 @@ class TPAscendWorker(NPUWorker):
         assert self._tp_layer_timer is not None
         collectives = self._tp_collectives
         collectives.total_ms = 0.0
+        collectives.extra_total_ms = 0.0
+        collectives.cross_bytes_total = 0
+        before_counts = collectives.counts.copy()
+        started = time.perf_counter()
         collectives.active = True
         try:
             with self._tp_layer_timer.capture(
@@ -70,6 +93,32 @@ class TPAscendWorker(NPUWorker):
             ):
                 output = super().execute_model(scheduler_output)
                 sync_torch_device(self.device)
+            if self._tp_trace is not None:
+                try:
+                    self._tp_trace.write(json.dumps({
+                        "pid": os.getpid(),
+                        "tp_rank": get_tp_group().rank_in_group,
+                        "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
+                        "compute_scale": self._tp_hetero.scale(get_tp_group().rank_in_group),
+                        "compute_base_ms": self._tp_layer_timer.mock_input_compute_ms,
+                        "compute_sleep_ms": self._tp_layer_timer.mock_delay_ms,
+                        "collective_total_ms": collectives.total_ms,
+                        "collective_extra_requested_ms": collectives.extra_total_ms,
+                        "collective_cross_bytes": collectives.cross_bytes_total,
+                        "collective_counts": {
+                            op: count - before_counts[op]
+                            for op, count in collectives.counts.items()
+                        },
+                        "forward_wall_ms": (time.perf_counter() - started) * 1000,
+                    }) + "\n")
+                    self._tp_trace_remaining -= 1
+                    if self._tp_trace_remaining == 0:
+                        self._tp_trace.close()
+                        self._tp_trace = None
+                except OSError as exc:
+                    logger.warning("Disabling TP mock trace after write failure: %s", exc)
+                    self._tp_trace.close()
+                    self._tp_trace = None
             if not self._tp_logged:
                 logger.info("TP mock first forward collectives=%s", collectives.counts)
                 self._tp_logged = True

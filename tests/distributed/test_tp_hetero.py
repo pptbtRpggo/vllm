@@ -130,3 +130,4 @@ def test_layer_compute_scale_excludes_collective_time(monkeypatch):
         layer(1)
     assert now[0] == pytest.approx(0.009)  # 3 ms compute + 3 ms comm + 3 ms delay
     assert timer.mock_requested_delay_ms == pytest.approx(3)
+    assert timer.mock_input_compute_ms == pytest.approx(3)

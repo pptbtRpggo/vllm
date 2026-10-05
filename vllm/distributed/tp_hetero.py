@@ -105,6 +105,8 @@ class TPCollectiveDelay:
         self.tp_size = tp_size
         self.device = device
         self.total_ms = 0.0
+        self.extra_total_ms = 0.0
+        self.cross_bytes_total = 0
         self.active = False
         self.counts = {"all_reduce": 0, "all_gather": 0, "reduce_scatter": 0}
         self.originals: dict[str, Callable[..., Any]] = {}
@@ -128,6 +130,10 @@ class TPCollectiveDelay:
                 )
                 if extra_ms:
                     time.sleep(extra_ms / 1000)
+                self.extra_total_ms += extra_ms
+                self.cross_bytes_total += self.config.cross_bytes(
+                    _op, input_.numel() * input_.element_size(), self.tp_size
+                )
                 self.total_ms += (time.perf_counter() - start) * 1000
                 self.counts[_op] += 1
                 return result
