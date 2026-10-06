@@ -1,10 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Write completed CPU trace records without blocking a device callback."""
 
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from queue import SimpleQueue
 from threading import Thread
 from typing import Any
+
+
+@dataclass
+class _PendingTrace:
+    completion: Any
+    resolve: Callable[[], Any]
 
 
 class AsyncTraceWriter:
@@ -26,6 +34,10 @@ class AsyncTraceWriter:
                 return
             if self._error is None:
                 try:
+                    if isinstance(record, _PendingTrace):
+                        while not record.completion.query():
+                            time.sleep(0.001)
+                        record = record.resolve()
                     self._write(record)
                 except Exception as exc:
                     self._error = exc
@@ -34,6 +46,14 @@ class AsyncTraceWriter:
         if self._closed:
             raise RuntimeError("trace writer is closed")
         self._queue.put(record)
+
+    def submit_ready(self, completion: Any, resolve: Callable[[], Any]) -> None:
+        """Read pinned snapshots only after their producer event completes.
+
+        Polling and record resolution run in this writer's background thread,
+        not in a stream callback or the worker's submission thread.
+        """
+        self.submit(_PendingTrace(completion, resolve))
 
     def check(self) -> None:
         if self._error is not None:

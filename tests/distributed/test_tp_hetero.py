@@ -65,146 +65,31 @@ def test_tp_latency_only_selects_worker_and_requires_cross_group(monkeypatch):
         TPHeteroConfig.from_env(4)
 
 
-def test_collective_delay_only_during_forward(monkeypatch):
-    now = [0.0]
-    sleeps = []
-    monkeypatch.setattr("vllm.distributed.tp_hetero.time.perf_counter", lambda: now[0])
+def test_compute_wait_precedes_collectives_and_does_not_scale_communication():
+    from tests.distributed.test_pp_stream import DeferredStream
 
-    def sleep(seconds):
-        sleeps.append(seconds)
-        now[0] += seconds
+    stream = DeferredStream()
+    starts = []
 
-    monkeypatch.setattr("vllm.distributed.tp_hetero.time.sleep", sleep)
-
-    class StreamDelay:
-        def enqueue(self, callback):
-            callback()
-
-    class Comm:
-        def all_reduce(self, x):
-            now[0] += 0.001
-            return x
-
-        def all_gather(self, x, dim):
-            now[0] += 0.001
-            return x
-
-        def reduce_scatter(self, x, dim):
-            now[0] += 0.001
-            return x
-
-    comm = Comm()
-    original = comm.all_reduce
-    delay = TPCollectiveDelay(
-        comm, TPHeteroConfig((1, 2, 4, 1), 2, 25), 4, StreamDelay()
-    )
-    delay.install()
-    x = torch.empty(1_000_000, dtype=torch.uint8)
-    comm.all_reduce(x)
-    assert not sleeps
-    delay.active = True
-    comm.all_reduce(x)
-    assert sleeps == pytest.approx([0.00032])
-    assert delay.total_ms == pytest.approx(1.32)
-    assert delay.actual_extra_total_ms == pytest.approx(0.32)
-    assert delay.counts["all_reduce"] == 1
-    delay.uninstall()
-    assert comm.all_reduce == original
-
-
-def test_short_sleep_compensates_measured_wakeup_overhead(monkeypatch):
-    now = [0.0]
-    sleeps = []
-    monkeypatch.setattr("vllm.distributed.tp_hetero.time.perf_counter", lambda: now[0])
-
-    def sleep(seconds):
-        sleeps.append(seconds)
-        now[0] += seconds + 0.0001
-
-    monkeypatch.setattr("vllm.distributed.tp_hetero.time.sleep", sleep)
-
-    class StreamDelay:
-        def enqueue(self, callback):
-            callback()
+    def all_reduce(x):
+        stream.enqueue(lambda: starts.append(stream.now))
+        stream.work(0.003)
+        return x
 
     comm = SimpleNamespace(
-        all_reduce=lambda x: x,
+        all_reduce=all_reduce,
         all_gather=lambda x, dim: x,
         reduce_scatter=lambda x, dim: x,
     )
-    delay = TPCollectiveDelay(comm, TPHeteroConfig((1, 1), 1, 25), 2, StreamDelay())
-    delay.install()
-    delay.active = True
-    x = torch.empty(1_000_000, dtype=torch.uint8)
-    comm.all_reduce(x)
-    comm.all_reduce(x)
-    assert sleeps[1] < sleeps[0]
-    assert delay.extra_total_ms == pytest.approx(0.64)
-    assert delay.actual_extra_total_ms < 0.84
-    delay.uninstall()
-
-
-def test_native_baseline_does_not_enqueue_callbacks():
-    class StreamDelay:
-        def enqueue(self, callback):
-            raise AssertionError("native TP must not enqueue stream callbacks")
-
-    comm = SimpleNamespace(
-        all_reduce=lambda x: x,
-        all_gather=lambda x, dim: x,
-        reduce_scatter=lambda x, dim: x,
-    )
-    delay = TPCollectiveDelay(
-        comm, TPHeteroConfig((1, 1, 1, 1), 4, None), 4, StreamDelay()
-    )
-    delay.install()
-    delay.active = True
-    comm.all_reduce(torch.empty(1))
-    assert delay.counts["all_reduce"] == 1
-    delay.uninstall()
-
-
-def test_compute_delay_precedes_collectives_and_excludes_comm(monkeypatch):
-    now = [0.0]
-    order = []
-    monkeypatch.setattr("vllm.distributed.tp_hetero.time.perf_counter", lambda: now[0])
-
-    def sleep(seconds):
-        order.append("delay")
-        now[0] += seconds
-
-    monkeypatch.setattr("vllm.distributed.tp_hetero.time.sleep", sleep)
-
-    class StreamDelay:
-        def enqueue(self, callback):
-            callback()
-
-    stream = StreamDelay()
-
-    class Comm:
-        def all_reduce(self, x):
-            order.append("all_reduce")
-            now[0] += 0.003
-            return x
-
-        def all_gather(self, x, dim):
-            return x
-
-        def reduce_scatter(self, x, dim):
-            return x
-
-    comm = Comm()
     collective = TPCollectiveDelay(comm, TPHeteroConfig((2, 1), 2, None), 2, stream)
     collective.install()
 
     class Layer(torch.nn.Module):
         def forward(self, x):
-            now[0] += 0.002
+            stream.work(0.002)
             x = comm.all_reduce(x)
-            now[0] += 0.001
-            x = comm.all_reduce(x)
-            now[0] += 0.0005
-            return x
+            stream.work(0.001)
+            return comm.all_reduce(x)
 
     layer = Layer()
     model = SimpleNamespace(
@@ -214,97 +99,54 @@ def test_compute_delay_precedes_collectives_and_excludes_comm(monkeypatch):
     )
     compute = TPComputeDelay(model, 2, stream)
     compute.install()
-    compute.reset()
     collective.compute_delay = compute
-    collective.active = True
+    compute.reset()
     layer(torch.empty(1))
     compute.validate()
-    assert order == ["delay", "all_reduce", "delay", "all_reduce", "delay"]
-    assert now[0] == pytest.approx(0.013)
-    assert compute.input_compute_ms == pytest.approx(3.5)
-    assert compute.requested_delay_ms == pytest.approx(3.5)
-    assert collective.counts["all_reduce"] == 2
+    stream.drain()
+    assert stream.waits == pytest.approx([2, 1])
+    assert starts == pytest.approx([1004, 1009])
+    assert stream.now == pytest.approx(1012)
     compute.uninstall()
     collective.uninstall()
 
 
-def test_pending_compute_callbacks_keep_their_microbatch_statistics(monkeypatch):
-    now = [0.0]
-    monkeypatch.setattr("vllm.distributed.tp_hetero.time.perf_counter", lambda: now[0])
-    monkeypatch.setattr(
-        "vllm.distributed.tp_hetero.time.sleep",
-        lambda s: now.__setitem__(0, now[0] + s),
-    )
+def test_native_collective_path_submits_no_device_work():
+    from tests.distributed.test_pp_stream import DeferredStream
 
-    class Stream:
-        def __init__(self):
-            self.pending = []
-
-        def enqueue(self, callback):
-            self.pending.append(callback)
-
-    stream = Stream()
-    model = SimpleNamespace(
-        model=SimpleNamespace(
-            start_layer=0,
-            end_layer=1,
-            layers=torch.nn.ModuleList([torch.nn.Identity()]),
-        )
-    )
-    compute = TPComputeDelay(model, 2, stream)
-    batches = []
-    for duration in (0.002, 0.005):
-        compute.reset()
-        batches.append(compute.stats)
-        compute._begin_segment()
-        stream.enqueue(lambda d=duration: now.__setitem__(0, now[0] + d))
-        compute._finish_segment()
-    for callback in stream.pending:
-        callback()
-    assert batches[0].input_compute_ms == pytest.approx(2)
-    assert batches[1].input_compute_ms == pytest.approx(5)
-    assert batches[0].requested_delay_ms == pytest.approx(2)
-    assert batches[1].requested_delay_ms == pytest.approx(5)
-
-
-def test_pending_collective_callbacks_keep_their_microbatch_statistics(monkeypatch):
-    now = [0.0]
-    monkeypatch.setattr("vllm.distributed.tp_hetero.time.perf_counter", lambda: now[0])
-    monkeypatch.setattr(
-        "vllm.distributed.tp_hetero.time.sleep",
-        lambda s: now.__setitem__(0, now[0] + s),
-    )
-
-    class Stream:
-        def __init__(self):
-            self.pending = []
-
-        def enqueue(self, callback):
-            self.pending.append(callback)
-
-    stream = Stream()
-
-    def all_reduce(x):
-        stream.enqueue(lambda: now.__setitem__(0, now[0] + 0.001))
-        return x
-
+    stream = DeferredStream()
     comm = SimpleNamespace(
-        all_reduce=all_reduce,
+        all_reduce=lambda x: x,
+        all_gather=lambda x, dim: x,
+        reduce_scatter=lambda x, dim: x,
+    )
+    delay = TPCollectiveDelay(comm, TPHeteroConfig((1, 1), 2, None), 2, stream)
+    delay.install()
+    comm.all_reduce(torch.empty(1))
+    assert not stream.pending
+    delay.uninstall()
+
+
+def test_collective_delay_and_trace_are_ordered_after_native_communication():
+    from tests.distributed.test_pp_stream import DeferredStream
+
+    stream = DeferredStream()
+    comm = SimpleNamespace(
+        all_reduce=lambda x: (stream.work(0.001), x)[1],
         all_gather=lambda x, dim: x,
         reduce_scatter=lambda x, dim: x,
     )
     delay = TPCollectiveDelay(comm, TPHeteroConfig((1, 1), 1, 25), 2, stream)
     delay.install()
-    delay.active = True
-    batches = []
+    delay.trace_enabled = True
+    snapshots = []
     for size in (1_000_000, 2_000_000):
         delay.reset()
-        batches.append(delay.stats)
         comm.all_reduce(torch.empty(size, dtype=torch.uint8))
-    for callback in stream.pending:
-        callback()
-    assert batches[0].extra_total_ms == pytest.approx(0.32)
-    assert batches[1].extra_total_ms == pytest.approx(0.64)
-    assert batches[0].total_ms == pytest.approx(1.32)
-    assert batches[1].total_ms == pytest.approx(1.64)
+        snapshots.append(delay.stats)
+    stream.drain()
+    assert [s.extra_total_ms for s in snapshots] == pytest.approx([0.32, 0.64])
+    assert [
+        s.events[0][0].elapsed_time(s.events[0][1]) for s in snapshots
+    ] == pytest.approx([1.32, 1.64])
     delay.uninstall()

@@ -121,10 +121,14 @@ def measured_layer_rank_costs(
                 or scale <= 0
             ):
                 raise ValueError("invalid compute scale in layer trace")
-            if scale != 1 and row.get("compute_delay_placement") != "layer":
+            if scale != 1 and row.get("compute_delay_placement") not in (
+                "layer",
+                "stage-attributed",
+            ):
                 raise ValueError(
                     "layer-measured cannot use mock compute slowdown unless "
-                    "actual per-layer waits are included in the measurements"
+                    "measured layer waits or attributed measured stage waits "
+                    "are included"
                 )
             layers = row.get("layer_compute_ms")
             if not isinstance(layers, dict) or set(layers) != {
@@ -150,7 +154,7 @@ def measured_layer_rank_costs(
         # stage rank. Reordered runs may use different roles/links, but must
         # describe the same compute environment on each device.
         compute_settings = {
-            (r.get("compute_scale", 1.0), r.get("compute_delay_placement") == "layer")
+            (r.get("compute_scale", 1.0), r.get("compute_delay_placement"))
             for r in rows
         }
         if len(compute_settings) != 1:

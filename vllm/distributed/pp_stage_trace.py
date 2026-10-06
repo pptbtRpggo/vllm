@@ -146,6 +146,7 @@ class PPStageTraceRecord:
     runner_overhead_ms: float | None = None
     comm_delay_in_window: bool = False
     timing_source: str = "synchronized"
+    clock_error_ns: int | None = None
 
 
 class PPStageTracer:
@@ -409,13 +410,16 @@ class PPStageTracer:
             clock_domain=self.clock_domain,
             batch_id=batch_id,
             compute_model=self.compute_model,
-            timing_source="stream_callback",
+            timing_source="device_clock",
         )
         self._step += 1
         return rec
 
     def submit_async_record(self, record: PPStageTraceRecord) -> None:
         self._async_writer.submit(record)
+
+    def submit_ready_record(self, completion, resolve) -> None:
+        self._async_writer.submit_ready(completion, resolve)
 
     def _write_record(self, rec: PPStageTraceRecord) -> None:
         self._fp.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")

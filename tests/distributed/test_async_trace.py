@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from threading import Event, get_ident
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,3 +42,26 @@ def test_writer_reports_io_errors_when_drained():
     with pytest.raises(RuntimeError, match="trace write failed") as error:
         writer.close()
     assert isinstance(error.value.__cause__, OSError)
+
+
+def test_pending_device_record_is_resolved_only_after_completion():
+    ready, inspected = Event(), Event()
+    rows = []
+
+    def query():
+        inspected.set()
+        return ready.is_set()
+
+    def resolve():
+        assert ready.is_set()
+        return {"step": 3}
+
+    writer = AsyncTraceWriter(rows.append)
+    try:
+        writer.submit_ready(SimpleNamespace(query=query), resolve)
+        assert inspected.wait(5)
+        assert not rows
+    finally:
+        ready.set()
+        writer.close()
+    assert rows == [{"step": 3}]

@@ -183,16 +183,18 @@ class PPAscendWorker(NPUWorker):
         return self._pp_output(output)
 
     def _execute_model_stream(self, scheduler_output, tracer, hetero):
+        from vllm.distributed.ascend_device_delay import AscendDeviceDelay
         from vllm.distributed.pp_layer_trace import (
             PPLayerTimer,
             validate_layer_execution,
         )
         from vllm.distributed.pp_stream import PPStreamExecution, PPStreamStep
-        from vllm.distributed.tp_stream_delay import TPStreamDelay
 
         if not hasattr(self, "_pp_stream_delay"):
-            self._pp_stream_delay = TPStreamDelay()
+            self._pp_stream_delay = AscendDeviceDelay()
             self._pp_stream_execution = PPStreamExecution(self._pp_stream_delay)
+        if tracer and self._pp_stream_delay.clock_offset_ns is None:
+            self._pp_stream_delay.calibrate_clock()
         self._pp_stream_delay.check()
         execution = self._pp_stream_execution
         pp_rank = get_pp_group().rank_in_group
@@ -236,7 +238,7 @@ class PPAscendWorker(NPUWorker):
             )
 
         timer = None
-        if mode == "layer-measured" and (tracer is not None or scale > 1):
+        if mode == "layer-measured" and tracer is not None:
             validate_layer_execution(self.vllm_config, get_tp_group().world_size)
             model = self.model_runner.model
             if getattr(self, "_pp_stream_layer_model", None) is not model:

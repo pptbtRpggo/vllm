@@ -18,7 +18,11 @@ def test_tp_worker_has_no_execute_sync_and_keeps_pending_batches_separate(
 ):
     stream = DeferredStream(monkeypatch)
     rows = []
-    writer = SimpleNamespace(check=lambda: None, submit=rows.append)
+    deferred = []
+    writer = SimpleNamespace(
+        check=lambda: None,
+        submit_ready=lambda event, resolve: deferred.append((event, resolve)),
+    )
 
     def all_reduce(x):
         stream.work(0.003)
@@ -36,7 +40,6 @@ def test_tp_worker_has_no_execute_sync_and_keeps_pending_batches_separate(
             comm.all_reduce(torch.empty(1_000_000, dtype=torch.uint8))
             stream.work(duration)
             comm.all_reduce(torch.empty(1_000_000, dtype=torch.uint8))
-            stream.work(duration)
             return 42
 
     model = SimpleNamespace(
@@ -68,6 +71,9 @@ def test_tp_worker_has_no_execute_sync_and_keeps_pending_batches_separate(
     )
     config = TPHeteroConfig((2, 1), 1, 25)
     worker = object.__new__(module.TPAscendWorker)
+    worker.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=True)
+    )
     worker._tp_stream_delay = stream
     worker._tp_trace_writer = writer if tracing else None
     worker._tp_trace_remaining = 1000
@@ -87,10 +93,13 @@ def test_tp_worker_has_no_execute_sync_and_keeps_pending_batches_separate(
         assert not rows
         stream.drain()
         if tracing:
+            for event, resolve in deferred:
+                assert event.query()
+                rows.append(resolve())
             assert [r["scheduled_tokens"] for r in rows] == [2, 5]
-            assert [r["compute_base_ms"] for r in rows] == pytest.approx([6, 15])
+            assert [r["compute_base_ms"] for r in rows] == pytest.approx([4, 10])
             assert [r["compute_extra_requested_ms"] for r in rows] == pytest.approx(
-                [6, 15]
+                [4, 10]
             )
             assert all(
                 r["collective_extra_requested_ms"] == pytest.approx(0.64) for r in rows
