@@ -71,6 +71,12 @@ class PPAscendWorker(NPUWorker):
                 if callable(parent):
                     parent()
 
+    def compile_or_warm_up_model(self):
+        from vllm.distributed.ascend_device_delay import prepare_ascend_full_graph
+
+        prepare_ascend_full_graph(self)
+        super().compile_or_warm_up_model()
+
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,

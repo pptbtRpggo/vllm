@@ -18,6 +18,24 @@ import torch
 CYCLES_PER_MS = 50_000
 
 
+def prepare_ascend_full_graph(worker) -> None:
+    """Fill Ascend's FULL Graph workspace registry before capture.
+
+    Some Ascend versions initialize this registry only with compilation mode
+    VLLM_COMPILE, although FULL runtime capture also supports mode NONE. Keep
+    model/attention execution unchanged and apply the same setup to baselines.
+    """
+    config = worker.vllm_config
+    if config.model_config.enforce_eager:
+        return
+    if not config.compilation_config.cudagraph_mode.has_full_cudagraphs():
+        return
+    from vllm_ascend.compilation.acl_graph import get_graph_params, set_graph_params
+
+    if get_graph_params() is None:
+        set_graph_params(worker.model_runner.cudagraph_batch_sizes)
+
+
 class AscendDeviceDelay:
     def __init__(self) -> None:
         self.library = None

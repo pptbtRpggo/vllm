@@ -108,6 +108,12 @@ class TPAscendWorker(NPUWorker):
         super().load_model()
         self._install_compute()
 
+    def compile_or_warm_up_model(self):
+        from vllm.distributed.ascend_device_delay import prepare_ascend_full_graph
+
+        prepare_ascend_full_graph(self)
+        super().compile_or_warm_up_model()
+
     def _install_compute(self):
         model = self.model_runner.model
         if self._tp_compute_model is not model:
