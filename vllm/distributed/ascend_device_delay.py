@@ -40,7 +40,7 @@ class AscendDeviceDelay:
         self.library.launch_stretch.argtypes = [
             ctypes.c_void_p,
             ctypes.c_void_p,
-            ctypes.c_double,
+            ctypes.c_float,
             ctypes.c_uint64,
         ]
         self.library.launch_wait.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
