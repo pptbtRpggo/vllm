@@ -40,7 +40,7 @@ class AscendDeviceDelay:
         self.library.launch_stretch.argtypes = [
             ctypes.c_void_p,
             ctypes.c_void_p,
-            ctypes.c_float,
+            ctypes.c_uint64,
             ctypes.c_uint64,
         ]
         self.library.launch_wait.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
@@ -72,7 +72,7 @@ class AscendDeviceDelay:
         self.library.launch_stretch(
             self.stream(),
             ctypes.c_void_p(buffer.data_ptr()),
-            factor,
+            round(factor * 1_000_000),
             math.ceil(extra_ms * CYCLES_PER_MS),
         )
         buffer.record_stream(torch.npu.current_stream())
