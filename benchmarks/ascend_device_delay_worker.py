@@ -58,6 +58,11 @@ class TPDeviceBenchWorker(TPAscendWorker):
 
     def execute_model(self, scheduler_output):
         state = control()
+        self._tp_trace_metadata = {
+            "bench_label": state["label"],
+            "bench_phase": state["phase"],
+            "bench_concurrency": state["concurrency"],
+        }
         mode = state["mode"]
         if mode != self._bench_mode:
             if not self.vllm_config.model_config.enforce_eager:

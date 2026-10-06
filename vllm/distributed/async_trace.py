@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Write completed CPU trace records without blocking a device callback."""
+"""Resolve completed device snapshots and write traces in a background thread."""
 
 import time
 from collections.abc import Callable
@@ -16,10 +16,11 @@ class _PendingTrace:
 
 
 class AsyncTraceWriter:
-    """Finish mutating records before submit; drain device callbacks before close."""
+    """Own submitted records; resolve deferred records after their event completes."""
 
-    def __init__(self, write: Callable[[Any], None]) -> None:
+    def __init__(self, write: Callable[[Any], None], initialize=None) -> None:
         self._write = write
+        self._initialize = initialize
         self._queue: SimpleQueue = SimpleQueue()
         self._stop = object()
         self._error: Exception | None = None
@@ -28,6 +29,11 @@ class AsyncTraceWriter:
         self._thread.start()
 
     def _run(self) -> None:
+        if self._initialize is not None:
+            try:
+                self._initialize()
+            except Exception as exc:
+                self._error = exc
         while True:
             record = self._queue.get()
             if record is self._stop:

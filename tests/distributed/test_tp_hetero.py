@@ -13,6 +13,15 @@ from vllm.distributed.tp_hetero import (
 from vllm.pp_hetero_env import TP_ASCEND_WORKER, maybe_override_pp_worker
 
 
+@pytest.fixture(autouse=True)
+def isolate_hetero_environment(monkeypatch):
+    import os
+
+    for key in os.environ:
+        if key.startswith(("VLLM_PP_", "VLLM_TP_")):
+            monkeypatch.delenv(key)
+
+
 def test_tp_worker_selection_and_no_silent_cuda(monkeypatch):
     monkeypatch.setenv("VLLM_TP_COMPUTE_SCALES", "1,2,4,1")
     cfg = SimpleNamespace(worker_cls="vllm_ascend.worker.worker.NPUWorker")

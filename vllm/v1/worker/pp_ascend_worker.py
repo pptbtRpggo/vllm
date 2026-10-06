@@ -3,8 +3,8 @@
 """NPUWorker subclass with stream-ordered PP mock delays and asynchronous traces.
 
 vllm-ascend replaces the GPU Worker, so ``gpu_worker.py`` hooks never run
-on Ascend. Native recv/compute/send dependencies are preserved; callbacks add
-mock waits and queue CPU trace records without per-step device synchronization.
+on Ascend. Native recv/compute/send dependencies are preserved; device kernels
+add mock waits and event-completed traces need no per-step device synchronization.
 """
 
 from __future__ import annotations

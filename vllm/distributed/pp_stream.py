@@ -137,7 +137,7 @@ class PPStreamExecution:
                     record.layer_compute_ms.values()
                 )
                 overhead = residual - sum(endpoints.values())
-                if min(residual, overhead) < -0.05:
+                if min(residual, overhead) < -0.01:
                     raise ValueError("layer events exceed stage timing")
                 record.non_layer_compute_ms = max(0.0, residual)
                 record.runner_overhead_ms = max(0.0, overhead)

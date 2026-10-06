@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Ascend eager worker for controlled TP heterogeneity experiments."""
+"""Ascend eager/Graph worker with device-side TP heterogeneity simulation."""
 
 from __future__ import annotations
 
@@ -65,7 +65,9 @@ class TPAscendWorker(NPUWorker):
             self._tp_trace = (
                 path / f"tp_mock_rank{tp_group.rank_in_group}_pid{os.getpid()}.jsonl"
             ).open("x", buffering=1)
-            self._tp_trace_writer = AsyncTraceWriter(self._write_trace)
+            self._tp_trace_writer = AsyncTraceWriter(
+                self._write_trace, lambda: torch.npu.set_device(self.device)
+            )
         logger.info(
             "TP mock rank=%d compute_scale=%g cross_group_size=%d "
             "cross_extra_bandwidth_gbps=%s cross_extra_latency_ms=%g",
@@ -77,8 +79,7 @@ class TPAscendWorker(NPUWorker):
         )
 
     def shutdown(self) -> None:
-        # Pending callbacks still own their statistics and may submit records.
-        # Drain them before stopping the writer or closing its file.
+        # Complete device work before draining snapshots and closing the file.
         try:
             if stream_delay := getattr(self, "_tp_stream_delay", None):
                 sync_torch_device(self.device)
@@ -147,6 +148,7 @@ class TPAscendWorker(NPUWorker):
             completed = self._tp_stream_delay.event()
             events = collective.stats.events.copy()
             metadata = {
+                **getattr(self, "_tp_trace_metadata", {}),
                 "pid": os.getpid(),
                 "tp_rank": get_tp_group().rank_in_group,
                 "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,

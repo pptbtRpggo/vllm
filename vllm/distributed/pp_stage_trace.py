@@ -9,13 +9,13 @@ Enabled by ``VLLM_PP_STAGE_TRACE=/path/to/dir``. Each PP rank writes
 * ``recv_ms`` / ``send_ms`` — intermediate-tensor communication windows,
   including any mock delay and peer waiting.
 
-Ascend's PP worker uses stream-ordered CPU callbacks and a background writer.
-Its records are tagged ``timing_source=stream_callback``; no per-step device
+Ascend's PP worker uses device clock kernels, events and a background writer.
+Its records are tagged ``timing_source=device_clock``; no per-step device
 synchronization is added. CUDA and CPU callers retain the synchronous timing
 methods below. Tracing itself adds instrumentation overhead in either path.
 
 ``VLLM_PP_COMPUTE_MODEL=layer-measured`` additionally records every local
-decoder layer, using callbacks on Ascend and device events in the synchronous
+decoder layer, using device events on Ascend and in the synchronous
 path. The default shape-affine mode is stage-only.
 """
 
@@ -378,11 +378,16 @@ class PPStageTracer:
         compute_scale: float,
         comm_scale: float,
     ) -> PPStageTraceRecord:
-        """Snapshot CPU metadata now; callbacks fill this step's own timings."""
+        """Snapshot metadata now; the background writer resolves device timings."""
         from vllm.distributed.async_trace import AsyncTraceWriter
 
         if self._async_writer is None:
-            self._async_writer = AsyncTraceWriter(self._write_record)
+            initialize = (
+                (lambda: torch.npu.set_device(self.device))
+                if self.device.type == "npu"
+                else None
+            )
+            self._async_writer = AsyncTraceWriter(self._write_record, initialize)
         self._async_writer.check()
         rec = PPStageTraceRecord(
             step=self._step,
