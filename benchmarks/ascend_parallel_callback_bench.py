@@ -60,7 +60,6 @@ def run_architecture(args, architecture, warm, samples):
     )
     if architecture == "tp":
         env.update(
-            VLLM_TP_COMPUTE_SCALES="1,1,1,1",
             VLLM_TP_MOCK_TRACE=str((root / "trace").resolve()),
         )
         worker = "TPCallbackBenchWorker"
