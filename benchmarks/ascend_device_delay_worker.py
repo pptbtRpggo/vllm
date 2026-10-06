@@ -18,6 +18,30 @@ from vllm.v1.worker.pp_ascend_worker import PPAscendWorker
 from vllm.v1.worker.tp_ascend_worker import TPAscendWorker
 
 
+def track_graph(worker):
+    """Count real cache hits, rather than assuming --graph enabled replay."""
+    model = worker.model_runner.model
+    if not hasattr(model, "concrete_aclgraph_entries"):
+        return
+    from vllm.forward_context import get_forward_context
+
+    original = type(model).__call__
+    worker._bench_graph_replays = 0
+
+    def call(instance, *args, **kwargs):
+        if instance is model:
+            context = get_forward_context()
+            if context.cudagraph_runtime_mode == instance.runtime_mode:
+                entry = instance.concrete_aclgraph_entries.get(context.batch_descriptor)
+                if entry is not None and entry.aclgraph is not None:
+                    worker._bench_graph_replays += 1
+                    if worker._bench_graph_replays == 1:
+                        print("DEVICE_BENCH_ACTUAL_GRAPH_REPLAY", flush=True)
+        return original(instance, *args, **kwargs)
+
+    type(model).__call__ = call
+
+
 def control():
     return json.loads(Path(os.environ["VLLM_DEVICE_BENCH_CONTROL"]).read_text())
 
@@ -55,6 +79,15 @@ class TPDeviceBenchWorker(TPAscendWorker):
         super().load_model()
         if self._bench_mode == "native":
             self._tp_compute_delay.uninstall()
+        track_graph(self)
+
+    def shutdown(self):
+        print(
+            "DEVICE_BENCH_GRAPH_REPLAYS",
+            getattr(self, "_bench_graph_replays", 0),
+            flush=True,
+        )
+        super().shutdown()
 
     def execute_model(self, scheduler_output):
         state = control()
@@ -80,6 +113,18 @@ class TPDeviceBenchWorker(TPAscendWorker):
 
 
 class PPDeviceBenchWorker(PPAscendWorker):
+    def load_model(self):
+        super().load_model()
+        track_graph(self)
+
+    def shutdown(self):
+        print(
+            "DEVICE_BENCH_GRAPH_REPLAYS",
+            getattr(self, "_bench_graph_replays", 0),
+            flush=True,
+        )
+        super().shutdown()
+
     def execute_model(self, scheduler_output):
         state = control()
         mode = state["mode"]
