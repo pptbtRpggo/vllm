@@ -116,7 +116,8 @@ def run_architecture(args, architecture, warm, samples):
         command.extend(
             [
                 "--compilation-config",
-                '{"mode":0,"cudagraph_mode":"FULL","cudagraph_capture_sizes":[1,2,4,8,16,32]}',
+                '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY",'
+                '"cudagraph_capture_sizes":[1,2,4,8,16,32]}',
             ]
         )
         if architecture == "tp":
