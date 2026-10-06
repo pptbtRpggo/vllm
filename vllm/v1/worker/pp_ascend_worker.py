@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""NPUWorker subclass that records PP stage traces.
+"""NPUWorker subclass with stream-ordered PP mock delays and asynchronous traces.
 
 vllm-ascend replaces the GPU Worker, so ``gpu_worker.py`` hooks never run
-on Ascend. This wrapper times the same blocking recv / compute / send path
-used by NPUWorker when ``VLLM_PP_STAGE_TRACE`` is set.
+on Ascend. Native recv/compute/send dependencies are preserved; callbacks add
+mock waits and queue CPU trace records without per-step device synchronization.
 """
 
 from __future__ import annotations
 
 import copy
+import os
 from types import NoneType
 from typing import TYPE_CHECKING
 
@@ -55,12 +56,20 @@ class PPAscendWorker(NPUWorker):
         self._pp_hetero.validate_pp_size(get_pp_group().world_size)
 
     def shutdown(self) -> None:
-        if tracer := getattr(self, "_pp_stage_tracer", None):
-            tracer.close()
-            self._pp_stage_tracer = None
-        parent = getattr(super(), "shutdown", None)
-        if callable(parent):
-            parent()
+        try:
+            if stream := getattr(self, "_pp_stream_delay", None):
+                # Shutdown is the only added device-wide wait in the stream path.
+                sync_torch_device(self.device)
+                stream.close()
+        finally:
+            try:
+                if tracer := getattr(self, "_pp_stage_tracer", None):
+                    tracer.close()
+                    self._pp_stage_tracer = None
+            finally:
+                parent = getattr(super(), "shutdown", None)
+                if callable(parent):
+                    parent()
 
     def execute_model(
         self,
@@ -90,6 +99,8 @@ class PPAscendWorker(NPUWorker):
         tracer: PPStageTracer | None,
         hetero: PPHeteroConfig,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        if self.device.type == "npu":
+            return self._execute_model_stream(scheduler_output, tracer, hetero)
         start_layer, end_layer = layer_range_from_runner(self.model_runner)
         batch = (
             scheduled_batch_shape(scheduler_output, self.model_runner)
@@ -169,6 +180,93 @@ class PPAscendWorker(NPUWorker):
                 compute_scale=hetero.compute_scale(pp_rank),
                 comm_scale=hetero.comm_scale(pp_rank),
             )
+        return self._pp_output(output)
+
+    def _execute_model_stream(self, scheduler_output, tracer, hetero):
+        from vllm.distributed.pp_layer_trace import (
+            PPLayerTimer,
+            validate_layer_execution,
+        )
+        from vllm.distributed.pp_stream import PPStreamExecution, PPStreamStep
+        from vllm.distributed.tp_stream_delay import TPStreamDelay
+
+        if not hasattr(self, "_pp_stream_delay"):
+            self._pp_stream_delay = TPStreamDelay()
+            self._pp_stream_execution = PPStreamExecution(self._pp_stream_delay)
+        self._pp_stream_delay.check()
+        execution = self._pp_stream_execution
+        pp_rank = get_pp_group().rank_in_group
+        scale = hetero.compute_scale(pp_rank)
+        mode = (
+            tracer.compute_model
+            if tracer
+            else os.environ.get("VLLM_PP_COMPUTE_MODEL", "shape-affine")
+        )
+        step = PPStreamStep() if tracer else None
+        record = None
+        if tracer:
+            start_layer, end_layer = layer_range_from_runner(self.model_runner)
+            record = tracer.reserve_async_step(
+                scheduler_output,
+                batch=scheduled_batch_shape(scheduler_output, self.model_runner),
+                batch_id=scheduled_batch_id(scheduler_output),
+                start_layer=start_layer,
+                end_layer=end_layer,
+                compute_scale=scale,
+                comm_scale=hetero.comm_scale(pp_rank),
+            )
+        gather = _all_gather_group()
+        intermediate = None
+        if not get_pp_group().is_first_rank:
+            if step is not None:
+                execution.begin_comm(step, "recv")
+            intermediate = IntermediateTensors(
+                get_pp_group().recv_tensor_dict(all_gather_group=gather)
+            )
+            payload = tensor_dict_nbytes(
+                intermediate.tensors,
+                all_gather_size=1 if gather is None else gather.world_size,
+            )
+            if step is not None:
+                step.recv_bytes = payload
+            # Native ProcessGroup send/recv establishes the completion
+            # dependency on the current stream. No device-wide wait is added.
+            execution.end_comm(
+                step, "recv", hetero.extra_transfer_ms(pp_rank - 1, payload)
+            )
+
+        timer = None
+        if mode == "layer-measured" and (tracer is not None or scale > 1):
+            validate_layer_execution(self.vllm_config, get_tp_group().world_size)
+            model = self.model_runner.model
+            if getattr(self, "_pp_stream_layer_model", None) is not model:
+                self._pp_stream_layer_timer = PPLayerTimer(model, self.device)
+                self._pp_stream_layer_model = model
+            timer = self._pp_stream_layer_timer
+        output = execution.compute(
+            lambda: self.model_runner.execute_model(scheduler_output, intermediate),
+            step,
+            scale,
+            mode,
+            timer,
+        )
+        if isinstance(output, IntermediateTensors):
+            payload = tensor_dict_nbytes(
+                output.tensors,
+                all_gather_size=1 if gather is None else gather.world_size,
+            )
+            if step is not None:
+                step.send_bytes = payload
+                execution.begin_comm(step, "send")
+            get_pp_group().send_tensor_dict(output.tensors, all_gather_group=gather)
+            execution.end_comm(step, "send", hetero.extra_transfer_ms(pp_rank, payload))
+        if step is not None:
+            execution.finish_trace(step, record, tracer, mode == "layer-measured")
+        self._pp_stream_delay.check()
+        return self._pp_output(output)
+
+    @staticmethod
+    def _pp_output(output):
         if isinstance(output, IntermediateTensors):
             kv_connector_output = getattr(output, "kv_connector_output", None)
             if not kv_connector_output:

@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stream-ordered host delays for eager Ascend TP experiments.
+"""Stream-ordered host callbacks for eager Ascend TP and PP experiments.
 
 CANN executes each callback after preceding work on the stream and blocks
-subsequent work until the callback returns. The callback only reads a CPU
-clock and sleeps; it must never call a CANN or torch device API.
+subsequent work until the callback returns. Callbacks may read CPU clocks,
+sleep and queue completed CPU records. They must never call CANN or torch
+device APIs or perform file I/O.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
-
 
 _Callback = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
 

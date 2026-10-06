@@ -47,8 +47,13 @@ class TPHeteroConfig:
         if self.compute_scales and len(self.compute_scales) != tp_size:
             raise ValueError("VLLM_TP_COMPUTE_SCALES must have one value per TP rank")
         if any(scale < 1 for scale in self.compute_scales):
-            raise ValueError("TP compute scales must be >= 1; sleep cannot speed up compute")
-        if not math.isfinite(self.cross_extra_latency_ms) or self.cross_extra_latency_ms < 0:
+            raise ValueError(
+                "TP compute scales must be >= 1; sleep cannot speed up compute"
+            )
+        if (
+            not math.isfinite(self.cross_extra_latency_ms)
+            or self.cross_extra_latency_ms < 0
+        ):
             raise ValueError("TP cross-group extra latency must be finite and >= 0")
         if self.cross_extra_bandwidth_gbps is not None:
             if (
@@ -89,18 +94,34 @@ class TPHeteroConfig:
         if self.cross_extra_bandwidth_gbps is None:
             return self.cross_extra_latency_ms
         return self.cross_extra_latency_ms + (
-            8 * self.cross_bytes(op, input_bytes, tp_size)
+            8
+            * self.cross_bytes(op, input_bytes, tp_size)
             / (self.cross_extra_bandwidth_gbps * 1_000_000)
         )
+
+
+@dataclass
+class TPComputeStats:
+    input_compute_ms: float = 0.0
+    requested_delay_ms: float = 0.0
+    actual_delay_ms: float = 0.0
+
+
+@dataclass
+class TPCollectiveStats:
+    total_ms: float = 0.0
+    extra_total_ms: float = 0.0
+    actual_extra_total_ms: float = 0.0
+    cross_bytes_total: int = 0
 
 
 class TPComputeDelay:
     """Stretch local decoder compute before its two TP all-reduces.
 
-CodeLlama/Llama decoder layers have one all-reduce in attention's o_proj and
-one in MLP's down_proj. Stream callbacks mark the beginning and end of each
-local compute segment without synchronizing the device on the caller thread.
-"""
+    CodeLlama/Llama decoder layers have one all-reduce in attention's o_proj and
+    one in MLP's down_proj. Stream callbacks mark the beginning and end of each
+    local compute segment without synchronizing the device on the caller thread.
+    """
 
     def __init__(self, model: Any, scale: float, stream_delay: TPStreamDelay) -> None:
         inner = getattr(model, "model", model)
@@ -122,9 +143,7 @@ local compute segment without synchronizing the device on the caller thread.
         self.handles: list[Any] = []
         self.segment: list[float] | None = None
         self.collectives_in_layer = 0
-        self.input_compute_ms = 0.0
-        self.requested_delay_ms = 0.0
-        self.actual_delay_ms = 0.0
+        self.stats = TPComputeStats()
         self.sleep_overhead_ms = 0.0
         self.finished_layers = 0
         self.active = False
@@ -146,11 +165,21 @@ local compute segment without synchronizing the device on the caller thread.
     def reset(self) -> None:
         self.segment = None
         self.collectives_in_layer = 0
-        self.input_compute_ms = 0.0
-        self.requested_delay_ms = 0.0
-        self.actual_delay_ms = 0.0
+        self.stats = TPComputeStats()
         self.finished_layers = 0
         self.active = self.scale > 1
+
+    @property
+    def input_compute_ms(self) -> float:
+        return self.stats.input_compute_ms
+
+    @property
+    def requested_delay_ms(self) -> float:
+        return self.stats.requested_delay_ms
+
+    @property
+    def actual_delay_ms(self) -> float:
+        return self.stats.actual_delay_ms
 
     def _begin_segment(self) -> None:
         if self.segment is not None:
@@ -182,6 +211,7 @@ local compute segment without synchronizing the device on the caller thread.
         if self.segment is None:
             raise RuntimeError("TP compute segment was not started")
         segment = self.segment
+        stats = self.stats
         self.segment = None
 
         def stretch_segment() -> None:
@@ -197,9 +227,9 @@ local compute segment without synchronizing the device on the caller thread.
                 self.sleep_overhead_ms = (
                     0.75 * self.sleep_overhead_ms + 0.25 * overhead_ms
                 )
-            self.input_compute_ms += base_ms
-            self.requested_delay_ms += requested_ms
-            self.actual_delay_ms += actual_ms
+            stats.input_compute_ms += base_ms
+            stats.requested_delay_ms += requested_ms
+            stats.actual_delay_ms += actual_ms
 
         self.stream_delay.enqueue(stretch_segment)
 
@@ -236,14 +266,30 @@ class TPCollectiveDelay:
         self.tp_size = tp_size
         self.stream_delay = stream_delay
         self.compute_delay: TPComputeDelay | None = None
-        self.total_ms = 0.0
-        self.extra_total_ms = 0.0
-        self.actual_extra_total_ms = 0.0
+        self.stats = TPCollectiveStats()
         self.sleep_overhead_ms = 0.0
-        self.cross_bytes_total = 0
         self.active = False
         self.counts = {"all_reduce": 0, "all_gather": 0, "reduce_scatter": 0}
         self.originals: dict[str, Callable[..., Any]] = {}
+
+    def reset(self) -> None:
+        self.stats = TPCollectiveStats()
+
+    @property
+    def total_ms(self) -> float:
+        return self.stats.total_ms
+
+    @property
+    def extra_total_ms(self) -> float:
+        return self.stats.extra_total_ms
+
+    @property
+    def actual_extra_total_ms(self) -> float:
+        return self.stats.actual_extra_total_ms
+
+    @property
+    def cross_bytes_total(self) -> int:
+        return self.stats.cross_bytes_total
 
     def install(self) -> None:
         for op in self.counts:
@@ -264,6 +310,7 @@ class TPCollectiveDelay:
                 extra_ms = self.config.extra_ms(
                     _op, input_.numel() * input_.element_size(), self.tp_size
                 )
+                stats = self.stats
                 if extra_ms:
                     started = [0.0]
                     self.stream_delay.enqueue(
@@ -284,14 +331,14 @@ class TPCollectiveDelay:
                             self.sleep_overhead_ms = (
                                 0.75 * self.sleep_overhead_ms + 0.25 * overhead_ms
                             )
-                        self.actual_extra_total_ms += actual_ms
-                        self.total_ms += elapsed_ms + actual_ms
+                        stats.actual_extra_total_ms += actual_ms
+                        stats.total_ms += elapsed_ms + actual_ms
 
                     self.stream_delay.enqueue(stretch_collective)
                 if self.compute_delay is not None:
                     self.compute_delay.after_collective(_op)
-                self.extra_total_ms += extra_ms
-                self.cross_bytes_total += self.config.cross_bytes(
+                stats.extra_total_ms += extra_ms
+                stats.cross_bytes_total += self.config.cross_bytes(
                     _op, input_.numel() * input_.element_size(), self.tp_size
                 )
                 self.counts[_op] += 1

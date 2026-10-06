@@ -132,9 +132,7 @@ def test_short_sleep_compensates_measured_wakeup_overhead(monkeypatch):
         all_gather=lambda x, dim: x,
         reduce_scatter=lambda x, dim: x,
     )
-    delay = TPCollectiveDelay(
-        comm, TPHeteroConfig((1, 1), 1, 25), 2, StreamDelay()
-    )
+    delay = TPCollectiveDelay(comm, TPHeteroConfig((1, 1), 1, 25), 2, StreamDelay())
     delay.install()
     delay.active = True
     x = torch.empty(1_000_000, dtype=torch.uint8)
@@ -196,9 +194,7 @@ def test_compute_delay_precedes_collectives_and_excludes_comm(monkeypatch):
             return x
 
     comm = Comm()
-    collective = TPCollectiveDelay(
-        comm, TPHeteroConfig((2, 1), 2, None), 2, stream
-    )
+    collective = TPCollectiveDelay(comm, TPHeteroConfig((2, 1), 2, None), 2, stream)
     collective.install()
 
     class Layer(torch.nn.Module):
@@ -211,9 +207,11 @@ def test_compute_delay_precedes_collectives_and_excludes_comm(monkeypatch):
             return x
 
     layer = Layer()
-    model = SimpleNamespace(model=SimpleNamespace(
-        start_layer=0, end_layer=1, layers=torch.nn.ModuleList([layer])
-    ))
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            start_layer=0, end_layer=1, layers=torch.nn.ModuleList([layer])
+        )
+    )
     compute = TPComputeDelay(model, 2, stream)
     compute.install()
     compute.reset()
@@ -228,3 +226,85 @@ def test_compute_delay_precedes_collectives_and_excludes_comm(monkeypatch):
     assert collective.counts["all_reduce"] == 2
     compute.uninstall()
     collective.uninstall()
+
+
+def test_pending_compute_callbacks_keep_their_microbatch_statistics(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr("vllm.distributed.tp_hetero.time.perf_counter", lambda: now[0])
+    monkeypatch.setattr(
+        "vllm.distributed.tp_hetero.time.sleep",
+        lambda s: now.__setitem__(0, now[0] + s),
+    )
+
+    class Stream:
+        def __init__(self):
+            self.pending = []
+
+        def enqueue(self, callback):
+            self.pending.append(callback)
+
+    stream = Stream()
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            start_layer=0,
+            end_layer=1,
+            layers=torch.nn.ModuleList([torch.nn.Identity()]),
+        )
+    )
+    compute = TPComputeDelay(model, 2, stream)
+    batches = []
+    for duration in (0.002, 0.005):
+        compute.reset()
+        batches.append(compute.stats)
+        compute._begin_segment()
+        stream.enqueue(lambda d=duration: now.__setitem__(0, now[0] + d))
+        compute._finish_segment()
+    for callback in stream.pending:
+        callback()
+    assert batches[0].input_compute_ms == pytest.approx(2)
+    assert batches[1].input_compute_ms == pytest.approx(5)
+    assert batches[0].requested_delay_ms == pytest.approx(2)
+    assert batches[1].requested_delay_ms == pytest.approx(5)
+
+
+def test_pending_collective_callbacks_keep_their_microbatch_statistics(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr("vllm.distributed.tp_hetero.time.perf_counter", lambda: now[0])
+    monkeypatch.setattr(
+        "vllm.distributed.tp_hetero.time.sleep",
+        lambda s: now.__setitem__(0, now[0] + s),
+    )
+
+    class Stream:
+        def __init__(self):
+            self.pending = []
+
+        def enqueue(self, callback):
+            self.pending.append(callback)
+
+    stream = Stream()
+
+    def all_reduce(x):
+        stream.enqueue(lambda: now.__setitem__(0, now[0] + 0.001))
+        return x
+
+    comm = SimpleNamespace(
+        all_reduce=all_reduce,
+        all_gather=lambda x, dim: x,
+        reduce_scatter=lambda x, dim: x,
+    )
+    delay = TPCollectiveDelay(comm, TPHeteroConfig((1, 1), 1, 25), 2, stream)
+    delay.install()
+    delay.active = True
+    batches = []
+    for size in (1_000_000, 2_000_000):
+        delay.reset()
+        batches.append(delay.stats)
+        comm.all_reduce(torch.empty(size, dtype=torch.uint8))
+    for callback in stream.pending:
+        callback()
+    assert batches[0].extra_total_ms == pytest.approx(0.32)
+    assert batches[1].extra_total_ms == pytest.approx(0.64)
+    assert batches[0].total_ms == pytest.approx(1.32)
+    assert batches[1].total_ms == pytest.approx(1.64)
+    delay.uninstall()

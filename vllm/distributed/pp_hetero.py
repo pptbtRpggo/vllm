@@ -81,11 +81,15 @@ class PPNetwork:
     def from_json(cls, text: str) -> PPNetwork:
         data = json.loads(text)
         if not isinstance(data, dict) or set(data) - {
-            "bandwidth_gbps", "latency_ms", "mode",
-            "native_bandwidth_gbps", "native_latency_ms",
+            "bandwidth_gbps",
+            "latency_ms",
+            "mode",
+            "native_bandwidth_gbps",
+            "native_latency_ms",
         }:
             raise ValueError(
-                "PP network accepts mode and target/native bandwidth and latency matrices"
+                "PP network accepts mode and target/native bandwidth "
+                "and latency matrices"
             )
         mode = data.get("mode", "extra")
         if mode not in ("extra", "target_total"):
@@ -108,8 +112,10 @@ class PPNetwork:
         matrices = [("bandwidth", bandwidth), ("latency", latency)]
         if mode == "target_total":
             matrices.extend(
-                [("native_bandwidth", native_bandwidth),
-                 ("native_latency", native_latency)]
+                [
+                    ("native_bandwidth", native_bandwidth),
+                    ("native_latency", native_latency),
+                ]
             )
         for name, matrix in matrices:
             if not isinstance(matrix, list) or len(matrix) != size:
@@ -145,7 +151,9 @@ class PPNetwork:
             tuple(map(tuple, bandwidth)),
             tuple(map(tuple, latency)),
             mode,
-            tuple(map(tuple, native_bandwidth)) if native_bandwidth is not None else None,
+            tuple(map(tuple, native_bandwidth))
+            if native_bandwidth is not None
+            else None,
             tuple(map(tuple, native_latency)) if native_latency is not None else None,
         )
 
@@ -260,10 +268,8 @@ def execute_pp_compute(
     )
     if mode not in ("shape-affine", "layer-measured"):
         raise ValueError(f"unknown compute profiling mode: {mode}")
-    simulate_layers = mode == "layer-measured" and any(
-        s > 1 for s in hetero.compute_scales
-    )
     scale = hetero.compute_scale(rank)
+    simulate_layers = mode == "layer-measured" and scale > 1
     if tracer is not None:
         return tracer.measure_stretched_compute(
             fn,
@@ -273,6 +279,8 @@ def execute_pp_compute(
             compute_scale=scale,
             simulate_layers=simulate_layers,
         )
+    if scale == 1:
+        return fn(), {}
     if simulate_layers:
         from vllm.distributed.pp_layer_trace import (
             PPLayerTimer,
@@ -430,20 +438,21 @@ class PPHeteroConfig:
     ) -> float:
         if not math.isfinite(elapsed_ms) or elapsed_ms < 0:
             raise ValueError("PP elapsed_ms must be finite and >= 0")
-        if self.network is not None:
-            extra_ms = self.transfer_ms(from_rank, payload_bytes)
-            if extra_ms:
-                time.sleep(extra_ms / 1000)
-            return elapsed_ms + extra_ms
-        scale = self.comm_scale(from_rank)
-        if scale == 1:
-            return elapsed_ms
-        transfer_ms = self.transfer_ms(from_rank, payload_bytes)
-        assert transfer_ms is not None  # Validated by __post_init__.
-        extra_ms = transfer_ms * (1 - 1 / scale)
+        extra_ms = self.extra_transfer_ms(from_rank, payload_bytes)
         if extra_ms > 0:
             time.sleep(extra_ms / 1000)
         return elapsed_ms + extra_ms
+
+    def extra_transfer_ms(self, from_rank: int, payload_bytes: int) -> float:
+        """Pure delay calculation, usable from a stream-ordered callback."""
+        if self.network is not None:
+            return self.transfer_ms(from_rank, payload_bytes) or 0.0
+        scale = self.comm_scale(from_rank)
+        if scale == 1:
+            return 0.0
+        transfer_ms = self.transfer_ms(from_rank, payload_bytes)
+        assert transfer_ms is not None  # Validated by __post_init__.
+        return transfer_ms * (1 - 1 / scale)
 
     def stretch_send(
         self, pp_rank: int, elapsed_ms: float, *, payload_bytes: int

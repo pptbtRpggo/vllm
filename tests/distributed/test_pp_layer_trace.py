@@ -335,7 +335,7 @@ def test_untraced_layer_mock_rejects_unsupported_execution(
         )
 
 
-def test_untraced_fast_rank_keeps_mock_hooks_when_other_rank_is_slow(monkeypatch):
+def test_untraced_fast_rank_skips_mock_hooks_when_other_rank_is_slow(monkeypatch):
     from vllm.distributed.pp_hetero import PPHeteroConfig, execute_pp_compute
 
     model, layers, now = model_and_clock(monkeypatch)
@@ -358,6 +358,5 @@ def test_untraced_fast_rank_keeps_mock_hooks_when_other_rank_is_slow(monkeypatch
             0,
         )
         assert value == 2
-        assert worker._pp_layer_mock_timer.wall_timing
-        assert worker._pp_layer_mock_timer.mock_delay_ms == 0
+        assert not hasattr(worker, "_pp_layer_mock_timer")
     assert now[0] == pytest.approx(0.010)

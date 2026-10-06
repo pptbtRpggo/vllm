@@ -5,19 +5,18 @@
 Enabled by ``VLLM_PP_STAGE_TRACE=/path/to/dir``. Each PP rank writes
 ``pp_stage_pp{rank}_tp{tp}.jsonl`` with one record per forward step:
 
-* ``compute_ms`` — local stage forward (all layers on this rank, plus
-  logits on the last rank). CUDA-event timed when CUDA is available.
-* ``recv_ms`` / ``send_ms`` — blocking wait for the previous/next rank's
-  intermediate-tensor transfer. Timed with CPU clock + device sync,
-  because NCCL runs on its own stream.
+* ``compute_ms`` — local stage forward, including logits on the last rank.
+* ``recv_ms`` / ``send_ms`` — intermediate-tensor communication windows,
+  including any mock delay and peer waiting.
 
-Tracing additionally synchronizes the device so each JSONL line is
-self-contained. The ordinary NCCL send path in this checkout already inserts
-a wait on the compute stream; tracing adds host synchronization overhead.
-Leave the env unset for production.
+Ascend's PP worker uses stream-ordered CPU callbacks and a background writer.
+Its records are tagged ``timing_source=stream_callback``; no per-step device
+synchronization is added. CUDA and CPU callers retain the synchronous timing
+methods below. Tracing itself adds instrumentation overhead in either path.
 
 ``VLLM_PP_COMPUTE_MODEL=layer-measured`` additionally records every local
-decoder layer using device events. The default shape-affine mode is stage-only.
+decoder layer, using callbacks on Ascend and device events in the synchronous
+path. The default shape-affine mode is stage-only.
 """
 
 from __future__ import annotations
@@ -146,6 +145,7 @@ class PPStageTraceRecord:
     final_norm_ms: float | None = None
     runner_overhead_ms: float | None = None
     comm_delay_in_window: bool = False
+    timing_source: str = "synchronized"
 
 
 class PPStageTracer:
@@ -189,6 +189,7 @@ class PPStageTracer:
         self._path = path
         # Kept open across steps; the worker calls close() on shutdown.
         self._fp = open(path, "a", encoding="utf-8")  # noqa: SIM115
+        self._async_writer = None
         self._step = 0
         self.trace_id = uuid.uuid4().hex
         self.trace_session = os.environ.get("VLLM_PP_TRACE_SESSION")
@@ -365,6 +366,66 @@ class PPStageTracer:
             comm_scale=comm_scale,
         )
 
+    def reserve_async_step(
+        self,
+        scheduler_output,
+        *,
+        batch: dict,
+        batch_id: str | None,
+        start_layer: int | None,
+        end_layer: int | None,
+        compute_scale: float,
+        comm_scale: float,
+    ) -> PPStageTraceRecord:
+        """Snapshot CPU metadata now; callbacks fill this step's own timings."""
+        from vllm.distributed.async_trace import AsyncTraceWriter
+
+        if self._async_writer is None:
+            self._async_writer = AsyncTraceWriter(self._write_record)
+        self._async_writer.check()
+        rec = PPStageTraceRecord(
+            step=self._step,
+            ts_unix=time.time(),
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            num_tokens=scheduler_output.total_num_scheduled_tokens,
+            num_reqs=len(scheduler_output.num_scheduled_tokens),
+            **batch,
+            compute_ms=0.0,
+            recv_ms=None,
+            send_ms=None,
+            recv_bytes=None,
+            send_bytes=None,
+            compute_scale=compute_scale,
+            comm_scale=comm_scale,
+            is_warmup=self.is_warmup,
+            trace_id=self.trace_id,
+            trace_session=self.trace_session,
+            device_id=self.device_id,
+            clock_domain=self.clock_domain,
+            batch_id=batch_id,
+            compute_model=self.compute_model,
+            timing_source="stream_callback",
+        )
+        self._step += 1
+        return rec
+
+    def submit_async_record(self, record: PPStageTraceRecord) -> None:
+        self._async_writer.submit(record)
+
+    def _write_record(self, rec: PPStageTraceRecord) -> None:
+        self._fp.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
+        self._fp.flush()
+        for field in self._timing_sums:
+            value = getattr(rec, field)
+            if value is not None:
+                self._timing_sums[field] += value
+                self._timing_counts[field] += 1
+
     def record(
         self,
         *,
@@ -427,13 +488,7 @@ class PPStageTracer:
             **self._layer_measurement,
             **self._comm_windows,
         )
-        self._fp.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
-        self._fp.flush()
-        for field in self._timing_sums:
-            value = getattr(rec, field)
-            if value is not None:
-                self._timing_sums[field] += value
-                self._timing_counts[field] += 1
+        self._write_record(rec)
         self._step += 1
         self._comm_windows.clear()
         self._layer_measurement.clear()
@@ -442,22 +497,26 @@ class PPStageTracer:
     def close(self) -> None:
         if self._fp.closed:
             return
-        if self._step:
-            means = {
-                field: f"{self._timing_sums[field] / count:.3f}" if count else "n/a"
-                for field, count in self._timing_counts.items()
-            }
-            logger.info(
-                "PP stage tracer pp_rank=%s: %d steps, "
-                "mean compute_ms=%s recv_ms=%s send_ms=%s -> %s",
-                self.pp_rank,
-                self._step,
-                means["compute_ms"],
-                means["recv_ms"],
-                means["send_ms"],
-                self._path,
-            )
-        self._fp.close()
+        try:
+            if self._async_writer is not None:
+                self._async_writer.close()
+            if self._step:
+                means = {
+                    field: f"{self._timing_sums[field] / count:.3f}" if count else "n/a"
+                    for field, count in self._timing_counts.items()
+                }
+                logger.info(
+                    "PP stage tracer pp_rank=%s: %d steps, "
+                    "mean compute_ms=%s recv_ms=%s send_ms=%s -> %s",
+                    self.pp_rank,
+                    self._step,
+                    means["compute_ms"],
+                    means["recv_ms"],
+                    means["send_ms"],
+                    self._path,
+                )
+        finally:
+            self._fp.close()
 
 
 def maybe_create_pp_stage_tracer(
