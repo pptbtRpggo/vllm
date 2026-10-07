@@ -62,6 +62,9 @@ class DeferredStream:
         self.enqueue(lambda: host.__setitem__(slice(None), buffer))
         return host
 
+    def elapsed_time(self, start, end):
+        return end.timestamp - start.timestamp
+
     def durations(self, host):
         return host[1] - host[0], host[2] - host[1]
 
@@ -133,3 +136,36 @@ def test_stage_buffer_reuse_orders_snapshot_before_next_execution():
         snapshots.append(stream.snapshot(execution._compute_buffer))
     stream.drain()
     assert [stream.durations(h) for h in snapshots] == pytest.approx([(2, 4), (5, 10)])
+
+
+def test_background_layer_trace_uses_completed_event_reader():
+    stream = DeferredStream()
+    native_event = stream.event
+
+    def event():
+        result = native_event()
+
+        def forbidden(_end):
+            pytest.fail("background trace must not drain TorchNPU queues")
+
+        result.elapsed_time = forbidden
+        return result
+
+    stream.event = event
+
+    class Layer(torch.nn.Module):
+        def forward(self):
+            stream.work(0.002)
+
+    timer = SimpleNamespace(layers={0: Layer()}, endpoints={})
+    step = PPStreamStep()
+    execution = PPStreamExecution(stream)
+    execution.compute(timer.layers[0], step, 1, "layer-measured", timer)
+    pending = []
+    tracer = SimpleNamespace(
+        submit_ready_record=lambda event, resolve: pending.append((event, resolve))
+    )
+    execution.finish_trace(step, SimpleNamespace(), tracer, True)
+    stream.drain()
+    assert pending[0][0].query()
+    assert pending[0][1]().layer_compute_ms == pytest.approx({"0": 2})

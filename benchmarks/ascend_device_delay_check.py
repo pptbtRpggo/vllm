@@ -80,6 +80,13 @@ def main():
         )
         ordered_rows.append(dict(mode=label, base_ms=base, wait_ms=delay))
     runtime.calibrate_clock()
+    start = runtime.event()
+    runtime.wait_ms(20)
+    end = runtime.event()
+    end.synchronize()  # No other work pending at this test boundary.
+    event_read = runtime.elapsed_time(start, end)
+    reference = start.elapsed_time(end)
+    assert abs(event_read - reference) < 0.01 and 19.5 <= event_read <= 24
     print(json.dumps(dict(rows=rows, ordered_rows=ordered_rows)), flush=True)
     Path(args.output).write_text(
         json.dumps(
@@ -87,6 +94,8 @@ def main():
                 rows=rows,
                 ordered_rows=ordered_rows,
                 clock_error_ns=runtime.clock_error_ns,
+                event_elapsed_ms=event_read,
+                event_reference_ms=reference,
             ),
             indent=2,
         )

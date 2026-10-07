@@ -8,6 +8,7 @@ kernel arguments and persistent timing buffers are compatible with NPU Graph.
 
 from __future__ import annotations
 
+import ctypes
 import math
 import os
 import time
@@ -39,6 +40,7 @@ class AscendDeviceDelay:
     def __init__(self) -> None:
         self.library = None
         self.wait_buffer = None
+        self._elapsed_api = None
         self.clock_offset_ns: int | None = None
         self.clock_error_ns: int | None = None
 
@@ -105,6 +107,37 @@ class AscendDeviceDelay:
         event = torch.npu.Event(enable_timing=True)
         event.record()
         return event
+
+    def elapsed_time(self, start, end) -> float:
+        """Read completed trace events without draining TorchNPU's CPU queue.
+
+        TorchNPU Event.elapsed_time empties all submission queues even when
+        these events are complete. In a background reader that can wait for
+        later collectives while holding the GIL needed by their producer.
+        The ACL call only reads this pair; CDLL releases the GIL for the call.
+        """
+        if not start.query() or not end.query():
+            raise RuntimeError("trace events must be complete before reading")
+        if self._elapsed_api is None:
+            library = ctypes.CDLL("libascendcl.so")
+            self._elapsed_api = library.aclrtEventElapsedTime
+            self._elapsed_api.argtypes = [
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ]
+            self._elapsed_api.restype = ctypes.c_int
+        result = ctypes.c_float()
+        error = self._elapsed_api(
+            ctypes.byref(result),
+            ctypes.c_void_p(start.npu_event),
+            ctypes.c_void_p(end.npu_event),
+        )
+        if error:
+            raise RuntimeError(f"ACL event elapsed-time read failed: {error}")
+        if not math.isfinite(result.value) or result.value < 0:
+            raise RuntimeError("invalid ACL event elapsed time")
+        return result.value
 
     @staticmethod
     def snapshot(buffer):

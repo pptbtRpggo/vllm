@@ -175,9 +175,11 @@ class TPAscendWorker(NPUWorker):
                     "compute_extra_requested_ms": sum(v[0] for v in values)
                     * (metadata["compute_scale"] - 1),
                     "collective_observed_with_extra_ms": sum(
-                        a.elapsed_time(b) for a, b in events
+                        self._tp_stream_delay.elapsed_time(a, b) for a, b in events
                     ),
-                    "forward_wall_ms": started.elapsed_time(finished),
+                    "forward_wall_ms": self._tp_stream_delay.elapsed_time(
+                        started, finished
+                    ),
                     "timing_source": "npu_event_device_clock",
                 }
 

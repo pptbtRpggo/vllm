@@ -115,7 +115,7 @@ class PPStreamExecution:
             record.comm_delay_in_window = True
             if layer_measured:
                 measured = {
-                    index: start.elapsed_time(end)
+                    index: self.stream.elapsed_time(start, end)
                     for index, (start, end) in step.layer_events.items()
                 }
                 # This is explicit attribution of an observed stage wait, not

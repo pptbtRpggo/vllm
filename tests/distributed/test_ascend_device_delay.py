@@ -63,6 +63,31 @@ def test_zero_wait_does_not_load_library_or_allocate(monkeypatch):
     runtime.wait_ms(0)
 
 
+def test_completed_event_read_avoids_torchnpu_queue_drain():
+    runtime = AscendDeviceDelay()
+
+    def forbidden(_other):
+        pytest.fail("TorchNPU elapsed_time drains the shared submission queue")
+
+    start = SimpleNamespace(npu_event=123, query=lambda: True, elapsed_time=forbidden)
+    end = SimpleNamespace(npu_event=456, query=lambda: True)
+
+    def read(result, first, last):
+        assert first.value == 123 and last.value == 456
+        result._obj.value = 20.125
+        return 0
+
+    runtime._elapsed_api = read
+    assert runtime.elapsed_time(start, end) == pytest.approx(20.125)
+    start.query = lambda: False
+    with pytest.raises(RuntimeError, match="complete"):
+        runtime.elapsed_time(start, end)
+    start.query = lambda: True
+    runtime._elapsed_api = lambda *_args: 1
+    with pytest.raises(RuntimeError, match="ACL"):
+        runtime.elapsed_time(start, end)
+
+
 def test_old_library_fails_with_rebuild_instruction(monkeypatch):
     import torch
 
