@@ -188,9 +188,14 @@ class Experiment:
             block_size=128,
             max_model_len=4096,
             max_num_seqs=256,
-            max_num_batched_tokens=2048,
+            max_num_batched_tokens=getattr(args, "max_num_batched_tokens", 2048),
             gpu_memory_utilization=0.85,
         )
+        if (
+            type(self.serving["max_num_batched_tokens"]) is not int
+            or self.serving["max_num_batched_tokens"] < self.serving["max_num_seqs"]
+        ):
+            raise ValueError("batch token budget must be an integer >= max_num_seqs")
         self.data = {
             name: read_samples(Path(args.data) / f"{name}.jsonl")
             for name in ("warmup", "profile", "evaluation")
@@ -276,7 +281,7 @@ class Experiment:
             "--max-num-seqs",
             "256",
             "--max-num-batched-tokens",
-            "2048",
+            str(self.serving["max_num_batched_tokens"]),
             "--block-size",
             "128",
             "--gpu-memory-utilization",
@@ -478,6 +483,7 @@ def main():
     parser.add_argument("--compute-scales")
     parser.add_argument("--served-model-name", default="pp-sla-34b")
     parser.add_argument("--kv-blocks", type=int, default=1024)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
     parser.add_argument(
         "--mode", choices=("profile", "pilot", "sweep"), default="pilot"
     )

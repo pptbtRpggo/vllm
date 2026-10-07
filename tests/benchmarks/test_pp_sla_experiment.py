@@ -196,15 +196,15 @@ def qwen_experiment(module, tmp_path, model_layers=28, **overrides):
 
 
 @pytest.mark.parametrize(
-    "pp_size,layers,scales,parts,visible",
+    "pp_size,layers,scales,parts,visible,budget",
     [
-        (2, 28, "2,4", [14, 14], "0,1"),
-        (2, 28, None, [14, 14], "0,1"),
-        (4, 48, None, [12, 12, 12, 12], "0,1,2,3"),
+        (2, 28, "2,4", [14, 14], "0,1", 512),
+        (2, 28, None, [14, 14], "0,1", 4096),
+        (4, 48, None, [12, 12, 12, 12], "0,1,2,3", 2048),
     ],
 )
 def test_launch_uses_model_layers_and_pp_devices(
-    experiment, tmp_path, monkeypatch, pp_size, layers, scales, parts, visible
+    experiment, tmp_path, monkeypatch, pp_size, layers, scales, parts, visible, budget
 ):
     exp = qwen_experiment(
         experiment,
@@ -212,6 +212,7 @@ def test_launch_uses_model_layers_and_pp_devices(
         model_layers=layers,
         pp_size=pp_size,
         compute_scales=scales,
+        max_num_batched_tokens=budget,
     )
     assert exp.uniform_partition == parts
     captured = {}
@@ -255,6 +256,8 @@ def test_launch_uses_model_layers_and_pp_devices(
         pass
     command = captured["command"]
     assert command[command.index("--pipeline-parallel-size") + 1] == str(pp_size)
+    assert command[command.index("--max-num-batched-tokens") + 1] == str(budget)
+    assert exp.serving["max_num_batched_tokens"] == budget
     assert captured["env"]["ASCEND_RT_VISIBLE_DEVICES"] == visible
     assert captured["env"]["VLLM_PP_HETERO"] == (
         "2.0,4.0" if pp_size == 2 else "1.0,1.0,2.0,4.0"
