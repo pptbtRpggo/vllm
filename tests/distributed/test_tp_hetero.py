@@ -159,3 +159,41 @@ def test_collective_delay_and_trace_are_ordered_after_native_communication():
         s.events[0][0].elapsed_time(s.events[0][1]) for s in snapshots
     ] == pytest.approx([1.32, 1.64])
     delay.uninstall()
+
+
+def test_target_network_subtracts_native_collective_cost_and_never_accelerates(
+    monkeypatch,
+):
+    import json
+
+    native = {
+        "all_reduce": {"bandwidth_gbps": 100, "latency_ms": 0.04},
+        "all_gather": {"bandwidth_gbps": 200, "latency_ms": 0.02},
+        "reduce_scatter": {"bandwidth_gbps": 50, "latency_ms": 0.01},
+    }
+    data = dict(
+        tp_size=4, cross_group_size=2, bandwidth_gbps=25, native_collectives=native
+    )
+    monkeypatch.setenv("VLLM_TP_CROSS_GROUP_SIZE", "2")
+    monkeypatch.setenv("VLLM_TP_CROSS_NETWORK", json.dumps(data))
+    config = TPHeteroConfig.from_env(4)
+    assert config.extra_ms("all_reduce", 1_000_000, 4) == pytest.approx(0.2)
+    assert config.extra_ms("all_gather", 1_000_000, 4) == pytest.approx(0.54)
+    assert config.extra_ms("reduce_scatter", 1_000_000, 4) == pytest.approx(0.07)
+    assert config.extra_ms("all_reduce", 1000, 4) == 0
+    worker = SimpleNamespace(worker_cls="vllm_ascend.worker.worker.NPUWorker")
+    maybe_override_pp_worker(worker)
+    assert worker.worker_cls == TP_ASCEND_WORKER
+    monkeypatch.setenv("VLLM_TP_CROSS_EXTRA_BANDWIDTH_GBPS", "25")
+    with pytest.raises(ValueError, match="cannot be combined"):
+        TPHeteroConfig.from_env(4)
+    monkeypatch.delenv("VLLM_TP_CROSS_EXTRA_BANDWIDTH_GBPS")
+    data["tp_size"] = 2
+    monkeypatch.setenv("VLLM_TP_CROSS_NETWORK", json.dumps(data))
+    with pytest.raises(ValueError, match="topology"):
+        TPHeteroConfig.from_env(4)
+    data["tp_size"] = 4
+    del data["native_collectives"]["all_gather"]
+    monkeypatch.setenv("VLLM_TP_CROSS_NETWORK", json.dumps(data))
+    with pytest.raises(ValueError, match="three collectives"):
+        TPHeteroConfig.from_env(4)

@@ -2,12 +2,14 @@
 """Software-only TP heterogeneity for single-host Ascend experiments.
 
 Compute delay precedes each decoder-layer all-reduce. A cross-group delay
-follows each TP collective. Neither changes NPU compute capability or HCCL's
-physical bandwidth.
+follows each TP collective. Target-total networks reuse the PP formula and
+subtract a measured native collective curve. Neither changes NPU compute
+capability or HCCL's physical bandwidth.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from dataclasses import dataclass, field
@@ -16,7 +18,7 @@ from typing import Any
 import torch
 
 from vllm.distributed.ascend_device_delay import AscendDeviceDelay
-from vllm.distributed.pp_hetero import parse_scale_list
+from vllm.distributed.pp_hetero import PPNetwork, parse_scale_list
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,7 @@ class TPHeteroConfig:
     cross_group_size: int
     cross_extra_bandwidth_gbps: float | None
     cross_extra_latency_ms: float = 0.0
+    cross_networks: tuple[tuple[str, PPNetwork], ...] = ()
 
     @classmethod
     def from_env(cls, tp_size: int) -> TPHeteroConfig:
@@ -35,7 +38,45 @@ class TPHeteroConfig:
         latency_ms = float(raw_latency) if raw_latency else 0.0
         raw_group_size = os.getenv("VLLM_TP_CROSS_GROUP_SIZE")
         group_size = int(raw_group_size) if raw_group_size else tp_size
-        config = cls(scales, group_size, bandwidth, latency_ms)
+        networks = ()
+        raw_network = os.getenv("VLLM_TP_CROSS_NETWORK")
+        if raw_network:
+            data = json.loads(raw_network)
+            if set(data) != {
+                "tp_size",
+                "cross_group_size",
+                "bandwidth_gbps",
+                "native_collectives",
+            }:
+                raise ValueError(
+                    "TP target network requires topology, bandwidth "
+                    "and native collectives"
+                )
+            if data["tp_size"] != tp_size or data["cross_group_size"] != group_size:
+                raise ValueError("TP native calibration topology does not match")
+            native = data["native_collectives"]
+            if set(native) != {"all_reduce", "all_gather", "reduce_scatter"}:
+                raise ValueError(
+                    "TP native calibration must cover all three collectives"
+                )
+            pairs = []
+            for op, curve in native.items():
+                if set(curve) != {"bandwidth_gbps", "latency_ms"}:
+                    raise ValueError("TP native curve requires bandwidth and latency")
+                network = PPNetwork.from_json(
+                    json.dumps(
+                        dict(
+                            mode="target_total",
+                            bandwidth_gbps=[[data["bandwidth_gbps"]], []],
+                            latency_ms=[[0], []],
+                            native_bandwidth_gbps=[[curve["bandwidth_gbps"]], []],
+                            native_latency_ms=[[curve["latency_ms"]], []],
+                        )
+                    )
+                )
+                pairs.append((op, network))
+            networks = tuple(pairs)
+        config = cls(scales, group_size, bandwidth, latency_ms, networks)
         config.validate(tp_size)
         return config
 
@@ -53,6 +94,16 @@ class TPHeteroConfig:
             or self.cross_extra_latency_ms < 0
         ):
             raise ValueError("TP cross-group extra latency must be finite and >= 0")
+        if self.cross_networks:
+            if (
+                self.cross_extra_bandwidth_gbps is not None
+                or self.cross_extra_latency_ms
+            ):
+                raise ValueError(
+                    "TP target network cannot be combined with extra network settings"
+                )
+            if not 0 < self.cross_group_size < tp_size:
+                raise ValueError("TP cross-group size must split the TP ranks")
         if self.cross_extra_bandwidth_gbps is not None:
             if (
                 not math.isfinite(self.cross_extra_bandwidth_gbps)
@@ -76,7 +127,7 @@ class TPHeteroConfig:
         This is an idealized collective lower bound, not HCCL's actual route.
         Both groups execute the same added delay to avoid rank skew.
         """
-        if self.cross_extra_bandwidth_gbps is None:
+        if self.cross_extra_bandwidth_gbps is None and not self.cross_networks:
             return 0
         left = self.cross_group_size
         right = tp_size - left
@@ -89,6 +140,13 @@ class TPHeteroConfig:
         raise ValueError(f"unsupported TP collective: {op}")
 
     def extra_ms(self, op: str, input_bytes: int, tp_size: int) -> float:
+        if self.cross_networks:
+            for name, network in self.cross_networks:
+                if name == op:
+                    return network.delay_ms(
+                        0, 1, self.cross_bytes(op, input_bytes, tp_size)
+                    )
+            raise ValueError(f"missing native TP calibration for {op}")
         if self.cross_extra_bandwidth_gbps is None:
             return self.cross_extra_latency_ms
         return self.cross_extra_latency_ms + (

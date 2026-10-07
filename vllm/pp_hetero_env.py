@@ -33,16 +33,23 @@ def maybe_override_pp_worker(parallel_config: Any) -> None:
         os.environ.get("VLLM_TP_COMPUTE_SCALES")
         or os.environ.get("VLLM_TP_CROSS_EXTRA_BANDWIDTH_GBPS")
         or os.environ.get("VLLM_TP_CROSS_EXTRA_LATENCY_MS")
+        or os.environ.get("VLLM_TP_CROSS_NETWORK")
     )
     if tp_requested and hetero_env_requested():
         raise ValueError("TP and PP heterogeneity settings cannot be combined")
     if not tp_requested and not hetero_env_requested():
         return
-    if tp_requested and getattr(parallel_config, "worker_cls", None) == TP_ASCEND_WORKER:
+    if (
+        tp_requested
+        and getattr(parallel_config, "worker_cls", None) == TP_ASCEND_WORKER
+    ):
         return
     # The platform has already resolved "auto". Replace only its built-in
     # worker; custom worker names/classes must not be matched by substring.
-    if getattr(parallel_config, "worker_cls", None) != "vllm_ascend.worker.worker.NPUWorker":
+    if (
+        getattr(parallel_config, "worker_cls", None)
+        != "vllm_ascend.worker.worker.NPUWorker"
+    ):
         if tp_requested:
             raise ValueError("TP heterogeneity currently requires Ascend NPUWorker")
         return
