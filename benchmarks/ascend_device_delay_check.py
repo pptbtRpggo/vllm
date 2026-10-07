@@ -53,10 +53,43 @@ def main():
         )
         assert base > 0 and 2.9 <= delay / base <= 3.5, (label, base, delay)
         rows.append(dict(mode=label, base_ms=base, wait_ms=delay, ratio=delay / base))
+
+    def ordered_wait():
+        runtime.begin_interval(buffer)
+        runtime.wait_ms(20)
+        runtime.end_interval(buffer, factor=1)
+
+    # A known device interval checks queue ordering independently of matmul
+    # submission latency. Repeat after capture to check current replay timing.
+    for _ in range(3):
+        ordered_wait()
+    torch.npu.synchronize()
+    wait_graph = torch.npu.NPUGraph()
+    with torch.npu.graph(wait_graph):
+        ordered_wait()
+    ordered_rows = []
+    for label in ("eager", "graph", "eager", "graph"):
+        (ordered_wait if label == "eager" else wait_graph.replay)()
+        host = runtime.snapshot(buffer)
+        runtime.event().synchronize()  # Benchmark boundary only.
+        base, delay = runtime.durations(host)
+        assert 19.5 <= base <= 24 and 0.99 <= delay / base <= 1.05, (
+            label,
+            base,
+            delay,
+        )
+        ordered_rows.append(dict(mode=label, base_ms=base, wait_ms=delay))
     runtime.calibrate_clock()
-    print(json.dumps(rows), flush=True)
+    print(json.dumps(dict(rows=rows, ordered_rows=ordered_rows)), flush=True)
     Path(args.output).write_text(
-        json.dumps(dict(rows=rows, clock_error_ns=runtime.clock_error_ns), indent=2)
+        json.dumps(
+            dict(
+                rows=rows,
+                ordered_rows=ordered_rows,
+                clock_error_ns=runtime.clock_error_ns,
+            ),
+            indent=2,
+        )
     )
 
 

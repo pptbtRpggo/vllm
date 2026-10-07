@@ -17,5 +17,6 @@ compiler=${cann_root}/bin/bisheng
 "$compiler" --cce-fatobj-link -L"$cann_root/lib64" \
   "$output_dir/hetero_delay.o" --shared \
   -lruntime -lstdc++ -lascendcl -lm -ldl \
-  -o "$output_dir/libhetero_delay.so"
-echo "$output_dir/libhetero_delay.so"
+  -o "$output_dir/libhetero_delay_kernels.so"
+"${PYTHON:-python3}" "$repo_root/benchmarks/build_ascend_delay.py" \
+  "$output_dir" "$cann_root"

@@ -8,7 +8,6 @@ kernel arguments and persistent timing buffers are compatible with NPU Graph.
 
 from __future__ import annotations
 
-import ctypes
 import math
 import os
 import time
@@ -39,6 +38,7 @@ def prepare_ascend_full_graph(worker) -> None:
 class AscendDeviceDelay:
     def __init__(self) -> None:
         self.library = None
+        self.wait_buffer = None
         self.clock_offset_ns: int | None = None
         self.clock_error_ns: int | None = None
 
@@ -53,21 +53,17 @@ class AscendDeviceDelay:
             )
         if "910B" not in torch.npu.get_device_name().upper():
             raise ValueError("device delay currently supports the 910B counter only")
-        self.library = ctypes.CDLL(path)
-        self.library.launch_mark.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        self.library.launch_stretch.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_uint64,
-            ctypes.c_uint64,
-        ]
-        self.library.launch_wait.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
-        for name in ("launch_mark", "launch_stretch", "launch_wait"):
-            getattr(self.library, name).restype = None
-
-    @staticmethod
-    def stream():
-        return ctypes.c_void_p(torch.npu.current_stream().npu_stream)
+        torch.ops.load_library(path)
+        ops = torch.ops.vllm_ascend_delay
+        try:
+            for name in ("mark", "stretch", "wait"):
+                getattr(ops, name)
+        except AttributeError as error:
+            raise RuntimeError(
+                "Rebuild VLLM_ASCEND_DELAY_LIBRARY with "
+                "benchmarks/build_ascend_delay.sh; queued TorchNPU ops are missing"
+            ) from error
+        self.library = ops
 
     @staticmethod
     def buffer():
@@ -77,7 +73,7 @@ class AscendDeviceDelay:
         self._load()
         if buffer is None:
             buffer = self.buffer()
-        self.library.launch_mark(self.stream(), ctypes.c_void_p(buffer.data_ptr()))
+        self.library.mark(buffer)
         buffer.record_stream(torch.npu.current_stream())
         return buffer
 
@@ -87,9 +83,8 @@ class AscendDeviceDelay:
             raise ValueError("delay factor must be finite and nonnegative")
         if not math.isfinite(extra_ms) or extra_ms < 0:
             raise ValueError("delay must be finite and nonnegative")
-        self.library.launch_stretch(
-            self.stream(),
-            ctypes.c_void_p(buffer.data_ptr()),
+        self.library.stretch(
+            buffer,
             round(factor * 1_000_000),
             math.ceil(extra_ms * CYCLES_PER_MS),
         )
@@ -100,9 +95,10 @@ class AscendDeviceDelay:
             raise ValueError("delay must be finite and nonnegative")
         if milliseconds:
             self._load()
-            self.library.launch_wait(
-                self.stream(), math.ceil(milliseconds * CYCLES_PER_MS)
-            )
+            if self.wait_buffer is None:
+                self.wait_buffer = self.buffer()
+            self.library.wait(self.wait_buffer, math.ceil(milliseconds * CYCLES_PER_MS))
+            self.wait_buffer.record_stream(torch.npu.current_stream())
 
     @staticmethod
     def event():

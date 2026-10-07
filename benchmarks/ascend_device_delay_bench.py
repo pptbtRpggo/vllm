@@ -127,9 +127,9 @@ def run_architecture(args, architecture, warm, samples):
     else:
         command.extend(["--enforce-eager", "--compilation-config", '{"mode":0}'])
     labels = (
-        [f"{args.fixed_mode}_a", f"{args.fixed_mode}_b"]
+        [f"{args.fixed_mode}_{suffix}" for suffix in ("a", "b")[: args.rounds]]
         if args.fixed_mode
-        else list(CASES)
+        else [label for label in CASES if args.rounds == 2 or label.endswith("_a")]
     )
     if args.graph:
         labels = [label for label in labels if not label.startswith("trace_zero")]
@@ -248,6 +248,7 @@ def main():
         "--fixed-mode", choices=["native", "zero", "kernel_zero", "hetero"]
     )
     parser.add_argument("--output-tokens", type=int, default=16)
+    parser.add_argument("--rounds", type=int, choices=[1, 2], default=2)
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--port", type=int, default=18790)
