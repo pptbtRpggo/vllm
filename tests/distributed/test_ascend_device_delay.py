@@ -128,3 +128,54 @@ def test_registered_delay_ops_on_npu():
     ):
         torch.library.opcheck(operation, arguments, test_utils=checks)
     torch.npu.synchronize()  # Test boundary only.
+
+
+def test_pp_direct_submission_preserves_stream_and_delay_arguments(monkeypatch):
+    import torch
+
+    from vllm.distributed import ascend_device_delay as module
+
+    stream = SimpleNamespace(npu_stream=987)
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            current_stream=lambda: stream, get_device_name=lambda: "Ascend910B3"
+        ),
+        raising=False,
+    )
+    monkeypatch.setenv("VLLM_ASCEND_DELAY_LIBRARY", "/built/libhetero_delay.so")
+    calls = []
+
+    def mark(actual_stream, address):
+        calls.append(("mark", actual_stream.value, address.value))
+
+    def stretch(actual_stream, address, factor, cycles):
+        calls.append(("stretch", actual_stream.value, address.value, factor, cycles))
+
+    def wait(actual_stream, cycles):
+        calls.append(("wait", actual_stream.value, cycles))
+
+    library = SimpleNamespace(
+        launch_mark=mark, launch_stretch=stretch, launch_wait=wait
+    )
+    monkeypatch.setattr(module.ctypes, "CDLL", lambda path: library)
+
+    class Buffer:
+        def data_ptr(self):
+            return 123
+
+        def record_stream(self, actual):
+            assert actual is stream
+
+    runtime = AscendDeviceDelay(queued=False)
+    monkeypatch.setattr(runtime, "buffer", Buffer)
+    buffer = runtime.begin_interval()
+    runtime.end_interval(buffer, factor=1, extra_ms=2)
+    runtime.wait_ms(5)
+    runtime.wait_ms(0)
+    assert calls == [
+        ("mark", 987, 123),
+        ("stretch", 987, 123, 1_000_000, 100_000),
+        ("wait", 987, 250_000),
+    ]

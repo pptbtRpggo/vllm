@@ -197,7 +197,9 @@ class PPAscendWorker(NPUWorker):
         from vllm.distributed.pp_stream import PPStreamExecution, PPStreamStep
 
         if not hasattr(self, "_pp_stream_delay"):
-            self._pp_stream_delay = AscendDeviceDelay()
+            # Preserve PP's tested native ProcessGroup ordering. TP uses the
+            # queued adapter; applying it here stalls later prefills on Ascend.
+            self._pp_stream_delay = AscendDeviceDelay(queued=False)
             self._pp_stream_execution = PPStreamExecution(self._pp_stream_delay)
         if tracer and self._pp_stream_delay.clock_offset_ns is None:
             self._pp_stream_delay.calibrate_clock()

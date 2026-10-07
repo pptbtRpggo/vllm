@@ -36,9 +36,47 @@ def prepare_ascend_full_graph(worker) -> None:
         set_graph_params(worker.model_runner.cudagraph_batch_sizes)
 
 
+class _DirectDelayOps:
+    """Keep PP's established native ProcessGroup/stream submission ordering.
+
+    Reading npu_stream drains the CPU submission queue, not device execution.
+    Queued OpCommand delays currently stall PP at a later prefill on Ascend;
+    this adapter preserves the working PP path while TP uses queued ops.
+    """
+
+    def __init__(self, path):
+        self.library = ctypes.CDLL(path)
+        self.library.launch_mark.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.library.launch_stretch.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+        ]
+        self.library.launch_wait.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        for name in ("launch_mark", "launch_stretch", "launch_wait"):
+            getattr(self.library, name).restype = None
+
+    @staticmethod
+    def stream():
+        return ctypes.c_void_p(torch.npu.current_stream().npu_stream)
+
+    def mark(self, buffer):
+        self.library.launch_mark(self.stream(), ctypes.c_void_p(buffer.data_ptr()))
+
+    def stretch(self, buffer, factor, cycles):
+        self.library.launch_stretch(
+            self.stream(), ctypes.c_void_p(buffer.data_ptr()), factor, cycles
+        )
+
+    def wait(self, _anchor, cycles):
+        self.library.launch_wait(self.stream(), cycles)
+
+
 class AscendDeviceDelay:
-    def __init__(self) -> None:
+    def __init__(self, *, queued: bool = True) -> None:
         self.library = None
+        self.queued = queued
         self.wait_buffer = None
         self._elapsed_api = None
         self.clock_offset_ns: int | None = None
@@ -55,6 +93,9 @@ class AscendDeviceDelay:
             )
         if "910B" not in torch.npu.get_device_name().upper():
             raise ValueError("device delay currently supports the 910B counter only")
+        if not self.queued:
+            self.library = _DirectDelayOps(path)
+            return
         torch.ops.load_library(path)
         ops = torch.ops.vllm_ascend_delay
         try:
