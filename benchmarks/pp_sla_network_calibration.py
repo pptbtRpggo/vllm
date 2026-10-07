@@ -18,7 +18,9 @@ def records(path):
         return [json.loads(line) for line in stream]
 
 
-def calibrate(trace_dir: Path, source_rank: int = 1):
+def calibrate(trace_dir: Path, source_rank: int = 1, *, large_min_bytes=16 * 1024**2):
+    if type(large_min_bytes) is not int or large_min_bytes < 1024**2:
+        raise ValueError("large payload threshold must be at least 1 MiB")
     send = records(trace_dir / f"pp_stage_pp{source_rank}_tp0.jsonl")
     recv = records(trace_dir / f"pp_stage_pp{source_rank + 1}_tp0.jsonl")
     peers = {(row["trace_session"], row["step"]): row for row in recv}
@@ -39,11 +41,11 @@ def calibrate(trace_dir: Path, source_rank: int = 1):
                 raise ValueError("native transfer time must be positive and finite")
             pairs.append((size, duration))
     small = [time_ms for size, time_ms in pairs if size < 1024**2]
-    large = [(size, time_ms) for size, time_ms in pairs if size >= 16 * 1024**2]
+    large = [(size, time_ms) for size, time_ms in pairs if size >= large_min_bytes]
     if len(small) < 20 or len(large) < 3:
         raise ValueError(
             f"insufficient native pairs: {len(small)} under 1 MiB, "
-            f"{len(large)} at least 16 MiB"
+            f"{len(large)} at least {large_min_bytes / 1024**2:g} MiB"
         )
     # Small serving transfers may include a different scheduling/metadata cost
     # from large prefill transfers. Subtracting their median from the large
@@ -79,7 +81,7 @@ def calibrate(trace_dir: Path, source_rank: int = 1):
         "native_bandwidth_gbps": bandwidth_gbps,
         "small_payload_median_ms": statistics.median(small),
         "fit_method": "nonnegative_affine_large_payloads",
-        "fit_scope_min_bytes": 16 * 1024**2,
+        "fit_scope_min_bytes": large_min_bytes,
         "fit_r_squared": r_squared,
         "fit_max_residual_ms": max(map(abs, residuals)),
         "effective_large_gbps": 8 * large_bytes / (large_ms * 1_000_000),
@@ -91,8 +93,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("trace_dir", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--source-rank", type=int, default=1)
+    parser.add_argument("--large-min-mib", type=int, default=16)
     args = parser.parse_args()
-    result = calibrate(args.trace_dir)
+    result = calibrate(
+        args.trace_dir, args.source_rank, large_min_bytes=args.large_min_mib * 1024**2
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))

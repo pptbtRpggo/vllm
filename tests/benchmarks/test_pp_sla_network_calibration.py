@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -80,3 +81,43 @@ def test_invalid_payload_is_rejected(calibration, tmp_path, size):
     large = [(mib * 1024**2, mib / 16) for mib in (16, 32, 64)]
     with pytest.raises(ValueError, match="payload"):
         calibration.calibrate(trace_dir(tmp_path, large + [(size, 3)]))
+
+
+def test_smaller_model_uses_an_explicit_large_payload_threshold(calibration, tmp_path):
+    large = [
+        (mib * 1024**2, 0.02 + 8 * mib * 1024**2 / (156 * 1e6)) for mib in (8, 16, 28)
+    ]
+    path = trace_dir(tmp_path, large)
+    result = calibration.calibrate(path, large_min_bytes=8 * 1024**2)
+    assert result["native_bandwidth_gbps"] == pytest.approx(156, rel=0.001)
+    assert result["fit_scope_min_bytes"] == 8 * 1024**2
+    with pytest.raises(ValueError, match="insufficient"):
+        calibration.calibrate(path)
+
+
+def test_pp0_to_pp1_calibration_cli(calibration, tmp_path, monkeypatch):
+    large = [
+        (mib * 1024**2, 0.02 + 8 * mib * 1024**2 / (156 * 1e6)) for mib in (8, 16, 28)
+    ]
+    trace_dir(tmp_path, large)
+    (tmp_path / "pp_stage_pp1_tp0.jsonl").rename(tmp_path / "pp_stage_pp0_tp0.jsonl")
+    (tmp_path / "pp_stage_pp2_tp0.jsonl").rename(tmp_path / "pp_stage_pp1_tp0.jsonl")
+    output = tmp_path / "calibration.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "calibration",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--source-rank",
+            "0",
+            "--large-min-mib",
+            "8",
+        ],
+    )
+    calibration.main()
+    result = json.loads(output.read_text())
+    assert result["source_rank"] == 0 and result["fit_scope_min_bytes"] == 8 * 1024**2
+    assert result["native_bandwidth_gbps"] == pytest.approx(156, rel=0.001)

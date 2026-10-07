@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Ascend PP=4 experiment: measured costs, memory bounds, and serving SLA.
+"""Ascend PP experiment: measured costs, memory bounds, and serving SLA.
 
 Run after pp_sla.py prepare. Source the Ascend environment first. This is a
 single-host compute-heterogeneity experiment; it does not emulate two hosts.
@@ -35,22 +35,31 @@ def two_group_network(
     mode="extra",
     native_bandwidth_gbps=None,
     native_latency_ms=None,
+    pp_size=4,
 ):
-    """Devices 0/1 and 2/3 retain native links; cross-group pairs are modeled."""
+    """Keep native links within two equal groups; model cross-group pairs."""
+    if pp_size not in (2, 4):
+        raise ValueError("this experiment supports PP=2 or PP=4")
+    group_size = pp_size // 2
+
+    def matrix(within, across):
+        return [
+            [
+                within if i // group_size == j // group_size else across
+                for j in range(i + 1, pp_size)
+            ]
+            for i in range(pp_size)
+        ]
+
     if mode == "native":
-        return dict(bandwidth_gbps=[[None, None, None], [None, None], [None], []])
+        return dict(bandwidth_gbps=matrix(None, None))
     if not (math.isfinite(bandwidth_gbps) and bandwidth_gbps > 0):
         raise ValueError("cross-group bandwidth must be positive and finite")
     if not (math.isfinite(latency_ms) and latency_ms >= 0):
         raise ValueError("cross-group latency must be nonnegative and finite")
     network = dict(
-        bandwidth_gbps=[
-            [None, bandwidth_gbps, bandwidth_gbps],
-            [bandwidth_gbps, bandwidth_gbps],
-            [None],
-            [],
-        ],
-        latency_ms=[[0, latency_ms, latency_ms], [latency_ms, latency_ms], [0], []],
+        bandwidth_gbps=matrix(None, bandwidth_gbps),
+        latency_ms=matrix(0, latency_ms),
     )
     if mode == "target_total":
         if not (
@@ -64,18 +73,8 @@ def two_group_network(
             raise ValueError("target_total needs measured native bandwidth and latency")
         network.update(
             mode=mode,
-            native_bandwidth_gbps=[
-                [None, native_bandwidth_gbps, native_bandwidth_gbps],
-                [native_bandwidth_gbps, native_bandwidth_gbps],
-                [None],
-                [],
-            ],
-            native_latency_ms=[
-                [0, native_latency_ms, native_latency_ms],
-                [native_latency_ms, native_latency_ms],
-                [0],
-                [],
-            ],
+            native_bandwidth_gbps=matrix(None, native_bandwidth_gbps),
+            native_latency_ms=matrix(0, native_latency_ms),
         )
     elif mode != "extra":
         raise ValueError("network mode must be native, extra, or target_total")
@@ -90,11 +89,12 @@ def memory_bounds(observations, model_config, serving, blocks):
     These reserves are conservative assumptions, not measurements of all shards.
     """
     layers = model_config["num_hidden_layers"]
-    if len(observations) != 4:
-        raise ValueError("expected four TP=1 worker observations")
+    pp_size = len(observations)
+    if pp_size not in (2, 4):
+        raise ValueError("expected two or four TP=1 worker observations")
     by_rank = {r["pp_rank"]: r for r in observations}
-    if set(by_rank) != set(range(4)) or any(r["tp_rank"] for r in observations):
-        raise ValueError("expected distinct PP ranks 0..3 and TP=1")
+    if set(by_rank) != set(range(pp_size)) or any(r["tp_rank"] for r in observations):
+        raise ValueError("expected distinct contiguous PP ranks and TP=1")
     weights = {}
     for row in observations:
         for index, size in row["layer_storage_bytes"].items():
@@ -124,7 +124,7 @@ def memory_bounds(observations, model_config, serving, blocks):
         residuals.append(max(0, row["peak_reserved_bytes"] - known))
     reserve = max(6 * GIB, max(residuals))
     devices = []
-    for rank in range(4):
+    for rank in range(pp_size):
         row = by_rank[rank]
         devices.append(
             dict(
@@ -142,13 +142,13 @@ def memory_bounds(observations, model_config, serving, blocks):
                 graph_bytes=0,
                 safety_margin_bytes=2 * GIB,
                 first_stage_bytes=by_rank[0]["non_layer_storage_bytes"],
-                last_stage_bytes=by_rank[3]["non_layer_storage_bytes"],
+                last_stage_bytes=by_rank[pp_size - 1]["non_layer_storage_bytes"],
             )
         )
     return dict(
         version=1,
         num_layers=layers,
-        pp_size=4,
+        pp_size=pp_size,
         tp_size=1,
         serving_config=serving,
         devices=devices,
@@ -160,13 +160,24 @@ class Experiment:
         self.args = args
         self.root = Path(args.output).resolve()
         self.url = f"http://127.0.0.1:{args.port}"
-        self.model_name = "pp-sla-34b"
+        self.pp_size = getattr(args, "pp_size", 4)
+        if self.pp_size not in (2, 4):
+            raise ValueError("this experiment supports PP=2 or PP=4")
+        self.model_name = getattr(args, "served_model_name", "pp-sla-34b")
+        scales = getattr(args, "compute_scales", None)
+        scales = scales or ("2,4" if self.pp_size == 2 else "1,1,2,4")
+        self.compute_scales = tuple(float(s) for s in scales.split(","))
+        if len(self.compute_scales) != self.pp_size or any(
+            not math.isfinite(s) or s < 1 for s in self.compute_scales
+        ):
+            raise ValueError("need one finite compute scale >= 1 per PP stage")
         self.network = two_group_network(
             args.cross_bandwidth_gbps,
             args.cross_extra_latency_ms,
             mode=getattr(args, "network_mode", "extra"),
             native_bandwidth_gbps=getattr(args, "native_bandwidth_gbps", None),
             native_latency_ms=getattr(args, "native_latency_ms", None),
+            pp_size=self.pp_size,
         )
         self.serving = dict(
             model=str(Path(args.model).resolve()),
@@ -194,8 +205,10 @@ class Experiment:
         ):
             raise ValueError("samples exceed the configured model context")
         self.config = json.loads((Path(args.model) / "config.json").read_text())
-        if self.config["num_hidden_layers"] != 48:
-            raise ValueError("this protocol requires the 48-layer CodeLlama model")
+        self.num_layers = self.config["num_hidden_layers"]
+        if self.num_layers < self.pp_size or self.num_layers % self.pp_size:
+            raise ValueError("model layers must be divisible by PP size")
+        self.uniform_partition = [self.num_layers // self.pp_size] * self.pp_size
 
     def rpc(self, method, args=()):
         body = json.dumps(dict(method=method, args=list(args))).encode()
@@ -220,12 +233,12 @@ class Experiment:
                 del env[name]
         env.update(
             VLLM_PP_LAYER_PARTITION=",".join(map(str, parts)),
-            VLLM_PP_HETERO="1,1,2,4",
+            VLLM_PP_HETERO=",".join(map(str, self.compute_scales)),
             VLLM_PP_COMPUTE_MODEL="layer-measured",
-            VLLM_PP_DEVICE_ORDER="0,1,2,3",
+            VLLM_PP_DEVICE_ORDER=",".join(map(str, range(self.pp_size))),
             VLLM_PP_NETWORK=json.dumps(self.network, separators=(",", ":")),
             VLLM_SERVER_DEV_MODE="1",
-            ASCEND_RT_VISIBLE_DEVICES="0,1,2,3",
+            ASCEND_RT_VISIBLE_DEVICES=",".join(map(str, range(self.pp_size))),
             VLLM_WORKER_MULTIPROC_METHOD="spawn",
             VLLM_NO_USAGE_STATS="1",
             HF_HUB_OFFLINE="1",
@@ -253,7 +266,7 @@ class Experiment:
             "--dtype",
             "float16",
             "--pipeline-parallel-size",
-            "4",
+            str(self.pp_size),
             "--tensor-parallel-size",
             "1",
             "--distributed-executor-backend",
@@ -351,7 +364,7 @@ class Experiment:
         from vllm.distributed.pp_memory import PPMemoryProfile
         from vllm.distributed.pp_partition import load_trace_records, partition_layers
 
-        with self.server("profile", [12, 12, 12, 12], trace=True):
+        with self.server("profile", self.uniform_partition, trace=True):
             concurrency = self.args.profile_concurrency
             self.rpc("set_pp_profile_warmup", [True])
             self.load(
@@ -375,23 +388,25 @@ class Experiment:
         )
         save(self.root / "profile/memory.json", bounds)
         memory = PPMemoryProfile.from_file(self.root / "profile/memory.json")
-        if any(r["headroom_bytes"] < 0 for r in memory.plan_usage([12] * 4)):
+        if any(
+            r["headroom_bytes"] < 0 for r in memory.plan_usage(self.uniform_partition)
+        ):
             raise ValueError("uniform allocation exceeds conservative memory bound")
         costs = measured_layer_rank_costs(
             [load_trace_records(self.root / "profile/traces")],
             workload="all",
             warmup_steps=0,
-            num_layers=48,
+            num_layers=self.num_layers,
         )
         save(self.root / "profile/costs.json", [asdict(c) for c in costs])
-        plans = {"uniform": [12, 12, 12, 12]}
+        plans = {"uniform": self.uniform_partition}
         for objective in ("latency", "throughput"):
             plan = partition_layers(
                 costs,
                 objective=objective,
-                num_layers=48,
-                min_pp_size=4,
-                max_pp_size=4,
+                num_layers=self.num_layers,
+                min_pp_size=self.pp_size,
+                max_pp_size=self.pp_size,
                 memory_profile=memory,
             )
             save(self.root / f"profile/{objective}.json", plan.to_dict())
@@ -459,6 +474,9 @@ def main():
     parser.add_argument("--data", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--port", type=int, default=18762)
+    parser.add_argument("--pp-size", type=int, choices=(2, 4), default=4)
+    parser.add_argument("--compute-scales")
+    parser.add_argument("--served-model-name", default="pp-sla-34b")
     parser.add_argument("--kv-blocks", type=int, default=1024)
     parser.add_argument(
         "--mode", choices=("profile", "pilot", "sweep"), default="pilot"
@@ -468,7 +486,8 @@ def main():
     parser.add_argument("--cross-bandwidth-gbps", type=float, default=25)
     parser.add_argument("--cross-extra-latency-ms", type=float, default=1)
     parser.add_argument(
-        "--network-mode", choices=("native", "extra", "target_total"),
+        "--network-mode",
+        choices=("native", "extra", "target_total"),
         default="extra",
     )
     parser.add_argument("--native-bandwidth-gbps", type=float)
@@ -496,7 +515,7 @@ def main():
     protocol = dict(
         serving=experiment.serving,
         kv_blocks=args.kv_blocks,
-        compute_slowdown=[1, 1, 2, 4],
+        compute_slowdown=list(experiment.compute_scales),
         network=experiment.network,
         sample_manifest=json.loads((Path(args.data) / "manifest.json").read_text()),
     )
