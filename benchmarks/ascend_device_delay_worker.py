@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Serving comparisons using production device-delay workers.
 
-Eager modes can switch in one server. Graph TP uses one fixed mode per server:
-hooks must be present during capture, and capture-time factors cannot be
-changed by subsequently changing Python configuration.
+PP eager modes can switch in one server. TP uses a fixed mode per server:
+timing hooks and tracing must be configured before model initialization, and
+Graph capture-time factors cannot change through Python configuration.
 """
 
 import json
@@ -98,9 +98,7 @@ class TPDeviceBenchWorker(TPAscendWorker):
         }
         mode = state["mode"]
         if mode != self._bench_mode:
-            if not self.vllm_config.model_config.enforce_eager:
-                raise RuntimeError("TP Graph benchmark requires a fixed mode")
-            self._set_mode(mode)
+            raise RuntimeError("TP benchmark requires a fixed startup mode")
         if mode == "native":
             return NPUWorker.execute_model(self, scheduler_output)
         writer = self._tp_trace_writer

@@ -35,6 +35,10 @@ def set_control(path, state):
 
 
 def run_architecture(args, architecture, warm, samples):
+    if architecture == "tp" and not args.fixed_mode:
+        raise ValueError("TP benchmark requires --fixed-mode for eager and Graph")
+    if args.graph and args.fixed_mode == "trace_zero":
+        raise ValueError("detailed tracing requires eager execution")
     root = Path(args.output) / architecture
     root.mkdir(parents=True, exist_ok=True)
     control_file = root / "control.json"
@@ -60,9 +64,8 @@ def run_architecture(args, architecture, warm, samples):
         + env.get("PYTHONPATH", ""),
     )
     if architecture == "tp":
-        env.update(
-            VLLM_TP_MOCK_TRACE=str((root / "trace").resolve()),
-        )
+        if args.fixed_mode == "trace_zero":
+            env["VLLM_TP_MOCK_TRACE"] = str((root / "trace").resolve())
         worker = "TPDeviceBenchWorker"
     else:
         env.update(
@@ -133,8 +136,6 @@ def run_architecture(args, architecture, warm, samples):
     )
     if args.graph:
         labels = [label for label in labels if not label.startswith("trace_zero")]
-    if architecture == "tp" and args.graph and not args.fixed_mode:
-        raise ValueError("TP Graph requires --fixed-mode")
     set_control(
         control_file,
         dict(
@@ -245,7 +246,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--graph", action="store_true")
     parser.add_argument(
-        "--fixed-mode", choices=["native", "zero", "kernel_zero", "hetero"]
+        "--fixed-mode",
+        choices=["native", "zero", "kernel_zero", "trace_zero", "hetero"],
     )
     parser.add_argument("--output-tokens", type=int, default=16)
     parser.add_argument("--rounds", type=int, choices=[1, 2], default=2)
