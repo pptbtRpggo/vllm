@@ -160,6 +160,21 @@ def rpc(url, method, args=()):
     return result["results"]
 
 
+def serving_config(case):
+    return dict(
+        model=str(Path(case["model_path"]).resolve()),
+        revision=None,
+        dtype="float16",
+        quantization=None,
+        kv_cache_dtype="auto",
+        block_size=128,
+        max_model_len=4096,
+        max_num_seqs=256,
+        max_num_batched_tokens=2048,
+        gpu_memory_utilization=0.85,
+    )
+
+
 def serving_command(case, method, port, profile=False):
     return [
         sys.executable,
@@ -469,14 +484,7 @@ def profile_group(args, group, attempt):
             windows.append((case, folder, start, stop))
             print("PROFILE", case["group"], case["workload"], flush=True)
         observations = rpc(url, "get_pp_memory_observation")
-    serving = dict(
-        dtype="float16",
-        kv_cache_dtype="auto",
-        block_size=128,
-        max_model_len=4096,
-        max_num_batched_tokens=2048,
-        gpu_memory_utilization=0.85,
-    )
+    serving = serving_config(first)
     bounds = memory_bounds(observations, config, serving, 1024)
     failed = []
     # Read unpaired raw rows only after graceful shutdown has drained the writer.

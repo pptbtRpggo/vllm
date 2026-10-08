@@ -92,3 +92,41 @@ def test_profile_windows_exclude_warmup_and_reject_misaligned_batches(driver):
     raw[1] = [dict(r, batch_id="wrong") if r["step"] == 3 else r for r in rows]
     with pytest.raises(ValueError, match="matching"):
         driver.select_window(raw, 1.5, 3.5, 2)
+
+
+def test_recorded_memory_can_be_loaded_by_actual_planner(driver, tmp_path, monkeypatch):
+    import sys
+
+    path = Path(__file__).resolve().parents[2] / "vllm/distributed/pp_memory.py"
+    spec = importlib.util.spec_from_file_location("length_compare_memory", path)
+    memory = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, memory)
+    spec.loader.exec_module(memory)
+    observations = [
+        dict(
+            pp_rank=r,
+            tp_rank=0,
+            layer_storage_bytes={str(i): 1024 for i in range(2 * r, 2 * r + 2)},
+            non_layer_storage_bytes=1024,
+            total_bytes=64 * 1024**3,
+            peak_reserved_bytes=2 * 1024**3,
+        )
+        for r in (0, 1)
+    ]
+    config = dict(
+        num_hidden_layers=4,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+    )
+    bounds = driver.memory_bounds(
+        observations,
+        config,
+        driver.serving_config(dict(model_path="/models/qwen")),
+        1024,
+    )
+    file = tmp_path / "memory.json"
+    driver.save(file, bounds)
+    loaded = memory.PPMemoryProfile.from_file(file)
+    assert loaded.num_layers == 4
+    assert all(r["headroom_bytes"] > 0 for r in loaded.plan_usage([2, 2]))
