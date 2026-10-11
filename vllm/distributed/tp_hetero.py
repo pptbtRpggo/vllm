@@ -158,17 +158,12 @@ class TPHeteroConfig:
 
 @dataclass
 class TPComputeStats:
-    input_compute_ms: float = 0.0
-    requested_delay_ms: float = 0.0
-    actual_delay_ms: float = 0.0
     intervals: list[Any] = field(default_factory=list)
 
 
 @dataclass
 class TPCollectiveStats:
-    total_ms: float = 0.0
     extra_total_ms: float = 0.0
-    actual_extra_total_ms: float = 0.0
     cross_bytes_total: int = 0
     events: list[tuple[Any, Any]] = field(default_factory=list)
 

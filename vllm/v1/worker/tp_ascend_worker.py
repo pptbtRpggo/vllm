@@ -49,7 +49,6 @@ class TPAscendWorker(NPUWorker):
         self._tp_collectives.install()
         self._tp_compute_delay: TPComputeDelay | None = None
         self._tp_compute_model: torch.nn.Module | None = None
-        self._tp_logged = False
         trace_dir = os.getenv("VLLM_TP_MOCK_TRACE")
         self._tp_trace = None
         self._tp_trace_writer = None
@@ -149,42 +148,44 @@ class TPAscendWorker(NPUWorker):
         if self.vllm_config.model_config.enforce_eager:
             compute.validate()
         if tracing:
-            finished = self._tp_stream_delay.event()
-            snapshots = [
-                self._tp_stream_delay.snapshot(buf) for buf in compute.stats.intervals
-            ]
-            completed = self._tp_stream_delay.event()
-            events = collective.stats.events.copy()
-            metadata = {
-                **getattr(self, "_tp_trace_metadata", {}),
-                "pid": os.getpid(),
-                "tp_rank": get_tp_group().rank_in_group,
-                "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
-                "compute_scale": compute.scale,
-                "collective_counts": {
-                    op: n - counts[op] for op, n in collective.counts.items()
-                },
-                "collective_extra_requested_ms": collective.stats.extra_total_ms,
-                "collective_cross_bytes": collective.stats.cross_bytes_total,
+            self._submit_trace(scheduler_output, started, counts)
+        return output
+
+    def _submit_trace(self, scheduler_output, started, counts):
+        """Snapshot this forward before buffers are reused by the next one."""
+        stream = self._tp_stream_delay
+        compute, collective = self._tp_compute_delay, self._tp_collectives
+        finished = stream.event()
+        snapshots = [stream.snapshot(buf) for buf in compute.stats.intervals]
+        completed = stream.event()
+        events = collective.stats.events.copy()
+        metadata = {
+            **getattr(self, "_tp_trace_metadata", {}),
+            "pid": os.getpid(),
+            "tp_rank": get_tp_group().rank_in_group,
+            "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
+            "compute_scale": compute.scale,
+            "collective_counts": {
+                op: n - counts[op] for op, n in collective.counts.items()
+            },
+            "collective_extra_requested_ms": collective.stats.extra_total_ms,
+            "collective_cross_bytes": collective.stats.cross_bytes_total,
+        }
+
+        def resolve():
+            durations = [stream.durations(host) for host in snapshots]
+            base_ms = sum(base for base, _ in durations)
+            return {
+                **metadata,
+                "compute_base_ms": base_ms,
+                "compute_sleep_ms": sum(delay for _, delay in durations),
+                "compute_extra_requested_ms": base_ms * (metadata["compute_scale"] - 1),
+                "collective_observed_with_extra_ms": sum(
+                    stream.elapsed_time(a, b) for a, b in events
+                ),
+                "forward_wall_ms": stream.elapsed_time(started, finished),
+                "timing_source": "npu_event_device_clock",
             }
 
-            def resolve():
-                values = [self._tp_stream_delay.durations(host) for host in snapshots]
-                return {
-                    **metadata,
-                    "compute_base_ms": sum(v[0] for v in values),
-                    "compute_sleep_ms": sum(v[1] for v in values),
-                    "compute_extra_requested_ms": sum(v[0] for v in values)
-                    * (metadata["compute_scale"] - 1),
-                    "collective_observed_with_extra_ms": sum(
-                        self._tp_stream_delay.elapsed_time(a, b) for a, b in events
-                    ),
-                    "forward_wall_ms": self._tp_stream_delay.elapsed_time(
-                        started, finished
-                    ),
-                    "timing_source": "npu_event_device_clock",
-                }
-
-            self._tp_trace_writer.submit_ready(completed, resolve)
-            self._tp_trace_remaining -= 1
-        return output
+        self._tp_trace_writer.submit_ready(completed, resolve)
+        self._tp_trace_remaining -= 1

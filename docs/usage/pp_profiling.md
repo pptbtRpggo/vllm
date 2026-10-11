@@ -95,7 +95,8 @@ warmup 不计入正式结果。不同 prompt 仍可能共享真实前缀，所�
 **用真实服务 requests 采集逐层 trace：**在上面的 `vllm serve` 命令启动之前设置
 `VLLM_PP_COMPUTE_MODEL=layer-measured`，并给服务加上 `--enforce-eager`，使用 TP=1。
 客户端采样、warmup 和发送 requests 的流程不变。worker 在 decoder layer 的调用前后
-记录 CUDA/NPU events，整段 stage 完成同步后统一读取；不会在每层之间插入同步。
+记录 CUDA/NPU events。Ascend 在后台等待完成事件后读取；CUDA 的同步计时路径在
+整段 stage 完成同步后读取。仅计时时不会在每层之间插入同步。
 计时边界是该 decoder module 的调用边界，当前 stream 上两个 events 之间的时间，
 可能包含设备等待 CPU 提交 kernel 的间隙，不保证等于所有 kernel 耗时之和。
 

@@ -8,6 +8,22 @@ These experiment workers add device-side delays to native Ascend execution. They
 
 The device-delay shared library is required through `VLLM_ASCEND_DELAY_LIBRARY`. After loading the CANN environment, build it with `PYTHON=python bash benchmarks/build_ascend_delay.sh output/delay_lib`; use a library compatible with the installed TorchNPU and CANN versions. Formal serving does not synchronize the device or use a CPU callback to implement these waits.
 
+## Code paths and timing costs
+
+The Ascend implementation separates execution, device timing and cost aggregation:
+
+- `vllm/v1/worker/pp_ascend_worker.py` preserves native receive → stage compute → send ordering and returns the same output types as the Ascend worker.
+- `vllm/distributed/pp_stream.py` adds one device wait per stage/microbatch and records optional layer events. It hands snapshots to the background trace writer, which reads them after their completion event.
+- `vllm/v1/worker/tp_ascend_worker.py` uses `tp_hetero.py` to stretch local attention/MLP segments before their collectives. Forward execution and deferred trace resolution are separate methods.
+- `vllm/distributed/ascend_device_delay.py` submits device timing/wait kernels. PP uses the direct adapter to preserve its tested ProcessGroup ordering; TP uses queued TorchNPU operators. These adapters are both needed.
+- `vllm/distributed/pp_layer_cost.py` validates trace timing, then builds representative layer, endpoint, fixed-overhead and measured link costs. `pp_partition.py` consumes these costs subject to memory bounds.
+
+For an Ascend PP stage, let `B` be its pre-wait interval, `D` its observed extra wait and `L_i` a layer event interval. The stored layer cost is `L_i * (B + D) / B`. Embedding, final norm and LM head use the same proportional attribution; the remainder is stored as runner overhead. DP must not multiply these stored costs by the slowdown factor again. These are elapsed device-stream intervals, which may include execution gaps; they are not sums of kernel active times.
+
+By default, cost aggregation first averages local layers within each microbatch and then averages all valid microbatches, including mixed prefill/decode steps. The optional `phase-balanced` aggregation instead averages the pure prefill and pure decode means equally and excludes mixed steps. Neither aggregation predicts serving P99 TTFT or request queueing. See [PP profiling](../usage/pp_profiling.md) for the trace schema and planner options.
+
+The CUDA PP worker still uses synchronous timing helpers in `pp_hetero.py` and `pp_layer_trace.py`. They are separate from the Ascend device-kernel path and remain necessary for CUDA experiments. The retired host-callback prototype and its diagnostic benchmark are available in Git history; they are not part of the serving implementation.
+
 ## TP target-total network simulation
 
 First measure the native collectives on the same host and with the same number of devices:

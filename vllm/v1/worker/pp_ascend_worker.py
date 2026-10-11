@@ -19,12 +19,7 @@ from vllm_ascend.worker.worker import NPUWorker
 
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.distributed.pp_batch_shape import scheduled_batch_id, scheduled_batch_shape
-from vllm.distributed.pp_hetero import (
-    PPHeteroConfig,
-    execute_pp_compute,
-    sync_torch_device,
-    time_call,
-)
+from vllm.distributed.pp_hetero import PPHeteroConfig, sync_torch_device
 from vllm.distributed.pp_stage_trace import (
     PPStageTracer,
     layer_range_from_runner,
@@ -88,7 +83,7 @@ class PPAscendWorker(NPUWorker):
             return super().execute_model(scheduler_output)
         if tracer is None and not hetero.enabled:
             return super().execute_model(scheduler_output)
-        return self._execute_model_with_pp_trace(scheduler_output, tracer, hetero)
+        return self._execute_model_stream(scheduler_output, tracer, hetero)
 
     def get_pp_memory_observation(self) -> dict:
         from vllm.distributed.pp_memory import observe_worker_memory
@@ -99,96 +94,12 @@ class PPAscendWorker(NPUWorker):
         if tracer := getattr(self, "_pp_stage_tracer", None):
             tracer.is_warmup = enabled
 
-    def _execute_model_with_pp_trace(
+    def _execute_model_stream(
         self,
         scheduler_output: SchedulerOutput,
         tracer: PPStageTracer | None,
         hetero: PPHeteroConfig,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        if self.device.type == "npu":
-            return self._execute_model_stream(scheduler_output, tracer, hetero)
-        start_layer, end_layer = layer_range_from_runner(self.model_runner)
-        batch = (
-            scheduled_batch_shape(scheduler_output, self.model_runner)
-            if tracer is not None
-            else {}
-        )
-        gather = _all_gather_group()
-        pp_rank = get_pp_group().rank_in_group
-
-        def _sync() -> None:
-            sync_torch_device(self.device)
-
-        batch_id = scheduled_batch_id(scheduler_output) if tracer is not None else None
-
-        recv_ms: float | None = None
-        recv_bytes: int | None = None
-        intermediate_tensors: IntermediateTensors | None = None
-        if not get_pp_group().is_first_rank:
-
-            def _recv() -> IntermediateTensors:
-                return IntermediateTensors(
-                    get_pp_group().recv_tensor_dict(all_gather_group=gather)
-                )
-
-            if tracer is not None:
-                intermediate_tensors, recv_ms = tracer.measure_comm(_recv, kind="recv")
-            else:
-                intermediate_tensors, recv_ms = time_call(_recv, _sync)
-            recv_bytes = tensor_dict_nbytes(
-                intermediate_tensors.tensors,
-                all_gather_size=1 if gather is None else gather.world_size,
-            )
-            recv_ms = hetero.stretch_recv(pp_rank, recv_ms, payload_bytes=recv_bytes)
-            if tracer is not None:
-                recv_ms = tracer.finish_comm("recv")
-
-        def _run_forward():
-            return self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
-
-        output, compute_timing = execute_pp_compute(
-            self, _run_forward, tracer, hetero, pp_rank
-        )
-
-        send_ms: float | None = None
-        send_bytes: int | None = None
-        if isinstance(output, IntermediateTensors):
-            send_bytes = tensor_dict_nbytes(
-                output.tensors,
-                all_gather_size=1 if gather is None else gather.world_size,
-            )
-
-            def _send() -> None:
-                get_pp_group().send_tensor_dict(output.tensors, all_gather_group=gather)
-
-            if tracer is not None:
-                _, send_ms = tracer.measure_comm(_send, kind="send")
-            else:
-                _, send_ms = time_call(_send, _sync)
-            send_ms = hetero.stretch_send(pp_rank, send_ms, payload_bytes=send_bytes)
-            if tracer is not None:
-                send_ms = tracer.finish_comm("send")
-
-        if tracer is not None:
-            tracer.record_step(
-                scheduler_output,
-                batch=batch,
-                batch_id=batch_id,
-                compute_timing=compute_timing,
-                recv_ms=recv_ms,
-                send_ms=send_ms,
-                recv_bytes=recv_bytes,
-                send_bytes=send_bytes,
-                start_layer=start_layer,
-                end_layer=end_layer,
-                compute_scale=hetero.compute_scale(pp_rank),
-                comm_scale=hetero.comm_scale(pp_rank),
-            )
-        return self._pp_output(output)
-
-    def _execute_model_stream(self, scheduler_output, tracer, hetero):
         from vllm.distributed.ascend_device_delay import AscendDeviceDelay
         from vllm.distributed.pp_layer_trace import (
             PPLayerTimer,

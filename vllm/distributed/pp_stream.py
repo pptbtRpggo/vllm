@@ -7,11 +7,38 @@ stage delay is attributed proportionally for DP and explicitly tagged.
 """
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, TypeVar
 
 T = TypeVar("T")
+
+
+def _attributed_layer_timing(stream, events, base_ms, delay_ms):
+    """Allocate one observed stage wait across measured modules and residual.
+
+    The layer events measure unmodified execution. The returned layer costs
+    include a proportional share of the stage wait, not per-layer sleeps.
+    Read events only in the background after the completion event is ready.
+    """
+    slowdown = (base_ms + delay_ms) / base_ms if base_ms else 1.0
+    durations = {
+        index: stream.elapsed_time(start, end) * slowdown
+        for index, (start, end) in events.items()
+    }
+    layers = {str(i): ms for i, ms in durations.items() if isinstance(i, int)}
+    endpoints = {i + "_ms": ms for i, ms in durations.items() if isinstance(i, str)}
+    residual = base_ms + delay_ms - sum(layers.values())
+    overhead = residual - sum(endpoints.values())
+    if min(residual, overhead) < -0.01:
+        raise ValueError("layer events exceed stage timing")
+    return {
+        "layer_compute_ms": layers,
+        **endpoints,
+        "non_layer_compute_ms": max(0.0, residual),
+        "runner_overhead_ms": max(0.0, overhead),
+    }
 
 
 @dataclass
@@ -57,9 +84,19 @@ class PPStreamExecution:
         else:
             interval = self.stream.begin_interval()
             step.intervals["compute"] = interval
-        handles = []
-        seen = []
-        starts = {}
+        with self._record_layer_events(step, timer):
+            result = fn()
+        # Exactly one proportional wait, irrespective of the profiling mode.
+        self.stream.end_interval(interval, factor=max(0.0, scale - 1))
+        return result
+
+    @contextmanager
+    def _record_layer_events(self, step, timer):
+        """Limit module hooks to this forward and always remove them on exit."""
+        if step is None or timer is None:
+            yield
+            return
+        handles, seen, starts = [], [], {}
 
         def before(index, _module, _args):
             if index in starts:
@@ -72,23 +109,17 @@ class PPStreamExecution:
                 seen.append(index)
 
         try:
-            if step is not None and timer is not None:
-                for index, module in {**timer.layers, **timer.endpoints}.items():
-                    handles.append(
-                        module.register_forward_pre_hook(partial(before, index))
-                    )
-                    handles.append(module.register_forward_hook(partial(after, index)))
-            result = fn()
-            if step is not None and timer is not None and seen != list(timer.layers):
+            for index, module in {**timer.layers, **timer.endpoints}.items():
+                handles.append(module.register_forward_pre_hook(partial(before, index)))
+                handles.append(module.register_forward_hook(partial(after, index)))
+            yield
+            if seen != list(timer.layers):
                 raise ValueError(
                     "layer-measured did not observe every decoder layer in order"
                 )
         finally:
             for handle in handles:
                 handle.remove()
-        # Exactly one proportional wait, irrespective of the profiling mode.
-        self.stream.end_interval(interval, factor=max(0.0, scale - 1))
-        return result
 
     def finish_trace(self, step, record, tracer, layer_measured):
         snapshots = {
@@ -114,33 +145,11 @@ class PPStreamExecution:
                     setattr(record, kind + "_end_ns", end)
             record.comm_delay_in_window = True
             if layer_measured:
-                measured = {
-                    index: self.stream.elapsed_time(start, end)
-                    for index, (start, end) in step.layer_events.items()
-                }
-                # This is explicit attribution of an observed stage wait, not
-                # a claim that each layer executed more slowly on the hardware.
-                ratio = (base + delay) / base if base else 1.0
-                record.layer_compute_ms = {
-                    str(i): ms * ratio
-                    for i, ms in measured.items()
-                    if isinstance(i, int)
-                }
-                endpoints = {
-                    i + "_ms": ms * ratio
-                    for i, ms in measured.items()
-                    if isinstance(i, str)
-                }
-                for name, duration in endpoints.items():
-                    setattr(record, name, duration)
-                residual = record.compute_wall_ms - sum(
-                    record.layer_compute_ms.values()
+                timing = _attributed_layer_timing(
+                    self.stream, step.layer_events, base, delay
                 )
-                overhead = residual - sum(endpoints.values())
-                if min(residual, overhead) < -0.01:
-                    raise ValueError("layer events exceed stage timing")
-                record.non_layer_compute_ms = max(0.0, residual)
-                record.runner_overhead_ms = max(0.0, overhead)
+                for name, duration in timing.items():
+                    setattr(record, name, duration)
             return record
 
         tracer.submit_ready_record(completion, resolve)

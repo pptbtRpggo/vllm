@@ -51,17 +51,13 @@ def phase_mean(groups, getter):
     )
 
 
-def measured_layer_rank_costs(
-    trace_sets: list[dict[int, list[dict[str, Any]]]],
-    *,
-    workload: Workload,
-    warmup_steps: int,
-    num_layers: int | None = None,
-    include_communication: bool = True,
-    layer_aggregation: str = "microbatch",
-) -> list[RankCost]:
-    from vllm.distributed.pp_partition import RankCost
+def _mean_layer_ms(row):
+    """One microbatch's mean across its local decoder layers, waits included."""
+    return statistics.mean(row["layer_compute_ms"].values())
 
+
+def _validate_trace_layout(trace_sets, num_layers):
+    """Require complete, contiguous layer ranges in each profiling run."""
     if not trace_sets:
         raise ValueError("layer-measured requires traces")
     ranks = sorted(trace_sets[0])
@@ -92,6 +88,67 @@ def measured_layer_rank_costs(
         totals.add(end)
     if len(totals) != 1 or (num_layers is not None and num_layers not in totals):
         raise ValueError("profiles must have the same total number of layers")
+    return ranks
+
+
+def _validate_layer_record(row, pp_size):
+    """Check timing conservation before any means or DP extrapolation."""
+    if row.get("compute_model") != "layer-measured":
+        raise ValueError("layer-measured requires direct layer traces")
+    if row["pp_size"] != pp_size:
+        raise ValueError("trace PP size does not match its ranks")
+    if row.get("tp_size") != 1 or row.get("tp_rank") != 0:
+        raise ValueError("layer-measured currently requires TP=1")
+    scale = row.get("compute_scale", 1.0)
+    if type(scale) not in (int, float) or not math.isfinite(scale) or scale <= 0:
+        raise ValueError("invalid compute scale in layer trace")
+    if scale != 1 and row.get("compute_delay_placement") not in (
+        "layer",
+        "stage-attributed",
+    ):
+        raise ValueError(
+            "layer-measured cannot use mock compute slowdown unless "
+            "measured layer waits or attributed measured stage waits "
+            "are included"
+        )
+    layers = row.get("layer_compute_ms")
+    if not isinstance(layers, dict) or set(layers) != {
+        str(i) for i in range(row["start_layer"], row["end_layer"])
+    }:
+        raise ValueError("layer trace must contain every local global layer ID")
+    duration = sum(_duration(v) for v in layers.values())
+    residual = _duration(row.get("non_layer_compute_ms"))
+    wall = _duration(row.get("compute_wall_ms"))
+    if abs(duration + residual - wall) > 0.01:
+        raise ValueError("layer times plus residual must match stage wall time")
+    endpoints = sum(
+        _duration(row[k])
+        for k in ("embedding_ms", "lm_head_ms", "final_norm_ms")
+        if row.get(k) is not None
+    )
+    overhead = _duration(row.get("runner_overhead_ms"))
+    if abs(endpoints + overhead - residual) > 0.01:
+        raise ValueError("endpoint times plus runner overhead must match residual")
+
+
+def measured_layer_rank_costs(
+    trace_sets: list[dict[int, list[dict[str, Any]]]],
+    *,
+    workload: Workload,
+    warmup_steps: int,
+    num_layers: int | None = None,
+    include_communication: bool = True,
+    layer_aggregation: str = "microbatch",
+) -> list[RankCost]:
+    """Build device costs: layers, endpoints, fixed overhead and outgoing link.
+
+    Stored layer/endpoint times already include any attributed stage wait.
+    Do not apply compute_scale again. The default weights each microbatch
+    equally; phase-balanced assigns equal weights to pure prefill/decode.
+    """
+    from vllm.distributed.pp_partition import RankCost
+
+    ranks = _validate_trace_layout(trace_sets, num_layers)
     costs = []
     for rank in ranks:
         groups = phase_groups(
@@ -108,48 +165,7 @@ def measured_layer_rank_costs(
         )
         rows = [r for group in groups.values() for r in group]
         for row in rows:
-            if row.get("compute_model") != "layer-measured":
-                raise ValueError("layer-measured requires direct layer traces")
-            if row["pp_size"] != len(ranks):
-                raise ValueError("trace PP size does not match its ranks")
-            if row.get("tp_size") != 1 or row.get("tp_rank") != 0:
-                raise ValueError("layer-measured currently requires TP=1")
-            scale = row.get("compute_scale", 1.0)
-            if (
-                type(scale) not in (int, float)
-                or not math.isfinite(scale)
-                or scale <= 0
-            ):
-                raise ValueError("invalid compute scale in layer trace")
-            if scale != 1 and row.get("compute_delay_placement") not in (
-                "layer",
-                "stage-attributed",
-            ):
-                raise ValueError(
-                    "layer-measured cannot use mock compute slowdown unless "
-                    "measured layer waits or attributed measured stage waits "
-                    "are included"
-                )
-            layers = row.get("layer_compute_ms")
-            if not isinstance(layers, dict) or set(layers) != {
-                str(i) for i in range(row["start_layer"], row["end_layer"])
-            }:
-                raise ValueError("layer trace must contain every local global layer ID")
-            duration = sum(_duration(v) for v in layers.values())
-            residual = _duration(row.get("non_layer_compute_ms"))
-            wall = _duration(row.get("compute_wall_ms"))
-            if abs(duration + residual - wall) > 0.01:
-                raise ValueError("layer times plus residual must match stage wall time")
-            endpoints = sum(
-                _duration(row[k])
-                for k in ("embedding_ms", "lm_head_ms", "final_norm_ms")
-                if row.get(k) is not None
-            )
-            overhead = _duration(row.get("runner_overhead_ms"))
-            if abs(endpoints + overhead - residual) > 0.01:
-                raise ValueError(
-                    "endpoint times plus runner overhead must match residual"
-                )
+            _validate_layer_record(row, len(ranks))
         # These rows have already been grouped by stable device identity, not
         # stage rank. Reordered runs may use different roles/links, but must
         # describe the same compute environment on each device.
@@ -180,9 +196,7 @@ def measured_layer_rank_costs(
             dict(
                 phase=p,
                 samples=len(rs),
-                t_layer_ms=statistics.mean(
-                    statistics.mean(r["layer_compute_ms"].values()) for r in rs
-                ),
+                t_layer_ms=statistics.mean(_mean_layer_ms(r) for r in rs),
             )
             for p, rs in groups.items()
         )
@@ -203,9 +217,7 @@ def measured_layer_rank_costs(
             RankCost(
                 pp_rank=rank,
                 n_layers=initial["end_layer"] - initial["start_layer"],
-                t_layer_ms=phase_mean(
-                    groups, lambda r: statistics.mean(r["layer_compute_ms"].values())
-                ),
+                t_layer_ms=phase_mean(groups, _mean_layer_ms),
                 t_fixed_ms=phase_mean(groups, lambda r: r["runner_overhead_ms"]),
                 t_embedding_ms=endpoint("embedding_ms"),
                 t_head_ms=endpoint("lm_head_ms"),

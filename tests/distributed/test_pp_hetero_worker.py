@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Execute the real PP wrappers with CPU tensors and fake transport/timing.
+"""Exercise the CUDA PP wrapper with CPU tensors and fake transport/timing.
 
-The Ascend parent is stubbed; these tests do not validate HCCL or NPU kernels.
+Ascend worker tests use the deferred stream in test_pp_stream_worker.py.
 """
 
 import importlib.util
@@ -40,12 +40,10 @@ def _worker_module(backend, monkeypatch):
     return module, module.PPAscendWorker
 
 
-@pytest.mark.parametrize("backend", ["cuda", "ascend", "ascend_sp"])
 @pytest.mark.parametrize("rank", [0, 1, 2])
 @pytest.mark.parametrize("tracing", [False, True])
 @pytest.mark.parametrize("compute_scale", [1, 2])
 def test_worker_comm_delay_excludes_peer_wait(
-    backend,
     rank,
     tracing,
     compute_scale,
@@ -54,14 +52,14 @@ def test_worker_comm_delay_excludes_peer_wait(
     compute_model="shape-affine",
     network=False,
 ):
-    module, worker_cls = _worker_module(backend, monkeypatch)
+    module, worker_cls = _worker_module("cuda", monkeypatch)
     monkeypatch.setenv("VLLM_PP_COMPUTE_MODEL", compute_model)
     now = [0.0]
     sleeps = []
     calls = []
     payload = {"hidden_states": torch.empty(1_000_000, dtype=torch.uint8)}
     tp = SimpleNamespace(world_size=1 if compute_model == "layer-measured" else 2)
-    wire_bytes = 1_000_000 if backend == "ascend_sp" else 1_000_000 // tp.world_size
+    wire_bytes = 1_000_000 // tp.world_size
     baseline_ms = wire_bytes / 1_000_000  # 8 Gbit/s.
 
     def sleep(seconds):
@@ -76,7 +74,7 @@ def test_worker_comm_delay_excludes_peer_wait(
     def send(tensors, **kwargs):
         calls.append("send")
         assert tensors is payload
-        assert kwargs["all_gather_group"] is (None if backend == "ascend_sp" else tp)
+        assert kwargs["all_gather_group"] is tp
         now[0] += (300 + baseline_ms) / 1000
 
     group = SimpleNamespace(
@@ -224,15 +222,11 @@ def test_worker_comm_delay_excludes_peer_wait(
             assert "send_transfer_ms" not in record
 
 
-@pytest.mark.parametrize("backend", ["cuda", "ascend", "ascend_sp"])
 @pytest.mark.parametrize("rank", [0, 1, 2])
 @pytest.mark.parametrize("tracing", [False, True])
 @pytest.mark.parametrize("scale", [1, 2, 4])
-def test_worker_wrapper_layer_measurement(
-    backend, rank, tracing, scale, tmp_path, monkeypatch
-):
+def test_worker_wrapper_layer_measurement(rank, tracing, scale, tmp_path, monkeypatch):
     test_worker_comm_delay_excludes_peer_wait(
-        backend,
         rank,
         tracing,
         scale,
@@ -242,10 +236,9 @@ def test_worker_wrapper_layer_measurement(
     )
 
 
-@pytest.mark.parametrize("backend", ["cuda", "ascend", "ascend_sp"])
 @pytest.mark.parametrize("rank", [0, 1, 2])
 @pytest.mark.parametrize("tracing", [False, True])
-def test_worker_uses_device_pair_network(backend, rank, tracing, tmp_path, monkeypatch):
+def test_worker_uses_device_pair_network(rank, tracing, tmp_path, monkeypatch):
     test_worker_comm_delay_excludes_peer_wait(
-        backend, rank, tracing, 1, tmp_path, monkeypatch, network=True
+        rank, tracing, 1, tmp_path, monkeypatch, network=True
     )

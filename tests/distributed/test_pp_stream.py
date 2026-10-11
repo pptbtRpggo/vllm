@@ -169,3 +169,59 @@ def test_background_layer_trace_uses_completed_event_reader():
     stream.drain()
     assert pending[0][0].query()
     assert pending[0][1]().layer_compute_ms == pytest.approx({"0": 2})
+
+
+def test_stage_wait_is_attributed_by_duration_with_separate_endpoints_and_overhead():
+    stream = DeferredStream()
+
+    class Module(torch.nn.Module):
+        def forward(self, milliseconds):
+            stream.work(milliseconds / 1000)
+
+    first, second, embedding, head = (Module() for _ in range(4))
+    timer = SimpleNamespace(
+        layers={0: first, 1: second},
+        endpoints={"embedding": embedding, "lm_head": head},
+    )
+
+    def forward():
+        stream.work(0.002)  # Runner work outside measured modules.
+        embedding(1)
+        first(2)
+        second(6)
+        head(3)
+
+    execution = PPStreamExecution(stream)
+    step, pending = PPStreamStep(), []
+    tracer = SimpleNamespace(
+        submit_ready_record=lambda event, resolve: pending.append((event, resolve))
+    )
+    execution.compute(forward, step, 3, "layer-measured", timer)
+    execution.finish_trace(step, SimpleNamespace(), tracer, True)
+    stream.drain()
+    record = pending[0][1]()
+    assert stream.waits == pytest.approx([28])  # One stage wait, not layer waits.
+    assert record.compute_base_ms == pytest.approx(14)
+    assert record.compute_wall_ms == pytest.approx(42)
+    assert record.layer_compute_ms == pytest.approx({"0": 6, "1": 18})
+    assert record.embedding_ms == pytest.approx(3)
+    assert record.lm_head_ms == pytest.approx(9)
+    assert record.runner_overhead_ms == pytest.approx(6)
+    assert record.non_layer_compute_ms == pytest.approx(18)
+
+
+def test_failed_forward_removes_hooks_and_does_not_submit_a_stage_wait():
+    stream = DeferredStream()
+
+    class Layer(torch.nn.Module):
+        def forward(self):
+            raise RuntimeError("model forward failed")
+
+    layer = Layer()
+    timer = SimpleNamespace(layers={0: layer}, endpoints={})
+    execution = PPStreamExecution(stream)
+    with pytest.raises(RuntimeError, match="model forward failed"):
+        execution.compute(layer, PPStreamStep(), 2, "layer-measured", timer)
+    assert not layer._forward_pre_hooks and not layer._forward_hooks
+    stream.drain()
+    assert not stream.waits

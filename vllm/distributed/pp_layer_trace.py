@@ -80,7 +80,6 @@ class PPLayerTimer:
         self.wall_timing = False
         self.mock_delay_ms = 0.0
         self.mock_requested_delay_ms = 0.0
-        self.mock_input_compute_ms = 0.0
         self.events: dict[int | str, tuple[Any, Any]] = {}
         self.finished: list[int] = []
         self.device_events = (
@@ -113,7 +112,6 @@ class PPLayerTimer:
         self.wall_timing = compute_scale is not None
         self.mock_delay_ms = 0.0
         self.mock_requested_delay_ms = 0.0
-        self.mock_input_compute_ms = 0.0
         self.events.clear()
         self.finished.clear()
         handles = []
@@ -138,7 +136,6 @@ class PPLayerTimer:
                     base_ms = max(
                         0.0, base_ms - (excluded_ms() - excluded_at_start[index])
                     )
-                self.mock_input_compute_ms += base_ms
                 stretch_after(base_ms, compute_scale)
                 self.mock_delay_ms += (time.perf_counter() - delay_start) * 1000
                 self.mock_requested_delay_ms += base_ms * max(0.0, compute_scale - 1)

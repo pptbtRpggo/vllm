@@ -80,7 +80,6 @@ def test_tp_worker_has_no_execute_sync_and_keeps_pending_batches_separate(
     worker._tp_hetero = config
     worker._tp_compute_model = None
     worker._tp_compute_delay = None
-    worker._tp_logged = False
     worker._tp_collectives = TPCollectiveDelay(comm, config, 2, stream)
     worker._tp_collectives.install()
     worker.model_runner = SimpleNamespace(model=model)

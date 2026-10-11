@@ -444,7 +444,7 @@ class PPHeteroConfig:
         return elapsed_ms + extra_ms
 
     def extra_transfer_ms(self, from_rank: int, payload_bytes: int) -> float:
-        """Pure delay calculation, usable from a stream-ordered callback."""
+        """Additional link delay in ms; the caller chooses how to apply it."""
         if self.network is not None:
             return self.transfer_ms(from_rank, payload_bytes) or 0.0
         scale = self.comm_scale(from_rank)
