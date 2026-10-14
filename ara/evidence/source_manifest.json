@@ -1,0 +1,62 @@
+{
+  "E01": {
+    "path": "output/pp_compute_gap_diagnosis_20261009/调查报告.md",
+    "sha256": "cff667598ab155b0a3b077136d982627e8f47ffab28549e58fdec3f05f255cc6"
+  },
+  "E02": {
+    "path": "output/pp_per_layer_kernel_20261009/实验报告.md",
+    "sha256": "af61cd00988588561ec5508f939e1d926a3bb601767777039bb492b4eb3e1623"
+  },
+  "E03": {
+    "path": "output/pp_layer_sum_verify_20261009/实验报告.md",
+    "sha256": "2792d0ca8b5d3b2fada6e9f9920ffa6bbf0dc23f11a6104546a397dc00b72886"
+  },
+  "E04": {
+    "path": "output/qwen_dp_recheck_272_20261009/实验报告.md",
+    "sha256": "c92934bfa5bbfe566a62fdabfb325bbec779bb6ce11d6806e9b61fccd2083974"
+  },
+  "E05": {
+    "path": "output/pp_slo_drop_diagnosis_20261012/SLO达标率下降_诊断报告.md",
+    "sha256": "30700cb1bb9b35beae55267a29681dcba2b388bf98b04eb45cdfbf66c62f4159"
+  },
+  "E06": {
+    "path": "output/pp_fixed16_slo_calibration_20261012/固定16_SLO校准结论.md",
+    "sha256": "f30a86c19f0c2b2c52e9b9bbc2f2b8d13a892067771506383f887851b2b38336"
+  },
+  "E07": {
+    "path": "output/mixed_prefill_fixed16_20261011/outline.md",
+    "sha256": "d3a76d79a757cf96b21869246f0348078076ef77e2cf4d5c1cb64d65a2731602"
+  },
+  "E08": {
+    "path": "output/mixed_prefill_fixed16_20261011/评价口径核对.json",
+    "sha256": "2e35f52e9be6d71a57f7371a79bf1573912e9033e2ad60f35f4932bfe7b996b4"
+  },
+  "E09": {
+    "path": "output/pp_fixed16_slo_calibration_20261012/recalibrated_figures_20261012/三策略_新SLO指标.csv",
+    "sha256": "7863a0b5d2cd124ce7e47106ac0b3621f9cf9b3ca1275303db488c464aab5f89"
+  },
+  "E10": {
+    "path": "output/pp_fixed16_slo_calibration_20261012/protocol.json",
+    "sha256": "e726ee3043d2af16f48f761d921384e3d312674229775ae6f8346074bf94027f"
+  },
+  "E11": {
+    "path": "output/mixed_prefill_fixed16_20261011/protocol.json",
+    "sha256": "64746c29631ebc8e8ba3982f328b623612b0030dc98725de412ff6d3aa9f1f6e"
+  },
+  "E12": {
+    "path": "output/mixed_prefill_fixed16_20261011/frozen_source/vllm/distributed/pp_layer_cost.py",
+    "sha256": "590508924ad93f964d729edd0992685129ba6595e1b0b111d282ecf109ac369e"
+  },
+  "E13": {
+    "path": "output/mixed_prefill_fixed16_20261011/frozen_source/vllm/distributed/pp_stream.py",
+    "sha256": "09dc30dcd4db2921d0d88cef36d955d2eb476a7b84d35dfe97c90c6a4e627e57"
+  },
+  "E14": {
+    "path": "output/pp_fixed16_slo_calibration_20261012/recalibrated_figures_20261012/combined_slo_table/来源核对.json",
+    "sha256": "4eaff682549d056d612dc745e515e3a1efde5a6a32412d9eca7b3371b72859ae"
+  },
+  "E15": {
+    "path": "output/pp_fixed16_slo_calibration_20261012/recalibrated_figures_20261012/combined_slo_table/三份备份核对.json",
+    "sha256": "2437e9842547e7e664a9c496434aa07a9fe10aac2d63607a22c5441409531dd5"
+  }
+}

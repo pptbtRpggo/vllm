@@ -1,0 +1,137 @@
+{
+  "recorded_on": "2026-10-14",
+  "scope": "Retrospective of verified artifacts and explicit user choices; not a complete historical transcript",
+  "tree": [
+    {
+      "id": "N01",
+      "type": "question",
+      "title": "复盘异构LLM实验并提炼可复用的方法",
+      "provenance": "user",
+      "timestamp": "2026-10-14",
+      "description": "本线程用户请求总结方法论、实验方式和防错经验。节点timestamp为本次复盘记录日期，不表示原实验执行日。",
+      "children": [
+        {
+          "id": "N02",
+          "type": "experiment",
+          "title": "Stage3基础区间定点干预",
+          "provenance": "ai-executed",
+          "timestamp": "2026-10-14",
+          "result": "仅Stage2多等20 ms，Stage3短decode区间24.77→14.61 ms，独立event核对一致。",
+          "evidence": [
+            "C01",
+            "C02",
+            "E01"
+          ],
+          "children": [
+            {
+              "id": "N03",
+              "type": "dead_end",
+              "title": "用内部倍率自洽替代外部精度验证",
+              "provenance": "ai-suggested",
+              "timestamp": "2026-10-14",
+              "hypothesis": "总区间/本次基础区间=4即可证明真实四分之一算力等效。",
+              "failure_mode": "基础区间随时序改变，相对无等待参考仅约2.36倍。",
+              "lesson": "明确物理目标，使用独立参考；不能把计时区间自动称纯计算。"
+            }
+          ]
+        },
+        {
+          "id": "N04",
+          "type": "experiment",
+          "title": "逐层等待原型与零等待对照",
+          "provenance": "ai-executed",
+          "timestamp": "2026-10-14",
+          "result": "eager/Graph零等待TTFT分别增加5.6%/6.4%，Graph decode部分区间通过倍率验证但prefill与stage总区间未同样通过。",
+          "evidence": [
+            "C03",
+            "E02",
+            "E03"
+          ]
+        },
+        {
+          "id": "N05",
+          "type": "experiment",
+          "title": "Qwen272/8旧DP与预设候选复测",
+          "provenance": "ai-executed",
+          "timestamp": "2026-10-14",
+          "result": "两批新profile仍推荐1/27；512请求P99分别为1/27的737.8 ms和27/1的395.9 ms，保留两段及所有候选。",
+          "evidence": [
+            "C05",
+            "E04"
+          ]
+        },
+        {
+          "id": "N06",
+          "type": "decision",
+          "title": "固定16三策略采用各stage本地一次等待",
+          "provenance": "user",
+          "timestamp": "2026-10-14",
+          "choice": "用户明确选用刚才27/1复测的机制；三来源混合、PP/TP/EdgeShard全场景、输出16。",
+          "alternatives": [
+            "stage0参照等待",
+            "自然回复长度"
+          ],
+          "evidence": [
+            "E07",
+            "E11"
+          ]
+        },
+        {
+          "id": "N07",
+          "type": "experiment",
+          "title": "闭环输出长度与到达节奏诊断",
+          "provenance": "ai-executed",
+          "timestamp": "2026-10-14",
+          "result": "Qwen C64固定16闭环17.38%/17.58%，固定16重放旧到达84.18%/84.38%；自然输出86.33%/86.33%。",
+          "evidence": [
+            "C04",
+            "E05"
+          ],
+          "children": [
+            {
+              "id": "N08",
+              "type": "decision",
+              "title": "按固定16协议重新校准SLO",
+              "provenance": "user",
+              "timestamp": "2026-10-14",
+              "choice": "用户要求拿固定16条件反过来校准；九配置18点共9216请求，校准和新验证分离，验证前冻结门槛。",
+              "alternatives": [
+                "继续把旧自然输出门槛当作同协议复验"
+              ],
+              "evidence": [
+                "E06",
+                "E10"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "N09",
+          "type": "decision",
+          "title": "明确100%实测覆盖目标与P95/P85门槛来源",
+          "provenance": "user-revised",
+          "timestamp": "2026-10-14",
+          "choice": "P95/P85仅用于取时间门槛；图上仍展示P99/P90，实测目标100%。",
+          "alternatives": [
+            "将P95/P85当作图上TTFT或覆盖要求"
+          ],
+          "evidence": [
+            "C06",
+            "E08",
+            "E14"
+          ]
+        },
+        {
+          "id": "N10",
+          "type": "dead_end",
+          "title": "默认DP预测最优就是端到端全局最优",
+          "provenance": "ai-suggested",
+          "timestamp": "2026-10-14",
+          "hypothesis": "平均layer成本的DP最优能直接保证P99 TTFT最优。",
+          "failure_mode": "已测候选存在预测选择1/27的P99高于27/1；均值目标、phase权重、负载依赖及模式差异需分别验证。",
+          "lesson": "算法枚举检查与模型实测验证分开；调参和最终评价分离。"
+        }
+      ]
+    }
+  ]
+}

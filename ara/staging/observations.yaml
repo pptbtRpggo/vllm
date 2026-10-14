@@ -1,0 +1,24 @@
+{
+  "observations": [
+    {
+      "id": "O01",
+      "timestamp": "2026-10-14",
+      "provenance": "ai-suggested",
+      "content": "真实异构硬件上的等效精度未建立；需要单独物理目标和测量。",
+      "context": "软件等待模型复盘",
+      "potential_type": "claim",
+      "promoted": true,
+      "claim": "C08"
+    },
+    {
+      "id": "O02",
+      "timestamp": "2026-10-14",
+      "provenance": "ai-suggested",
+      "content": "更合适的DP模型或硬件环境可能改善表现，但当前资料不能保证自动恢复全局最优。",
+      "context": "成本模型与端到端优化范围",
+      "potential_type": "claim",
+      "promoted": true,
+      "claim": "C09"
+    }
+  ]
+}

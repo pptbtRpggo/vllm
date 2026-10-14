@@ -1,0 +1,196 @@
+{
+  "session": {
+    "id": "2026-10-14_001",
+    "timestamp": "2026-10-14",
+    "summary": "复核计时、逐层原型、DP候选、输出/到达过程诊断和SLO口径，形成10条防错建议。"
+  },
+  "events_logged": [
+    {
+      "type": "question",
+      "id": "N01",
+      "provenance": "user",
+      "summary": "复盘异构LLM实验并提炼可复用的方法"
+    },
+    {
+      "type": "experiment",
+      "id": "N02",
+      "provenance": "ai-executed",
+      "summary": "Stage3基础区间定点干预"
+    },
+    {
+      "type": "dead_end",
+      "id": "N03",
+      "provenance": "ai-suggested",
+      "summary": "用内部倍率自洽替代外部精度验证"
+    },
+    {
+      "type": "experiment",
+      "id": "N04",
+      "provenance": "ai-executed",
+      "summary": "逐层等待原型与零等待对照"
+    },
+    {
+      "type": "experiment",
+      "id": "N05",
+      "provenance": "ai-executed",
+      "summary": "Qwen272/8旧DP与预设候选复测"
+    },
+    {
+      "type": "decision",
+      "id": "N06",
+      "provenance": "user",
+      "summary": "固定16三策略采用各stage本地一次等待"
+    },
+    {
+      "type": "experiment",
+      "id": "N07",
+      "provenance": "ai-executed",
+      "summary": "闭环输出长度与到达节奏诊断"
+    },
+    {
+      "type": "decision",
+      "id": "N08",
+      "provenance": "user",
+      "summary": "按固定16协议重新校准SLO"
+    },
+    {
+      "type": "decision",
+      "id": "N09",
+      "provenance": "user-revised",
+      "summary": "明确100%实测覆盖目标与P95/P85门槛来源"
+    },
+    {
+      "type": "dead_end",
+      "id": "N10",
+      "provenance": "ai-suggested",
+      "summary": "默认DP预测最优就是端到端全局最优"
+    },
+    {
+      "type": "claim",
+      "id": "C01",
+      "provenance": "ai-suggested",
+      "summary": "上游等待会改变下游被测基础区间"
+    },
+    {
+      "type": "claim",
+      "id": "C02",
+      "provenance": "ai-suggested",
+      "summary": "等待公式自洽不能独立验证硬件等效精度"
+    },
+    {
+      "type": "claim",
+      "id": "C03",
+      "provenance": "ai-suggested",
+      "summary": "逐层零等待路径存在可测开销"
+    },
+    {
+      "type": "claim",
+      "id": "C04",
+      "provenance": "ai-suggested",
+      "summary": "固定输出会通过闭环到达过程影响TTFT"
+    },
+    {
+      "type": "claim",
+      "id": "C05",
+      "provenance": "ai-suggested",
+      "summary": "DP推荐切分的端到端表现需要验证"
+    },
+    {
+      "type": "claim",
+      "id": "C06",
+      "provenance": "user-revised",
+      "summary": "门槛来源、场景分位数和覆盖目标应分别定义"
+    },
+    {
+      "type": "claim",
+      "id": "C07",
+      "provenance": "ai-suggested",
+      "summary": "匹配协议校准仍不能强制独立验证比例"
+    },
+    {
+      "type": "claim",
+      "id": "C08",
+      "provenance": "ai-suggested",
+      "summary": "当前软件等待已等效真实项目异构硬件"
+    },
+    {
+      "type": "claim",
+      "id": "C09",
+      "provenance": "ai-suggested",
+      "summary": "当前DP在所有负载上给出实测全局最优"
+    }
+  ],
+  "ai_actions": [
+    {
+      "action": "只读核对本地报告、协议和冻结源码；新建研究复盘记录，未修改实验原始数据或生产代码。",
+      "provenance": "ai-executed",
+      "files_changed": [
+        "ara/"
+      ]
+    }
+  ],
+  "claims_touched": [
+    {
+      "id": "C01",
+      "action": "created",
+      "provenance": "ai-suggested"
+    },
+    {
+      "id": "C02",
+      "action": "created",
+      "provenance": "ai-suggested"
+    },
+    {
+      "id": "C03",
+      "action": "created",
+      "provenance": "ai-suggested"
+    },
+    {
+      "id": "C04",
+      "action": "created",
+      "provenance": "ai-suggested"
+    },
+    {
+      "id": "C05",
+      "action": "created",
+      "provenance": "ai-suggested"
+    },
+    {
+      "id": "C06",
+      "action": "created",
+      "provenance": "user-revised"
+    },
+    {
+      "id": "C07",
+      "action": "created",
+      "provenance": "ai-suggested"
+    },
+    {
+      "id": "C08",
+      "action": "created",
+      "provenance": "ai-suggested"
+    },
+    {
+      "id": "C09",
+      "action": "created",
+      "provenance": "ai-suggested"
+    }
+  ],
+  "open_threads": [
+    "真实异构硬件等效验证",
+    "与TTFT尾延迟目标一致的成本模型和候选验证",
+    "跨服务重启/长时间的稳定性验证"
+  ],
+  "ai_suggestions_pending": [
+    "H01: 先把评价目标写成完整合同",
+    "H02: 计时区间必须有边界和包含项",
+    "H03: 模拟机制先通过独立验收再做全量比较",
+    "H04: 工作负载包括到达过程，不只有数据集与并发",
+    "H05: 用端到端留出验证检查DP模型的有效性",
+    "H06: 异常用定点干预，不先给强因果故事",
+    "H07: 统计设计按尾部和相关性决定",
+    "H08: 先小而有辨别力，再决定全量实验",
+    "H09: 把原始数据到图表做成可复算链条",
+    "H10: 探索更优与独立证明分开"
+  ]
+}
