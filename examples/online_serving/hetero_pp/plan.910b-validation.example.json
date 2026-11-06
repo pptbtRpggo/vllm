@@ -1,0 +1,10 @@
+{
+  "validation_mode": "910b_only",
+  "timeout_s": 420,
+  "stages": [
+    {"node_ip": "192.0.2.10", "soc": "910B", "layers": 12},
+    {"node_ip": "192.0.2.10", "soc": "910B", "layers": 8},
+    {"node_ip": "192.0.2.20", "soc": "910B", "layers": 7},
+    {"node_ip": "192.0.2.20", "soc": "910B", "layers": 5}
+  ]
+}

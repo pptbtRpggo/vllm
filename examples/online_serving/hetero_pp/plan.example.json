@@ -1,0 +1,9 @@
+{
+  "timeout_s": 1200,
+  "stages": [
+    {"node_ip": "192.0.2.10", "soc": "910B", "layers": 18},
+    {"node_ip": "192.0.2.10", "soc": "910B", "layers": 18},
+    {"node_ip": "192.0.2.20", "soc": "310P", "layers": 6},
+    {"node_ip": "192.0.2.20", "soc": "310P", "layers": 6}
+  ]
+}
