@@ -19,6 +19,7 @@ def main():
     import vllm.entrypoints.cli.collect_env
     import vllm.entrypoints.cli.launch
     import vllm.entrypoints.cli.openai
+    import vllm.entrypoints.cli.pp_profile
     import vllm.entrypoints.cli.run_batch
     import vllm.entrypoints.cli.serve
     from vllm.entrypoints.serve.utils.api_utils import (
@@ -29,6 +30,7 @@ def main():
 
     CMD_MODULES = [
         vllm.entrypoints.cli.openai,
+        vllm.entrypoints.cli.pp_profile,
         vllm.entrypoints.cli.serve,
         vllm.entrypoints.cli.launch,
         vllm.entrypoints.cli.benchmark.main,

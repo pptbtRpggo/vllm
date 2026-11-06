@@ -1,5 +1,9 @@
 # EdgeShard profiling 与 vLLM 0.23 的核查结果
 
+> 这是后续实现开始前、提交 `ad0bb3f19e` 时的核查快照。下文的“没有迁移”
+> 描述该历史时点，不代表当前分支状态。后续实现和当前使用方法见
+> [v0.23 EdgeShard 式 profiling 指南](../usage/edgeshard_v023_zh.md)。
+
 核查日期：2026-11-06。
 
 **结论：此前实现的 EdgeShard 式 profiling 在 vLLM 0.13.0 派生代码中；
