@@ -62,7 +62,7 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 export LD_LIBRARY_PATH="/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$REPO:${PYTHONPATH:-}"
-SITE="$($PY -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+SITE="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 export LD_LIBRARY_PATH="$SITE/vllm_ascend:$LD_LIBRARY_PATH"
 export GLOO_SOCKET_IFNAME=eth0
 export VLLM_HOST_IP="$NODE_IP"
@@ -103,6 +103,17 @@ npu-smi info
 两端需要相同的模型配置、tokenizer 和权重。可使用每端各一份、同路径且
 逐文件 SHA 相同的副本，也可使用双方真正可访问的共享模型目录。
 本次 hw/hw2 的 userdata 是共享存储；两端看到同一份文件并不构成两个独立备份。
+
+在本次仍存续的实例上，第 1 节的路径可以直接填为：
+
+```bash
+export REPO=/home/m7zhang/userdata/hetero_pp_v023_20261106_d5a6b52b99/source
+export VENV=/home/m7zhang/userdata/vllm_pd_latest_runtime_20261024/venv
+export MODEL=/home/m7zhang/userdata/hetero_pp_v023_20261106_d5a6b52b99/model
+```
+
+这是独立的完整 v0.23 源码树；复用了匹配环境的生成版本文件和同一份共享模型，
+没有替换原安装。测试结束后本次 Ray/API 会停止，手动使用时仍需按下面顺序启动。
 
 ## 2. 终端一：在 hw 启动 Ray head
 

@@ -77,6 +77,9 @@ Git 祖先检查确认该提交继承自 `v0.13.0`，不继承自 `v0.23.0`。
 `set_pp_profile_warmup` 或 `get_pp_memory_observation` RPC。
 旧采样客户端需要这些能力，不能在新 worker 上直接假定它们存在。
 
+原生 Ascend runner 仍会做自己的显存估算、`profile_run` 和模型预热；
+启动日志里出现 `profile` 不等于已经接入 EdgeShard 式逐层成本采集与 DP 自动分层。
+
 两类验证要分别理解：
 
 - 新 PP 功能验证回答：tensor 能否正确传递、每张卡是否装载指定层、
