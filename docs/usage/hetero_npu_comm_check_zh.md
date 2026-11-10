@@ -5,6 +5,57 @@
 `verify_cpu_gloo.py`、`TensorDictChannel` 和 `CpuStagingTransport`。
 它验证 NPU→CPU→Gloo→CPU→NPU 的内容与完成依赖，不测带宽或模型推理。
 
+## 使用 Docker：在两台宿主机执行
+
+宿主机需要已有 Docker、NPU 驱动，以及各自相同版本的本分支源码。
+镜像提供 CANN/TorchNPU，不能只复制 910B 的 Python 环境给 310P 使用。
+选择与本机驱动、设备及 CPU 架构兼容的镜像；管理员提供的适配镜像优先。
+以下官方 310P 镜像按 Atlas 300I DUO 的设备映射举例，其他板卡以管理员配置为准。
+
+在 **910B 宿主机** 的项目根目录执行：
+
+```bash
+bash examples/online_serving/hetero_pp/check_cpu_gloo_docker.sh \
+  --soc 910b --head 192.168.1.10
+```
+
+在 **310P 宿主机** 的项目根目录执行：
+
+```bash
+bash examples/online_serving/hetero_pp/check_cpu_gloo_docker.sh \
+  --soc 310p --head 192.168.1.10
+```
+
+两端的 `192.168.1.10` 均替换为同一台宿主机的真实网卡 IPv4。
+先启动的一端会等待另一端；需要在两个终端分别启动，不能等第一端结束。
+如果当前已在管理员启动的配套容器内，直接使用下一节的非 Docker 入口，
+不要在容器里再次启动 Docker。
+
+自定义镜像或设备号：
+
+```bash
+bash examples/online_serving/hetero_pp/check_cpu_gloo_docker.sh \
+  --image registry.example.com/admin/npu-image:tag \
+  --head 192.168.1.10 --devices 0,1
+```
+
+默认映射 `/dev/davinci0`、`/dev/davinci1` 和三个管理设备
+`davinci_manager`、`devmm_svm`、`hisi_hdc`，所选设备须存在且空闲。
+映射宿主机驱动库及项目目录，但不覆盖镜像的整个 `/usr/local/Ascend`，
+不安装依赖或修改驱动。支持从常见 bin/sbin 位置映射 `npu-smi`。
+其他板卡的特殊设备映射需使用管理员的容器命令，再在容器内调用原入口。
+
+脚本使用 host 网络；两机需允许 19090、19091 和 Gloo 动态 TCP 连接。
+`--port`、`--timeout`、`--interface`、`--cann-env` 可传给容器内原测试入口；
+`--cann-env` 指容器内路径。测试固定使用镜像 PATH 中的 Python，
+避免误用项目内从其他机器复制的虚拟环境。
+`--timeout` 不包括 Docker 镜像拉取时间；首次运行可能需要下载镜像。
+加 `--dry-run` 只显示命令，不拉取镜像或启动测试。
+
+容器退出后自动删除，日志仍保留在宿主机项目 `output/comm_check_*/`。
+两端都返回 0 且生成各自的 `complete.json` 才算通过；Docker 能启动不代表通信通过。
+本 Docker 封装只做了本地命令生成/错误传递检查，实际异构验证以本轮硬件回执为准。
+
 ## 运行
 
 两端同步本分支源码；每端使用适配本机 SoC 的现有 TorchNPU/CANN 环境。
