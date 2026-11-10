@@ -6,10 +6,13 @@ Requires Python 3.9+ and 7-Zip or WinRAR. No third-party Python packages.
 Directories: encrypted first archive -> random new name -> ordinary outer archive.
 Use --encrypt-outer to encrypt the outer archive with the same password as well.
 Files: preserve the original single-layer encrypted wrapping behavior.
+Explicit --backend winrar-zip uses weak ZipCrypto for traditional Linux unzip.
+ZIP cannot hide filenames. Enter the same password in WinRAR's password dialog.
 Example:
     encrypt_archive.py D:\\project --backend winrar --output D:\\backup.rar
     encrypt_archive.py original.zip --name renamed.zip --output protected.7z
     encrypt_archive.py original.zip --backend winrar --output protected.rar
+    encrypt_archive.py D:\\project --backend winrar-zip --output D:\\delivery.zip
 """
 
 import argparse
@@ -22,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import warnings
+import zipfile
 from pathlib import Path
 
 
@@ -97,23 +101,60 @@ def find_winrar(explicit=None):
     )
 
 
+def find_winrar_gui(explicit=None):
+    """Find WinRAR.exe, required because console Rar.exe cannot create ZIP."""
+    if explicit:
+        candidate = Path(explicit).expanduser().resolve()
+        if candidate.name.lower() == "rar.exe":
+            candidate = candidate.with_name("WinRAR.exe")
+        if candidate.name.lower() != "winrar.exe" or not candidate.is_file():
+            raise FileNotFoundError(f"ZIP 模式需要 WinRAR.exe：{candidate}")
+        return str(candidate)
+    found = shutil.which("WinRAR.exe")
+    if found:
+        return found
+    for variable in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        root = os.environ.get(variable)
+        if root:
+            for relative in ("WinRAR/WinRAR.exe", "Programs/WinRAR/WinRAR.exe"):
+                candidate = Path(root) / relative
+                if candidate.is_file():
+                    return str(candidate)
+    raise FileNotFoundError(
+        '未找到 WinRAR.exe。请指定 --winrar "C:\\Program Files\\WinRAR\\WinRAR.exe"。'
+    )
+
+
+def archive_extension(backend):
+    """Return the output extension of an explicitly supported backend."""
+    formats = {"7zip": ".7z", "winrar": ".rar", "winrar-zip": ".zip"}
+    if backend not in formats:
+        raise ValueError(f"未知的压缩工具：{backend}")
+    return formats[backend]
+
+
 def select_backend(backend="auto", output=None, seven_zip=None, winrar=None):
     """Select the format explicitly, by extension, or by installed tools."""
     if seven_zip:
-        if backend == "winrar" or winrar:
+        if backend in ("winrar", "winrar-zip") or winrar:
             raise ValueError("7-Zip 与 WinRAR 的选项不能同时指定。")
         backend = "7zip"
     if winrar:
         if backend == "7zip":
             raise ValueError("7-Zip 与 WinRAR 的选项不能同时指定。")
-        backend = "winrar"
+        if backend != "winrar-zip":
+            backend = "winrar"
     if backend == "auto" and output:
         suffix = Path(output).suffix.lower()
+        if suffix == ".zip":
+            raise ValueError("兼容 ZIP 使用较弱加密，请显式指定 --backend winrar-zip。")
         if suffix not in (".7z", ".rar"):
             raise ValueError("输出文件名必须以 .7z 或 .rar 结尾。")
         backend = "winrar" if suffix == ".rar" else "7zip"
     if backend == "winrar":
         return backend, find_winrar(winrar)
+    if backend == "winrar-zip":
+        return backend, find_winrar_gui(winrar)
     if backend == "7zip":
         return backend, find_7zip(seven_zip)
     if backend != "auto":
@@ -177,11 +218,74 @@ def run_winrar(executable, arguments, password=None, cwd=None):
         raise RuntimeError(f"WinRAR 操作失败（代码 {result.returncode}）：\n{detail}")
 
 
+def run_winrar_gui(executable, arguments, cwd=None):
+    """Let WinRAR ask for its password in a GUI, never in process arguments."""
+    result = subprocess.run(
+        [str(executable), *arguments],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=cwd,
+        timeout=3600,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"WinRAR ZIP 操作失败或被取消（代码 {result.returncode}）。")
+
+
+def validate_password(password, backend):
+    """Validate format limits before starting an archiver or writing output."""
+    if not password or any(char in password for char in "\r\n\x00"):
+        raise ValueError("密码不能为空，也不能包含换行或 NUL 字符。")
+    if backend == "winrar":
+        encode_rar_password(password)
+    elif backend == "winrar-zip" and (
+        len(password) > 127 or any(not 32 <= ord(char) <= 126 for char in password)
+    ):
+        raise ValueError(
+            "ZIP 兼容密码须为 1～127 位可打印 ASCII 字符：英文、数字或符号。"
+        )
+
+
+def check_zip_compatibility(archive, password):
+    """Reject AES ZIP, unsupported compression, missing encryption and bad CRC."""
+    with zipfile.ZipFile(archive) as zipped:
+        for member in zipped.infolist():
+            if member.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                raise ValueError(
+                    "ZIP 使用了 AES 或不兼容的压缩方法，不能交给传统 unzip。"
+                )
+            if member.flag_bits & 0x40:
+                raise ValueError("ZIP 使用了不兼容的强加密格式。")
+            if not member.is_dir() and bool(member.flag_bits & 1) != (
+                password is not None
+            ):
+                raise ValueError("ZIP 文件的实际加密状态与要求不一致。")
+        if password is not None:
+            zipped.setpassword(password.encode("ascii"))
+        try:
+            bad_file = zipped.testzip()
+        except RuntimeError as error:
+            raise ValueError(
+                "ZIP 解密校验失败，请在 WinRAR 窗口输入与终端相同的密码。"
+            ) from error
+        if bad_file is not None:
+            raise ValueError(f"ZIP 完整性校验失败：{bad_file}")
+
+
 def create_archive(source, output, password, executable, backend):
     """Archive one explicit file or directory without following symbolic links."""
     source, output = Path(source), Path(output)
     member = "." + os.sep + source.name
-    if backend == "winrar":
+    if backend == "winrar-zip":
+        arguments = ["a", "-cfg-", "-afzip", "-mezl", "-ep1", "-m1"]
+        if source.is_dir():
+            arguments.append("-r")
+        if password is not None:
+            arguments.append("-p")
+        arguments.extend([str(output), member])
+        run_winrar_gui(executable, arguments, cwd=source.parent)
+    elif backend == "winrar":
         arguments = ["a", "-cfg-", "-ma5", "-ep1", "-m1", "-y"]
         if source.is_dir():
             arguments.extend(["-r", "-ol"])
@@ -201,7 +305,9 @@ def create_archive(source, output, password, executable, backend):
 
 def test_archive(archive, password, executable, backend):
     """Check an entire archive before publishing or using it as the next input."""
-    if backend == "winrar":
+    if backend == "winrar-zip":
+        check_zip_compatibility(archive, password)
+    elif backend == "winrar":
         arguments = ["t", "-cfg-"]
         if password is not None:
             arguments.append("-p")
@@ -221,8 +327,8 @@ def check_project_links(source):
                 reparse = getattr(info, "st_file_attributes", 0) & 0x400
                 if stat.S_ISLNK(info.st_mode) or reparse:
                     raise ValueError(
-                        f"7-Zip 目录模式不支持此链接或重解析点：{entry.path}。"
-                        "请改用 --backend winrar，避免链接恢复不完整。"
+                        f"当前格式的目录模式不支持此链接或重解析点：{entry.path}。"
+                        "请改用 RAR 模式 --backend winrar，避免链接恢复不完整。"
                     )
                 if stat.S_ISDIR(info.st_mode):
                     pending.append(Path(entry.path))
@@ -240,19 +346,14 @@ def publish(temporary, output):
 def encrypt_archive(source, output, inner_name, password, executable, backend="7zip"):
     """Wrap the renamed source in an encrypted archive and test it."""
     validate_name(inner_name)
-    if not password or any(char in password for char in "\r\n\x00"):
-        raise ValueError("密码不能为空，也不能包含换行或 NUL 字符。")
+    validate_password(password, backend)
     source = Path(source).expanduser().resolve(strict=True)
     output = Path(output).expanduser().absolute()
     if not source.is_file():
         raise ValueError("输入必须是一个文件。")
-    if backend not in ("7zip", "winrar"):
-        raise ValueError(f"未知的压缩工具：{backend}")
-    extension = ".rar" if backend == "winrar" else ".7z"
+    extension = archive_extension(backend)
     if output.suffix.lower() != extension:
         raise ValueError(f"输出文件名必须以 {extension} 结尾。")
-    if backend == "winrar":
-        encode_rar_password(password)
     if os.path.lexists(output):
         raise FileExistsError(f"输出已经存在，未覆盖：{output}")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -288,22 +389,17 @@ def encrypt_project(
     output = Path(output).expanduser().absolute()
     if not source.is_dir() or source == source.parent:
         raise ValueError("输入必须是具体的项目目录，不能是磁盘根目录。")
-    if backend not in ("7zip", "winrar"):
-        raise ValueError(f"未知的压缩工具：{backend}")
-    extension = ".rar" if backend == "winrar" else ".7z"
+    extension = archive_extension(backend)
     validate_name(inner_name)
     if not inner_name.lower().endswith(extension) or output.suffix.lower() != extension:
         raise ValueError(f"第一层新名字和输出文件名都必须以 {extension} 结尾。")
-    if not password or any(char in password for char in "\r\n\x00"):
-        raise ValueError("密码不能为空，也不能包含换行或 NUL 字符。")
-    if backend == "winrar":
-        encode_rar_password(password)
+    validate_password(password, backend)
     resolved_output = output.resolve()
     if resolved_output == source or source in resolved_output.parents:
         raise ValueError("输出必须放在项目目录外，避免把生成中的压缩包打包进自己。")
     if os.path.lexists(output):
         raise FileExistsError(f"输出已经存在，未覆盖：{output}")
-    if backend == "7zip":
+    if backend in ("7zip", "winrar-zip"):
         check_project_links(source)
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -339,7 +435,7 @@ def main():
     parser.add_argument("source", nargs="?", help="项目目录，或要封装的已有文件")
     parser.add_argument("--name", help="第一层压缩包的新名字，目录模式默认自动随机命名")
     parser.add_argument(
-        "--output", help="最终外层 .7z 或 .rar 文件路径，放在项目目录外"
+        "--output", help="最终外层 .7z、.rar 或兼容 .zip 文件路径，放在项目目录外"
     )
     parser.add_argument(
         "--encrypt-outer",
@@ -348,13 +444,13 @@ def main():
     )
     parser.add_argument(
         "--backend",
-        choices=("auto", "7zip", "winrar"),
+        choices=("auto", "7zip", "winrar", "winrar-zip"),
         default="auto",
-        help="压缩工具，默认自动查找",
+        help="压缩工具；winrar-zip 为传统 unzip 的弱加密兼容模式",
     )
     programs = parser.add_mutually_exclusive_group()
     programs.add_argument("--seven-zip", help="手动指定 7z.exe 路径")
-    programs.add_argument("--winrar", help="手动指定 WinRAR 目录中的 Rar.exe 路径")
+    programs.add_argument("--winrar", help="WinRAR 工具路径；ZIP 模式使用 WinRAR.exe")
     args = parser.parse_args()
     source = Path(args.source or input("项目目录或文件路径：").strip().strip('"'))
     if not source.is_file() and not source.is_dir():
@@ -362,7 +458,7 @@ def main():
     backend, executable = select_backend(
         args.backend, args.output, args.seven_zip, args.winrar
     )
-    extension = ".rar" if backend == "winrar" else ".7z"
+    extension = archive_extension(backend)
     suffix = (
         extension
         if source.is_dir()
@@ -395,6 +491,12 @@ def main():
         confirmation = getpass.getpass("再次输入新密码：")
     if password != confirmation:
         raise ValueError("两次密码不一致，未生成压缩包。")
+    validate_password(password, backend)
+    if backend == "winrar-zip":
+        print("ZIP 兼容模式：使用较弱的 ZipCrypto，文件名可见。", flush=True)
+        print(
+            "请在随后 WinRAR 弹出的密码窗口中输入相同密码；脚本会校验匹配。", flush=True
+        )
     print("正在加密并检查完整性，请稍候……", flush=True)
     if source.is_dir():
         result = encrypt_project(
@@ -427,6 +529,7 @@ if __name__ == "__main__":
         subprocess.TimeoutExpired,
         getpass.GetPassWarning,
         EOFError,
+        zipfile.BadZipFile,
     ) as error:
         print(f"失败：{error}", file=sys.stderr)
         sys.exit(1)
