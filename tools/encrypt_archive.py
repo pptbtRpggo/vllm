@@ -8,6 +8,7 @@ Use --encrypt-outer to encrypt the outer archive with the same password as well.
 Files: preserve the original single-layer encrypted wrapping behavior.
 Explicit --backend winrar-zip uses weak ZipCrypto for traditional Linux unzip.
 ZIP cannot hide filenames. Enter the same password in WinRAR's password dialog.
+Creation skips full decryption/CRC tests; ZIP checks inspect metadata only.
 Example:
     encrypt_archive.py D:\\project --backend winrar --output D:\\backup.rar
     encrypt_archive.py original.zip --name renamed.zip --output protected.7z
@@ -24,7 +25,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
 import warnings
 import zipfile
 from pathlib import Path
@@ -249,7 +249,7 @@ def validate_password(password, backend):
 
 
 def check_zip_compatibility(archive, password):
-    """Check every ZIP member to EOF, with progress during slow decryption."""
+    """Inspect ZIP format and encryption flags without decrypting file contents."""
     with zipfile.ZipFile(archive) as zipped:
         members = zipped.infolist()
         for member in members:
@@ -263,52 +263,6 @@ def check_zip_compatibility(archive, password):
                 password is not None
             ):
                 raise ValueError("ZIP 文件的实际加密状态与要求不一致。")
-        if password is not None:
-            zipped.setpassword(password.encode("ascii"))
-        total = sum(member.file_size for member in members)
-        processed = 0
-        completed = 0
-        started = last_report = time.monotonic()
-        print(
-            f"ZIP 解密/CRC 校验：0.0% | 共 {total / 2**20:.1f} MiB（解压后）"
-            f"，{len(members)} 个成员；加密大包校验可能较慢。",
-            flush=True,
-        )
-        try:
-            for member in members:
-                # Passing ZipInfo also verifies duplicate-name entries separately.
-                # Reading to EOF preserves zipfile's full decryption and CRC check.
-                with zipped.open(member) as contents:
-                    while True:
-                        chunk = contents.read(64 * 1024)
-                        if not chunk:
-                            break
-                        processed += len(chunk)
-                        now = time.monotonic()
-                        if now - last_report >= 2:
-                            elapsed = max(now - started, 0.001)
-                            percent = min(99.9, processed * 100 / total) if total else 0
-                            print(
-                                f"ZIP 校验：{percent:.1f}% | "
-                                f"{processed / 2**20:.1f}/{total / 2**20:.1f} MiB | "
-                                f"成员 {completed}/{len(members)} | "
-                                f"{processed / 2**20 / elapsed:.2f} MiB/s"
-                                "（解压后数据）",
-                                flush=True,
-                            )
-                            last_report = now
-                completed += 1
-        except RuntimeError as error:
-            raise ValueError(
-                "ZIP 解密校验失败，请在 WinRAR 窗口输入与终端相同的密码。"
-            ) from error
-    elapsed = max(time.monotonic() - started, 0.001)
-    print(
-        f"ZIP 完整性校验完成：100.0% | {completed}/{len(members)} 个成员 | "
-        f"{processed / 2**20:.1f} MiB | {processed / 2**20 / elapsed:.2f} MiB/s"
-        f"（解压后数据） | 用时 {elapsed:.1f} 秒",
-        flush=True,
-    )
 
 
 def create_archive(source, output, password, executable, backend):
@@ -341,18 +295,13 @@ def create_archive(source, output, password, executable, backend):
         run_7zip(executable, arguments, password, cwd=source.parent)
 
 
-def test_archive(archive, password, executable, backend):
-    """Check an entire archive before publishing or using it as the next input."""
+def check_archive_output(archive, password, backend):
+    """Require nonempty output and compatible ZIP metadata, with no full test."""
+    archive = Path(archive)
+    if not archive.is_file() or archive.stat().st_size == 0:
+        raise RuntimeError(f"压缩工具未生成非空压缩包：{archive}")
     if backend == "winrar-zip":
         check_zip_compatibility(archive, password)
-    elif backend == "winrar":
-        arguments = ["t", "-cfg-"]
-        if password is not None:
-            arguments.append("-p")
-        arguments.append(str(archive))
-        run_winrar(executable, arguments, password)
-    else:
-        run_7zip(executable, ["t", str(archive)], password)
 
 
 def check_project_links(source):
@@ -382,7 +331,7 @@ def publish(temporary, output):
 
 
 def encrypt_archive(source, output, inner_name, password, executable, backend="7zip"):
-    """Wrap the renamed source in an encrypted archive and test it."""
+    """Wrap the renamed source in an encrypted archive without a full test."""
     validate_name(inner_name)
     validate_password(password, backend)
     source = Path(source).expanduser().resolve(strict=True)
@@ -408,7 +357,7 @@ def encrypt_archive(source, output, inner_name, password, executable, backend="7
         shutil.copyfile(source, renamed)
         temporary = Path(output_dir) / ("encrypted" + extension)
         create_archive(renamed, temporary, password, executable, backend)
-        test_archive(temporary, password, executable, backend)
+        check_archive_output(temporary, password, backend)
         publish(temporary, output)
     return output
 
@@ -452,17 +401,16 @@ def encrypt_project(
         first = first_dir / (source.name + extension)
         print("1/3：将整个项目加密压缩……", flush=True)
         create_archive(source, first, password, executable, backend)
-        print("第一层压缩完成，开始校验密码与完整性……", flush=True)
-        test_archive(first, password, executable, backend)
+        check_archive_output(first, password, backend)
+        print("第一层压缩完成。", flush=True)
         renamed = work / inner_name
         first.rename(renamed)
         print(f"2/3：第一层压缩包已改名为 {inner_name}", flush=True)
         temporary = second_dir / ("outer" + extension)
         outer_password = password if encrypt_outer else None
-        print("3/3：进行第二次压缩并检查完整性……", flush=True)
+        print("3/3：进行第二次压缩……", flush=True)
         create_archive(renamed, temporary, outer_password, executable, backend)
-        print("第二层压缩完成，开始完整性校验……", flush=True)
-        test_archive(temporary, outer_password, executable, backend)
+        check_archive_output(temporary, outer_password, backend)
         publish(temporary, output)
     return output
 
@@ -535,9 +483,10 @@ def main():
     if backend == "winrar-zip":
         print("ZIP 兼容模式：使用较弱的 ZipCrypto，文件名可见。", flush=True)
         print(
-            "请在随后 WinRAR 弹出的密码窗口中输入相同密码；脚本会校验匹配。", flush=True
+            "请在 WinRAR 密码窗口中输入相同密码；ZIP 实际密码以该窗口为准。",
+            flush=True,
         )
-    print("正在加密并检查完整性，请稍候……", flush=True)
+    print("正在加密压缩，请稍候……（跳过解密与 CRC 完整性校验）", flush=True)
     if source.is_dir():
         result = encrypt_project(
             source,
