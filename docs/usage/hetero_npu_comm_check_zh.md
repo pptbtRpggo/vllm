@@ -7,6 +7,25 @@
 
 ## 使用 Docker：在两台宿主机执行
 
+如果希望直接编辑 `docker run`，使用
+`examples/online_serving/hetero_pp/check_cpu_gloo_docker_manual.sh`。
+它保留可编辑的 `IMAGE`、`CONTAINER_NAME`、`MASTER_ADDR`、`MASTER_PORT`、
+`DEVICE_ARGS` 和 `MOUNT_ARGS`，不强制删除同名容器。
+两机填相同的 `MASTER_ADDR`，各自改本机镜像/设备/驱动挂载后执行：
+
+```bash
+export MASTER_ADDR=192.168.1.10
+# 910B；310P 改成 v0.23.0.post1-310p-openeuler，或使用管理员镜像。
+export IMAGE=quay.io/ascend/vllm-ascend:v0.23.0.post1-openeuler
+bash examples/online_serving/hetero_pp/check_cpu_gloo_docker_manual.sh
+```
+
+模板只传递测试入口实际使用的 `MASTER_ADDR`、`MASTER_PORT`、`NPU_DEVICES`。
+网卡由原入口自动选择；默认不设置 `HCCL_*`，实际 tensor 数据走 CPU Gloo。
+TorchNPU 本身仍需镜像内的 HCCL 动态库。当前无模型请求，不需要模型挂载或 8000 端口。
+master 端口默认 29501，协调另用 29502，仍需允许 Gloo 动态 TCP 连接。
+模板不能解决 Docker 服务不可达/权限错误；先确认宿主机 `docker version` 可读取 Server。
+
 宿主机需要已有 Docker、NPU 驱动，以及各自相同版本的本分支源码。
 镜像提供 CANN/TorchNPU，不能只复制 910B 的 Python 环境给 310P 使用。
 选择与本机驱动、设备及 CPU 架构兼容的镜像；管理员提供的适配镜像优先。

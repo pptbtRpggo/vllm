@@ -100,3 +100,29 @@ def test_container_failure_is_not_reported_as_success(tmp_path):
     env = dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}")
     result = run_script("--soc", "910b", "--head", "192.168.1.10", env=env)
     assert result.returncode == 7
+
+
+def test_manual_template_passes_host_settings_without_expanding_them(tmp_path):
+    docker = tmp_path / "docker"
+    docker.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\nexit 7\n')
+    docker.chmod(0o700)
+    env = dict(
+        os.environ,
+        PATH=f"{tmp_path}:{os.environ['PATH']}",
+        IMAGE="admin/310p:approved",
+        MASTER_ADDR="192.168.1.10",
+        MASTER_PORT="29501",
+        HOST_PROJECT_DIR=str(tmp_path / "source with spaces"),
+    )
+    manual = ROOT / "examples/online_serving/hetero_pp/check_cpu_gloo_docker_manual.sh"
+    result = subprocess.run(
+        ["bash", str(manual)], env=env, text=True, capture_output=True, timeout=10
+    )
+    assert result.returncode == 7, result.stderr
+    arguments = result.stdout.splitlines()
+    assert "admin/310p:approved" in arguments
+    assert f"{tmp_path}/source with spaces:/work/vllm" in arguments
+    assert "MASTER_ADDR" in arguments and "MASTER_PORT" in arguments
+    assert "--rm" in arguments and "--network=host" in arguments
+    assert "rm" not in arguments
+    assert "SERVICE_PORT" not in arguments
