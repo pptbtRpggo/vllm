@@ -24,6 +24,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import warnings
 import zipfile
 from pathlib import Path
@@ -248,9 +249,10 @@ def validate_password(password, backend):
 
 
 def check_zip_compatibility(archive, password):
-    """Reject AES ZIP, unsupported compression, missing encryption and bad CRC."""
+    """Check every ZIP member to EOF, with progress during slow decryption."""
     with zipfile.ZipFile(archive) as zipped:
-        for member in zipped.infolist():
+        members = zipped.infolist()
+        for member in members:
             if member.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
                 raise ValueError(
                     "ZIP 使用了 AES 或不兼容的压缩方法，不能交给传统 unzip。"
@@ -263,14 +265,50 @@ def check_zip_compatibility(archive, password):
                 raise ValueError("ZIP 文件的实际加密状态与要求不一致。")
         if password is not None:
             zipped.setpassword(password.encode("ascii"))
+        total = sum(member.file_size for member in members)
+        processed = 0
+        completed = 0
+        started = last_report = time.monotonic()
+        print(
+            f"ZIP 解密/CRC 校验：0.0% | 共 {total / 2**20:.1f} MiB（解压后）"
+            f"，{len(members)} 个成员；加密大包校验可能较慢。",
+            flush=True,
+        )
         try:
-            bad_file = zipped.testzip()
+            for member in members:
+                # Passing ZipInfo also verifies duplicate-name entries separately.
+                # Reading to EOF preserves zipfile's full decryption and CRC check.
+                with zipped.open(member) as contents:
+                    while True:
+                        chunk = contents.read(64 * 1024)
+                        if not chunk:
+                            break
+                        processed += len(chunk)
+                        now = time.monotonic()
+                        if now - last_report >= 2:
+                            elapsed = max(now - started, 0.001)
+                            percent = min(99.9, processed * 100 / total) if total else 0
+                            print(
+                                f"ZIP 校验：{percent:.1f}% | "
+                                f"{processed / 2**20:.1f}/{total / 2**20:.1f} MiB | "
+                                f"成员 {completed}/{len(members)} | "
+                                f"{processed / 2**20 / elapsed:.2f} MiB/s"
+                                "（解压后数据）",
+                                flush=True,
+                            )
+                            last_report = now
+                completed += 1
         except RuntimeError as error:
             raise ValueError(
                 "ZIP 解密校验失败，请在 WinRAR 窗口输入与终端相同的密码。"
             ) from error
-        if bad_file is not None:
-            raise ValueError(f"ZIP 完整性校验失败：{bad_file}")
+    elapsed = max(time.monotonic() - started, 0.001)
+    print(
+        f"ZIP 完整性校验完成：100.0% | {completed}/{len(members)} 个成员 | "
+        f"{processed / 2**20:.1f} MiB | {processed / 2**20 / elapsed:.2f} MiB/s"
+        f"（解压后数据） | 用时 {elapsed:.1f} 秒",
+        flush=True,
+    )
 
 
 def create_archive(source, output, password, executable, backend):
@@ -414,6 +452,7 @@ def encrypt_project(
         first = first_dir / (source.name + extension)
         print("1/3：将整个项目加密压缩……", flush=True)
         create_archive(source, first, password, executable, backend)
+        print("第一层压缩完成，开始校验密码与完整性……", flush=True)
         test_archive(first, password, executable, backend)
         renamed = work / inner_name
         first.rename(renamed)
@@ -422,6 +461,7 @@ def encrypt_project(
         outer_password = password if encrypt_outer else None
         print("3/3：进行第二次压缩并检查完整性……", flush=True)
         create_archive(renamed, temporary, outer_password, executable, backend)
+        print("第二层压缩完成，开始完整性校验……", flush=True)
         test_archive(temporary, outer_password, executable, backend)
         publish(temporary, output)
     return output
