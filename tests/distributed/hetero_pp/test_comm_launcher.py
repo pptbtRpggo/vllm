@@ -100,6 +100,38 @@ class LauncherCase(unittest.TestCase):
         cls.helper = load_helper()
 
 
+class SocNameTests(LauncherCase):
+    def test_numeric_model_and_revision_suffixes_keep_the_soc_family(self):
+        for name, expected in (
+            ("Ascend910B", "910B"),
+            ("Ascend910B3", "910B"),
+            ("Ascend910B4-1", "910B"),
+            ("ascend910b4-1", "910B"),
+            ("Ascend310P", "310P"),
+            ("Ascend310P3", "310P"),
+            ("Ascend310P3-1", "310P"),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(self.helper.soc_family(name), expected)
+
+    def test_other_families_and_invalid_revision_suffixes_are_rejected(self):
+        for name in (
+            "Ascend910C",
+            "Ascend310B",
+            "Ascend910Bgarbage",
+            "Ascend910B4--1",
+            "Ascend910B-1",
+            "Ascend910B4-1-extra",
+            "Ascend910B４",
+            "Ascend910B4\n",
+        ):
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(RuntimeError, "不支持的本机 SoC"),
+            ):
+                self.helper.soc_family(name)
+
+
 class NetworkTests(LauncherCase):
     def test_head_uses_own_address_interface_even_when_route_says_loopback(self):
         actual = self.helper.choose_network(

@@ -196,6 +196,27 @@ def source_pins(repo):
     }
 
 
+def soc_family(name):
+    """Classify an exact device name without importing Torch or initializing NPUs."""
+    lower = name.lower()
+    family = next(
+        (soc for soc in ("910B", "310P") if lower.startswith("ascend" + soc.lower())),
+        None,
+    )
+    suffix = lower[len("ascend") + len(family) :] if family else ""
+    parts = suffix.split("-")
+    if (
+        family is None
+        or suffix
+        and (
+            len(parts) > 2
+            or not all(part.isascii() and part.isdigit() for part in parts)
+        )
+    ):
+        raise RuntimeError(f"不支持的本机 SoC：{name}")
+    return family
+
+
 def inspect_runtime(repo):
     """Exercise the probe's local operations before attributing errors to Gloo."""
     if sys.flags.optimize:
@@ -230,19 +251,7 @@ def inspect_runtime(repo):
     for index in range(count):
         torch.npu.set_device(index)
         name = torch.npu.get_device_name(index)
-        lower = name.lower()
-        family = next(
-            (
-                soc
-                for soc in ("910B", "310P")
-                if lower.startswith("ascend" + soc.lower())
-            ),
-            None,
-        )
-        suffix = lower[len("ascend") + len(family) :] if family else ""
-        if family is None or suffix and not (suffix.isascii() and suffix.isdigit()):
-            raise RuntimeError(f"不支持的本机 SoC：{name}")
-        soc = family
+        soc = soc_family(name)
         base = (torch.arange(128).reshape(8, 16) % 101).half().T
         value = base.to("npu")
         residual = value * 2
