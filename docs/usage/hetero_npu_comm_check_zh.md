@@ -15,8 +15,8 @@
 
 ```bash
 export MASTER_ADDR=192.168.1.10
-# 910B；310P 改成 v0.23.0.post1-310p-openeuler，或使用管理员镜像。
-export IMAGE=quay.io/ascend/vllm-ascend:v0.23.0.post1-openeuler
+# 910B；310P 改成 v0.23.0-310p-openeuler，或使用管理员镜像。
+export IMAGE=quay.io/ascend/vllm-ascend:v0.23.0-openeuler
 bash examples/online_serving/hetero_pp/check_cpu_gloo_docker_manual.sh
 ```
 
@@ -144,6 +144,18 @@ bash examples/online_serving/hetero_pp/check_cpu_gloo.sh \
 两端同型号则标为 `homogeneous_control`，不冒充异构测试。
 
 本地算子/导入失败属于环境或设备预检失败，不能直接称为 Gloo 网络故障。
+`没有找到能完成本地 NPU 预检的环境` 是汇总信息，不等于 CANN 一定未安装。
+在宿主机项目根目录找到本轮最新日志，查看其中原始的 ImportError/RuntimeError：
+
+```bash
+find output -maxdepth 2 -name environment_attempts.log -print
+tail -n 100 output/本轮comm_check目录/environment_attempts.log
+```
+
+日志保留在宿主机挂载的项目中，即使容器退出并自动删除仍可查看。
+`--cann-env` 有两个 `n`；它和 `--python` 都是指容器内的实际路径。
+需要先依据原始异常区分动态库缺失、设备不可见、Python 依赖或本地算子错误，
+不要仅根据汇总信息反复更换镜像或修改库路径。
 超时、中断或子进程失败不生成成功回执，只停止本轮自建进程组。
 本入口沿用现有探针的四种形状、整数/空 tensor/None、非连续数据和反向 token 检查；
 没有新增 format29 或显式非默认 stream 的实机覆盖。

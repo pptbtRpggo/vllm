@@ -13,7 +13,7 @@ usage() {
   bash check_cpu_gloo_docker.sh --soc 310p --head 192.168.1.10
   bash check_cpu_gloo_docker.sh --image 管理员镜像:标签 --head 192.168.1.10
 选项：
-  --soc 910b|310p       选择官方 v0.23.0.post1 镜像
+  --soc 910b|310p       选择 v0.23.0 镜像（不带 post）
   --image IMAGE        使用指定镜像，优先于 --soc
   --head IPv4          两端填写相同的、属于其中一台宿主机的 IPv4
   --devices 0,1        本机两个 /dev/davinci 设备号（默认 0,1）
@@ -52,8 +52,8 @@ done
 [[ -z "$soc" || "$soc" == 910b || "$soc" == 310p ]] || die "--soc 只能是 910b 或 310p"
 if [[ -z "$image" ]]; then
   case "$soc" in
-    910b) image=quay.io/ascend/vllm-ascend:v0.23.0.post1 ;;
-    310p) image=quay.io/ascend/vllm-ascend:v0.23.0.post1-310p ;;
+    910b) image=quay.io/ascend/vllm-ascend:v0.23.0 ;;
+    310p) image=quay.io/ascend/vllm-ascend:v0.23.0-310p ;;
     *) die "需要 --soc 或 --image" ;;
   esac
 fi

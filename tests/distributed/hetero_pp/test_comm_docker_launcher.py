@@ -38,7 +38,8 @@ def test_dry_run_mounts_source_and_devices_without_overwriting_cann(soc):
     assert f"type=bind,src={ROOT},dst=/work/vllm" in mounts
     assert not any("dst=/usr/local/Ascend," in mount for mount in mounts)
     image = command[command.index("--entrypoint") + 2]
-    assert "v0.23.0.post1" in image
+    assert "v0.23.0" in image
+    assert ".post" not in image
     assert image.endswith("-310p") == (soc == "310p")
     assert command[-4:] == ["--head", "192.168.1.10", "--devices", "0,1"]
 

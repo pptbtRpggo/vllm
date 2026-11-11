@@ -5,8 +5,8 @@
 if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
 set -euo pipefail
 
-# 910B default. For 310P use v0.23.0.post1-310p-openeuler or an approved image.
-export IMAGE="${IMAGE:-quay.io/ascend/vllm-ascend:v0.23.0.post1-openeuler}"
+# 910B default. For 310P use v0.23.0-310p-openeuler or an approved image.
+export IMAGE="${IMAGE:-quay.io/ascend/vllm-ascend:v0.23.0-openeuler}"
 export CONTAINER_NAME="${CONTAINER_NAME:-hete-npu-comm-test}"
 export MASTER_ADDR="${MASTER_ADDR:-}" # Required: the same real host IPv4 on both nodes.
 export MASTER_PORT="${MASTER_PORT:-29501}"
