@@ -71,7 +71,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd -- "$script_dir/../../.." && pwd)"
 [[ "$repo_dir" != *,* ]] || die "Docker bind mount 不支持此项目路径中的逗号"
 
-command=(docker run --rm --init --network host --shm-size=1g)
+command=(docker run --rm --network host --shm-size=1g)
 if [[ -t 0 && -t 1 ]]; then command+=(-it); fi
 for device in "davinci$first" "davinci$second" davinci_manager devmm_svm hisi_hdc; do
   command+=(--device "/dev/$device")

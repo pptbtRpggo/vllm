@@ -40,7 +40,7 @@ MOUNT_ARGS=(
 # Do not force-remove an existing named container. Docker reports name conflicts.
 # These variables expand inside the container.
 # shellcheck disable=SC2016
-exec docker run -it --rm --init \
+exec docker run -it --rm \
   --name "$CONTAINER_NAME" \
   --network=host --shm-size=1g \
   "${DEVICE_ARGS[@]}" \
