@@ -45,12 +45,16 @@ exec docker run -it --rm \
   --network=host --shm-size=1g \
   "${DEVICE_ARGS[@]}" \
   "${MOUNT_ARGS[@]}" \
-  -e MASTER_ADDR \
-  -e MASTER_PORT \
-  -e NPU_DEVICES \
+  -e "MASTER_ADDR=$MASTER_ADDR" \
+  -e "MASTER_PORT=$MASTER_PORT" \
+  -e "NPU_DEVICES=$NPU_DEVICES" \
   -w /work/vllm \
   --entrypoint /bin/bash "$IMAGE" -c '
-set -e
+set -eu
+: "${MASTER_ADDR:?MASTER_ADDR was not passed to the container}"
+: "${MASTER_PORT:?MASTER_PORT was not passed to the container}"
+: "${NPU_DEVICES:?NPU_DEVICES was not passed to the container}"
+echo "Container head=${MASTER_ADDR}, port=${MASTER_PORT}, devices=${NPU_DEVICES}"
 container_python=$(command -v python3 || command -v python)
 exec bash examples/online_serving/hetero_pp/check_cpu_gloo.sh \
   --python "$container_python" \

@@ -21,6 +21,8 @@ bash examples/online_serving/hetero_pp/check_cpu_gloo_docker_manual.sh
 ```
 
 模板只传递测试入口实际使用的 `MASTER_ADDR`、`MASTER_PORT`、`NPU_DEVICES`。
+使用 `-e "MASTER_ADDR=$MASTER_ADDR"` 等显式传值，避免在 `docker` 前加
+`sudo` 后丢失调用者环境；容器内会打印实际收到的 head/port/devices。
 网卡由原入口自动选择；默认不设置 `HCCL_*`，实际 tensor 数据走 CPU Gloo。
 TorchNPU 本身仍需镜像内的 HCCL 动态库。当前无模型请求，不需要模型挂载或 8000 端口。
 master 端口默认 29501，协调另用 29502，仍需允许 Gloo 动态 TCP 连接。

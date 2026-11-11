@@ -122,7 +122,40 @@ def test_manual_template_passes_host_settings_without_expanding_them(tmp_path):
     arguments = result.stdout.splitlines()
     assert "admin/310p:approved" in arguments
     assert f"{tmp_path}/source with spaces:/work/vllm" in arguments
-    assert "MASTER_ADDR" in arguments and "MASTER_PORT" in arguments
+    assert "MASTER_ADDR=192.168.1.10" in arguments
+    assert "MASTER_PORT=29501" in arguments
     assert "--rm" in arguments and "--network=host" in arguments
     assert "rm" not in arguments
     assert "SERVICE_PORT" not in arguments
+
+
+def test_manual_passes_values_even_when_docker_environment_is_cleared(tmp_path):
+    docker = tmp_path / "docker"
+    docker.write_text(
+        "#!/bin/bash\n"
+        'if [[ "${FAKE_STAGE:-}" != clean ]]; then\n'
+        "  exec env -u MASTER_ADDR -u MASTER_PORT -u NPU_DEVICES "
+        'FAKE_STAGE=clean "$0" "$@"\n'
+        "fi\n"
+        "while (($#)); do\n"
+        '  if [[ "$1" == -e ]]; then export "$2"; shift; fi\n'
+        "  shift\n"
+        "done\n"
+        'printf "%s\\n" "${MASTER_ADDR:-MISSING}" '
+        '"${MASTER_PORT:-MISSING}" "${NPU_DEVICES:-MISSING}"\n'
+    )
+    docker.chmod(0o700)
+    env = dict(
+        os.environ,
+        PATH=f"{tmp_path}:{os.environ['PATH']}",
+        MASTER_ADDR="144.147.135.53",
+        MASTER_PORT="29501",
+        NPU_DEVICES="0,1",
+    )
+    env.pop("FAKE_STAGE", None)
+    manual = ROOT / "examples/online_serving/hetero_pp/check_cpu_gloo_docker_manual.sh"
+    result = subprocess.run(
+        ["bash", str(manual)], env=env, text=True, capture_output=True, timeout=10
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["144.147.135.53", "29501", "0,1"]
