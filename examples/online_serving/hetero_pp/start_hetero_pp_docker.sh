@@ -42,6 +42,8 @@ usage() {
   --max-model-len N / --max-num-batched-tokens N / --max-num-seqs N
   --gpu-memory-utilization N / --cann-env PATH / --python PATH
                        可选，转发给容器内入口；路径是容器内路径
+  --chat-template codellama-instruct / PATH
+                       内置 CodeLlama-Instruct 模板或容器内文件路径；省略沿用 tokenizer
   --dry-run            只显示命令，不启动 Docker，不初始化 NPU
 EOF
 }
@@ -51,7 +53,7 @@ while (($#)); do
   case "$1" in
     --help|-h) usage; exit 0 ;;
     --dry-run) dry_run=true; shift ;;
-    --head|--peer|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--api-port|--layers|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python)
+    --head|--peer|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--api-port|--layers|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python|--chat-template)
       (($# >= 2)) && [[ -n "$2" && "$2" != --* ]] || die "$1 缺少参数"
       case "$1" in
         --head) head="$2" ;; --peer) peer="$2" ;; --model) model="$2" ;;

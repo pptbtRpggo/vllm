@@ -153,6 +153,16 @@ def test_empty_port_environment_uses_defaults_and_container_options_are_forwarde
     assert command[-2:] == ["--startup-timeout", "900"]
 
 
+@pytest.mark.parametrize(
+    "template", ["codellama-instruct", "/work/vllm/custom chat.jinja"]
+)
+def test_docker_forwards_chat_template_as_one_argument(environment, template):
+    result = invoke(environment, "--chat-template", template, "--dry-run")
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout)
+    assert command[-2:] == ["--chat-template", template]
+
+
 def test_interface_must_own_the_selected_local_address(environment):
     result = invoke(environment, "--interface", "missing0", "--dry-run")
     assert result.returncode != 0

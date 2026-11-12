@@ -53,6 +53,39 @@ curl --fail-with-body --max-time 180 \
 `user` 请求。如果返回没有 chat template 的错误，需确认具体模型及模板，
 不能随便套一个模板认为等价。
 
+对于本实验的 **CodeLlama-34B-Instruct**，项目已提供内置模板。
+停止自己本次旧测试服务/容器后，在原来两边的启动命令末尾加：
+
+```bash
+--chat-template codellama-instruct
+```
+
+例如下面两种入口均支持该参数，其他 IP、模型路径和设备号沿用你的配置：
+
+```bash
+# 宿主机 Docker 入口（两台宿主机各运行一次）
+bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
+  --head 53 --peer 54 --model /本机模型目录 --devices 0,1 \
+  --chat-template codellama-instruct
+
+# 已有容器内入口（两台机器各运行一次；不要与上面的启动重复执行）
+bash examples/online_serving/hetero_pp/start_hetero_pp.sh \
+  --head 141.147.135.53 --peer 141.147.135.54 --model /workspace/model \
+  --chat-template codellama-instruct
+```
+
+别名解析到项目内 `examples/online_serving/hetero_pp/codellama_instruct.jinja`，
+模板正文取自 [CodeLlama-34b-Instruct-hf 官方 tokenizer 配置](https://huggingface.co/codellama/CodeLlama-34b-Instruct-hf/blob/main/tokenizer_config.json)
+的 `chat_template` 字段（2026-11-12 核对）。保留 `[INST]`、`<<SYS>>`、
+BOS/EOS 和 user/assistant 交替规则；不是给基础版、Python 版或 70B 版通用的模板。
+单轮和 system 加多轮消息的渲染字节已做 CPU 回归，但不代表实际异构输出已验证。
+
+需要其他模板时传 `--chat-template /容器内/模板.jinja`，该文件只需 API 所在的
+head 端可读。Docker 下可把文件放在项目目录，使用 `/work/vllm/相对路径`；
+不要直接传未挂载的宿主机绝对路径。空文件/不存在的文件在 head 端预检拒绝。
+省略参数仍用 tokenizer 自带模板，不自动猜测模型类型，也不修改只读模型目录。
+实际模板路径可在 head 的 `launch.json` → `serve_command` 中确认。
+
 `finish_reason: "length"` 表示达到生成长度或上下文上限。
 `ignore_eos: false` 表示生成 EOS 时允许停止，不保证模型一定生成 EOS。
 `stop_reason` 通常是停止字符串/token ID 或 null，并非上述 `length` 字段。

@@ -132,6 +132,7 @@ embedding 和输出 head 仍在首末 stage，也会占用显存和计算时间�
 | --- | --- |
 | `--python /path/to/python` | 指定已有 NPU 环境，未指定时复用通信脚本的环境探测 |
 | `--cann-env /path/to/set_env.sh` | 显式加载本机 SDK 环境 |
+| `--chat-template codellama-instruct` | 使用项目内 CodeLlama-34B-Instruct 对话模板；也支持容器内模板文件路径，省略则沿用 tokenizer |
 | `--interface eth0` | 默认自动选择到对端的网卡；各端可不同 |
 | `--ray-port 16379` | 两边相同；其他 Ray 和 Gloo 动态端口也需互通 |
 | `--api-port 8000` | API 仅监听 910B 容器/宿主机的 `127.0.0.1` |

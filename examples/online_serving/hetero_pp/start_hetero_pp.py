@@ -52,6 +52,10 @@ def argument_parser():
     parser.add_argument("--python", help="已有 NPU Python，默认沿用环境探测")
     parser.add_argument("--cann-env", help="可选，本机已有 CANN set_env.sh")
     parser.add_argument(
+        "--chat-template",
+        help="codellama-instruct 或模板文件路径；省略时使用 tokenizer 自带模板",
+    )
+    parser.add_argument(
         "--devices", help="可选，当前 runtime 的两个逻辑卡号；默认不更改可见性"
     )
     parser.add_argument("--interface", help="本机 Gloo 网卡，默认自动选择")
@@ -122,6 +126,20 @@ def select_network(head, peer, interfaces, route_ip, interface=None):
             "自动选择的本机地址不等于 head/peer；请核对 IP 或指定 --interface"
         )
     return network
+
+
+def resolve_chat_template(value):
+    """Resolve an explicit template on the API host without guessing model identity."""
+    if value is None:
+        return None
+    path = (
+        Path(__file__).with_name("codellama_instruct.jinja")
+        if value == "codellama-instruct"
+        else Path(value).expanduser()
+    )
+    if not path.is_file() or not path.read_text(encoding="utf-8").strip():
+        raise ValueError(f"对话模板文件不存在或为空：{path}")
+    return str(path.resolve())
 
 
 def make_launch(args, node_ip, python, environment):
@@ -200,6 +218,9 @@ def make_launch(args, node_ip, python, environment):
             "--port",
             str(args.api_port),
         ]
+        template = resolve_chat_template(args.chat_template)
+        if template:
+            serve += ["--chat-template", template]
     return dict(
         role=role, plan=plan, environment=updates, ray_command=ray, serve_command=serve
     )
@@ -363,6 +384,8 @@ def main(argv=None):
             node_ip = network["node_ip"]
             if args.node_ip and node_ip != args.node_ip:
                 raise ValueError("--node-ip 不属于本机所选网卡")
+        if node_ip == args.head:
+            resolve_chat_template(args.chat_template)
         env = prepare_environment(ROOT, os.environ, args.devices)
         if network["interface"]:
             env["GLOO_SOCKET_IFNAME"] = network["interface"]

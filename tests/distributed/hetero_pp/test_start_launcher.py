@@ -111,6 +111,42 @@ def test_dry_run_keeps_visibility_and_does_not_expose_other_environment(model):
     assert plan["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "0"
 
 
+def test_builtin_chat_template_is_forwarded_only_to_head_api(model):
+    result = invoke(model, "--chat-template", "codellama-instruct")
+    assert result.returncode == 0, result.stderr
+    command = json.loads(result.stdout)["serve_command"]
+    template = Path(command[command.index("--chat-template") + 1])
+    assert template == DIRECTORY / "codellama_instruct.jinja"
+    assert template.is_file()
+    worker = invoke(
+        model, "--node-ip", "192.0.2.20", "--chat-template", "/only/on/head.jinja"
+    )
+    assert worker.returncode == 0, worker.stderr
+    assert json.loads(worker.stdout)["serve_command"] is None
+
+
+def test_explicit_chat_template_with_spaces_and_existing_default(model, tmp_path):
+    template = tmp_path / "custom chat.jinja"
+    template.write_text("{{ messages[0]['content'] }}")
+    result = invoke(model, "--chat-template", str(template))
+    assert result.returncode == 0, result.stderr
+    command = json.loads(result.stdout)["serve_command"]
+    assert command[command.index("--chat-template") + 1] == str(template)
+    default = invoke(model)
+    assert "--chat-template" not in json.loads(default.stdout)["serve_command"]
+
+
+@pytest.mark.parametrize("contents", [None, "  \n"])
+def test_missing_or_empty_template_is_rejected_before_start(model, tmp_path, contents):
+    template = tmp_path / "invalid.jinja"
+    if contents is not None:
+        template.write_text(contents)
+    result = invoke(model, "--chat-template", str(template))
+    assert result.returncode != 0
+    assert "模板" in result.stderr
+    assert not result.stdout.strip().startswith("{")
+
+
 @pytest.fixture
 def launcher(monkeypatch):
     monkeypatch.syspath_prepend(str(DIRECTORY))
