@@ -98,9 +98,9 @@ def worker_for_soc_name(name):
     """Legacy plugin compatibility, selected from the local ACL SoC name."""
     import regex as re
 
-    if re.fullmatch(r"Ascend910B[0-9]*", name, re.IGNORECASE):
+    if re.fullmatch(r"Ascend910B(?:[0-9]+(?:-[0-9]+)?)?", name, re.IGNORECASE):
         return "vllm_ascend.worker.worker.NPUWorker"
-    if re.fullmatch(r"Ascend310P[0-9]*", name, re.IGNORECASE):
+    if re.fullmatch(r"Ascend310P(?:[0-9]+(?:-[0-9]+)?)?", name, re.IGNORECASE):
         return "vllm_ascend._310p.worker_310p.NPUWorker310"
     raise ValueError(f"unsupported local ACL SoC: {name!r}")
 
