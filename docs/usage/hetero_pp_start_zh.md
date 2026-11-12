@@ -185,6 +185,9 @@ curl --fail http://127.0.0.1:8000/v1/completions \
 当前执行器一次只执行一个 scheduler batch，不保证四个 stage 持续重叠工作。
 先验收完整推理功能，再评估 TTFT、TPOT、吞吐及 CPU staging 开销。
 
+两端保存 NPU 利用率/显存、带 role 的请求及重复输出的短摘要诊断，见
+[监控与停止原因诊断](hetero_pp_monitor_zh.md)。
+
 ## 停止与再次启动
 
 在 910B 端按 Ctrl+C 停止本次 API，日志保留；Ray 服务也保留。
