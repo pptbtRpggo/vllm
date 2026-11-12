@@ -67,13 +67,14 @@ def test_local_ip_selects_image_and_nic_without_npu_smi(environment, local, soc)
     assert result.returncode == 0, result.stderr
     command = shlex.split(result.stdout)
     assert command[:2] == ["docker", "run"]
-    assert "seccomp=unconfined" in command
+    assert ("seccomp=unconfined" in command) == (soc == "310p")
+    assert ("--security-opt" in command) == (soc == "310p")
     assert "--entrypoint" not in command
     assert "--init" not in command
     image = (
         "quay.io/ascend/vllm-ascend:v0.23.0-openeuler"
         if soc == "910b"
-        else "quay.io/ascend/vllm-ascend:v0.23.0-310p-openeuler-mixed-pp"
+        else "quay.io/ascend/vllm-ascend:v0.23.0-310p-openeuler"
     )
     assert image in command
     assert "GLOO_SOCKET_IFNAME=enp3s0" in command
@@ -173,7 +174,7 @@ def test_worker_container_stays_alive_after_ray_join(environment, tmp_path):
     result = invoke(environment, "--dry-run")
     assert result.returncode == 0, result.stderr
     command = shlex.split(result.stdout)
-    image = command.index("quay.io/ascend/vllm-ascend:v0.23.0-310p-openeuler-mixed-pp")
+    image = command.index("quay.io/ascend/vllm-ascend:v0.23.0-310p-openeuler")
     assert command[image + 1 : image + 3] == ["/bin/bash", "-c"]
     assert "HETERO_PP_ROLE=worker" in command
     fake_bash = tmp_path / "bash"
@@ -184,7 +185,7 @@ def test_worker_container_stays_alive_after_ray_join(environment, tmp_path):
         "#!/bin/bash\n"
         "while (($#)); do\n"
         '  if [[ "$1" == -e ]]; then export "$2"; shift 2; continue; fi\n'
-        '  if [[ "$1" == *v0.23.0-310p-openeuler-mixed-pp ]]; then\n'
+        '  if [[ "$1" == *v0.23.0-310p-openeuler ]]; then\n'
         '    shift; exec "$@"\n'
         "  fi\n"
         "  shift\n"

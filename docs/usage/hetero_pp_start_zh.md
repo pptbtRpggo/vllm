@@ -27,11 +27,11 @@ bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
 | 角色 | 默认镜像 |
 | --- | --- |
 | 910B / head | `quay.io/ascend/vllm-ascend:v0.23.0-openeuler` |
-| 310P / worker | `quay.io/ascend/vllm-ascend:v0.23.0-310p-openeuler-mixed-pp` |
+| 310P / worker | `quay.io/ascend/vllm-ascend:v0.23.0-310p-openeuler` |
 
-310P 默认值是用户本次使用的自定义镜像名，不代表它是官方发布的标签。
-优先使用 Docker 本地已有镜像；不存在时 Docker 会按这个名称尝试拉取，
-若自定义标签未发布，需要先导入同事提供的镜像。需要换镜像时，可以使用
+310P 默认使用普通 310P openEuler 镜像，不再使用 `mixed-pp` 自定义标签。
+优先使用 Docker 本地已有镜像；不存在时 Docker 会按这个名称尝试拉取。
+需要换镜像时，可以使用
 `--image 镜像名`，或分别设置环境变量 `IMAGE_910B` / `IMAGE_310P`。
 
 选镜像依据是用户填写的 IP 角色，不是宿主机硬件探测结果。实际型号、卡数
@@ -47,8 +47,9 @@ bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
 `ASCEND_RT_VISIBLE_DEVICES`，避免宿主机编号和容器逻辑编号重复筛选。
 这是选卡配置，不是空闲检测；必须确认这些卡可以供本次使用。
 
-容器参数保留 `seccomp=unconfined`、host 网络、1GiB 共享内存和镜像原始
-entrypoint。模型只读挂载，项目可写挂载以保存日志；不覆盖镜像自带 CANN。
+310P 容器添加 `--security-opt seccomp=unconfined`；910B 容器不添加此参数。
+两边均使用 host 网络、1GiB 共享内存并保留镜像原始 entrypoint。
+模型只读挂载，项目可写挂载以保存日志；不覆盖镜像自带 CANN。
 Ray head/API 默认端口仍为 16379/8000，可通过 `--ray-port` / `--api-port` 修改；
 其他 Ray/Gloo 端口仍动态分配。
 
@@ -62,7 +63,7 @@ Ray head/API 默认端口仍为 16379/8000，可通过 `--ray-port` / `--api-por
 ## 准备
 
 - 在两边已经能通过 NPU/CPU/Gloo 检查的容器里运行，保留成功的 Docker
-  参数，包括本次确认需要的 `--security-opt seccomp=unconfined`。
+  参数；310P 端添加 `--security-opt seccomp=unconfined`，910B 端不添加。
   不要为了这个脚本覆盖镜像原有 entrypoint。
 - 两端更新到同一版项目；shell 入口还需要同目录下的
   `start_hetero_pp.py` 和 `check_cpu_gloo.py`，不能只复制一个 shell 文件。

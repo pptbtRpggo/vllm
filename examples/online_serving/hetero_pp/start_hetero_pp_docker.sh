@@ -11,7 +11,7 @@ head="${HEAD_IP:-${HEAD_LAST:-}}"
 peer="${PEER_IP:-${PEER_LAST:-}}"
 model="${HOST_MODEL_DIR:-}"
 image_910b="${IMAGE_910B:-quay.io/ascend/vllm-ascend:v0.23.0-openeuler}"
-image_310p="${IMAGE_310P:-quay.io/ascend/vllm-ascend:v0.23.0-310p-openeuler-mixed-pp}"
+image_310p="${IMAGE_310P:-quay.io/ascend/vllm-ascend:v0.23.0-310p-openeuler}"
 image="${IMAGE:-}"
 devices="${HOST_NPU_DEVICES:-0,1}"
 ray_port="${RAY_PORT:-16379}" api_port="${SERVICE_PORT:-8000}"
@@ -129,7 +129,8 @@ done <<< "$addresses"
 "$valid_interface" && [[ "$interface" != lo ]] || die "所选网卡不拥有本机 IP：$interface / $local_ip"
 
 name="${name:-hetero-pp-$role}"
-command=(docker run --rm --name "$name" --security-opt seccomp=unconfined --net=host --shm-size=1g)
+command=(docker run --rm --name "$name" --net=host --shm-size=1g)
+if [[ "$role" == worker ]]; then command+=(--security-opt seccomp=unconfined); fi
 if [[ -t 0 && -t 1 ]]; then command+=(-it); fi
 for device in "davinci$first" "davinci$second" davinci_manager hisi_hdc; do
   command+=(--device "/dev/$device")
