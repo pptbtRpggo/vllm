@@ -10,6 +10,7 @@ IP_PREFIX="${IP_PREFIX:-141.147.135}"
 head="${HEAD_IP:-${HEAD_LAST:-}}"
 peer="${PEER_IP:-${PEER_LAST:-}}"
 model="${HOST_MODEL_DIR:-}"
+log_dir="${HOST_LOG_DIR:-${HOME:?需要 HOME 或 HOST_LOG_DIR}/vllm_hetero_pp_logs}"
 image_910b="${IMAGE_910B:-quay.io/ascend/vllm-ascend:v0.23.0-openeuler}"
 image_310p="${IMAGE_310P:-quay.io/ascend/vllm-ascend:v0.23.0-310p-openeuler}"
 image="${IMAGE:-}"
@@ -29,6 +30,7 @@ usage() {
   --head VALUE         910B IP 或末段；也可设置 HEAD_LAST / HEAD_IP
   --peer VALUE         310P IP 或末段；也可设置 PEER_LAST / PEER_IP
   --model DIR          本机完整模型目录，挂载到容器 /workspace/model
+  --log-dir DIR        宿主机可读日志根目录，默认 $HOME/vllm_hetero_pp_logs
   --devices 0,1        宿主机两张卡设备文件编号，只影响 Docker 映射
   --interface NAME     默认按到对端的路由自动识别
   --image IMAGE        覆盖本机镜像；也可分别设置 IMAGE_910B / IMAGE_310P
@@ -49,10 +51,11 @@ while (($#)); do
   case "$1" in
     --help|-h) usage; exit 0 ;;
     --dry-run) dry_run=true; shift ;;
-    --head|--peer|--model|--devices|--interface|--image|--name|--ray-port|--api-port|--layers|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python)
+    --head|--peer|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--api-port|--layers|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python)
       (($# >= 2)) && [[ -n "$2" && "$2" != --* ]] || die "$1 缺少参数"
       case "$1" in
         --head) head="$2" ;; --peer) peer="$2" ;; --model) model="$2" ;;
+        --log-dir) log_dir="$2" ;;
         --devices) devices="$2" ;; --interface) interface="$2" ;;
         --image) image="$2" ;; --name) name="$2" ;;
         --ray-port) ray_port="$2" ;; --api-port) api_port="$2" ;;
@@ -128,6 +131,17 @@ while read -r _ nic family cidr _; do
 done <<< "$addresses"
 "$valid_interface" && [[ "$interface" != lo ]] || die "所选网卡不拥有本机 IP：$interface / $local_ip"
 
+if [[ "$log_dir" != /* ]]; then log_dir="$(pwd -P)/$log_dir"; fi
+[[ "$log_dir" != *,* ]] || die "日志 bind mount 路径不能含逗号"
+if "$dry_run"; then
+  run_dir="$log_dir/preview-$role"
+else
+  # The invoking host user owns these private parents, even when Docker is root.
+  (umask 077; mkdir -p -- "$log_dir") || die "无法创建日志目录；用 --log-dir 指定你自己的可写路径"
+  log_dir="$(cd -- "$log_dir" && pwd -P)"
+  [[ -w "$log_dir" && -x "$log_dir" ]] || die "日志目录不可写/不可进入：$log_dir"
+  run_dir="$(umask 077; mktemp -d "$log_dir/hetero_pp_${role}_$(date +%Y%m%d_%H%M%S)_XXXXXX")"
+fi
 name="${name:-hetero-pp-$role}"
 command=(docker run --rm --name "$name" --net=host --shm-size=1g)
 if [[ "$role" == worker ]]; then command+=(--security-opt seccomp=unconfined); fi
@@ -142,6 +156,7 @@ for path in /usr/local/dcmi /usr/local/Ascend/driver/lib64 \
   command+=(--mount "type=bind,src=$path,dst=$path,readonly")
 done
 command+=(--mount "type=bind,src=$repo,dst=/work/vllm"
+  --mount "type=bind,src=$run_dir,dst=/work/hetero_logs"
   --mount "type=bind,src=$model,dst=/workspace/model,readonly" -w /work/vllm
   -e "GLOO_SOCKET_IFNAME=$interface" -e "VLLM_HOST_IP=$local_ip" -e "HETERO_PP_ROLE=$role")
 # Retain the image's entrypoint so custom image initialization is not bypassed.
@@ -149,6 +164,7 @@ command+=(--mount "type=bind,src=$repo,dst=/work/vllm"
 # shellcheck disable=SC2016
 command+=("$image" /bin/bash -c '
 set -u
+umask 022
 if [[ "$HETERO_PP_ROLE" == head ]]; then
   exec bash /work/vllm/examples/online_serving/hetero_pp/start_hetero_pp.sh "$@"
 fi
@@ -160,7 +176,7 @@ trap "exit 0" INT TERM HUP
 while true; do sleep 5 & wait $!; done
 ' hetero-pp --head "$head" --peer "$peer" --model /workspace/model
   --node-ip "$local_ip" --interface "$interface" --layers "$layers"
-  --ray-port "$ray_port" --api-port "$api_port")
+  --ray-port "$ray_port" --api-port "$api_port" --output /work/hetero_logs/start)
 # Bash 3 treats an empty array as unset under nounset.
 if [[ -n "${forward[*]-}" ]]; then command+=("${forward[@]}"); fi
 if "$dry_run"; then
@@ -172,4 +188,5 @@ command -v docker >/dev/null || die "找不到 docker 命令"
 echo "本机角色=$role，IP=$local_ip，网卡=$interface，镜像=$image" >&2
 echo "选择镜像依据 IP 角色；容器内将实际校验两张 NPU 型号及初始化。" >&2
 echo "Ray端口=$ray_port，API端口=$api_port；不删除已有容器、不重新设置 NPU 可见性。" >&2
+echo "宿主机本轮日志：$run_dir/start；目录和日志文件将允许宿主机用户读取。" >&2
 exec "${command[@]}"

@@ -5,6 +5,7 @@
 import os
 import shlex
 import signal
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -156,6 +157,81 @@ def test_interface_must_own_the_selected_local_address(environment):
     result = invoke(environment, "--interface", "missing0", "--dry-run")
     assert result.returncode != 0
     assert not result.stdout.startswith("docker run")
+
+
+def test_logs_default_to_host_home_and_dry_run_does_not_create_them(environment):
+    result = invoke(environment, "--dry-run")
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout)
+    mounts = [command[i + 1] for i, arg in enumerate(command) if arg == "--mount"]
+    base = Path(environment["HOME"]) / "vllm_hetero_pp_logs"
+    assert f"type=bind,src={base}/preview-head,dst=/work/hetero_logs" in mounts
+    assert command[command.index("--output") + 1] == "/work/hetero_logs/start"
+    assert not base.exists()
+
+
+def test_custom_log_directory_is_forwarded_as_a_host_mount(environment, tmp_path):
+    base = tmp_path / "readable logs"
+    result = invoke(environment, "--log-dir", str(base), "--dry-run")
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout)
+    assert f"type=bind,src={base}/preview-head,dst=/work/hetero_logs" in command
+    assert not base.exists()
+
+
+def test_container_logs_remain_readable_with_restrictive_initial_umask(
+    environment, tmp_path
+):
+    # The Docker boundary maps the generated host log directory for this fixture.
+    docker = tmp_path / "docker"
+    docker.write_text(
+        "#!/bin/bash\n"
+        "while (($#)); do\n"
+        '  if [[ "$1" == --mount && "$2" == *dst=/work/hetero_logs ]]; then\n'
+        '    value="${2#type=bind,src=}"\n'
+        '    export TEST_LOG_ROOT="${value%,dst=/work/hetero_logs}"\n'
+        "    shift 2; continue\n"
+        "  fi\n"
+        '  if [[ "$1" == -e ]]; then export "$2"; shift 2; continue; fi\n'
+        '  if [[ "$1" == *v0.23.0-openeuler ]]; then shift; exec "$@"; fi\n'
+        "  shift\n"
+        "done\nexit 99\n"
+    )
+    docker.chmod(0o700)
+    fake_bash = tmp_path / "bash"
+    fake_bash.write_text(
+        '#!/bin/sh\n: "${TEST_LOG_ROOT:?missing log mount}"\n'
+        'mkdir "$TEST_LOG_ROOT/start"\n'
+        'echo readable > "$TEST_LOG_ROOT/start/result.log"\n'
+    )
+    fake_bash.chmod(0o700)
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            str(SCRIPT),
+            "--head",
+            "53",
+            "--peer",
+            "54",
+            "--model",
+            environment["TEST_MODEL"],
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        umask=0o077,
+    )
+    assert result.returncode == 0, result.stderr
+    base = Path(environment["HOME"]) / "vllm_hetero_pp_logs"
+    runs = list(base.glob("hetero_pp_head_*"))
+    assert len(runs) == 1
+    assert stat.S_IMODE(base.stat().st_mode) == 0o700
+    assert stat.S_IMODE(runs[0].stat().st_mode) == 0o700
+    assert stat.S_IMODE((runs[0] / "start").stat().st_mode) == 0o755
+    log = runs[0] / "start/result.log"
+    assert stat.S_IMODE(log.stat().st_mode) == 0o644
+    assert log.read_text() == "readable\n"
 
 
 def test_container_failure_is_preserved_without_removing_existing_container(

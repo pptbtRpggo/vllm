@@ -49,12 +49,28 @@ bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
 
 310P 容器添加 `--security-opt seccomp=unconfined`；910B 容器不添加此参数。
 两边均使用 host 网络、1GiB 共享内存并保留镜像原始 entrypoint。
-模型只读挂载，项目可写挂载以保存日志；不覆盖镜像自带 CANN。
+模型只读挂载，项目代码保持挂载；日志另外挂载到当前宿主机用户的目录。
+不覆盖镜像自带 CANN。
 Ray head/API 默认端口仍为 16379/8000，可通过 `--ray-port` / `--api-port` 修改；
 其他 Ray/Gloo 端口仍动态分配。
 
+宿主机入口的日志默认写到：
+
+```text
+$HOME/vllm_hetero_pp_logs/hetero_pp_head_时间_标识/start/
+$HOME/vllm_hetero_pp_logs/hetero_pp_worker_时间_标识/start/
+```
+
+实际路径会打印出来。宿主机用户先创建私有外层目录（新建时为 `700`），
+容器内本轮日志目录为 `755`、普通新日志文件为 `644`，因此即使由容器 root
+写入，宿主机用户也能进入自己的目录读取日志。不批量修改旧 `output` 的权限。
+容器内固定路径是 `/work/hetero_logs/start`，退出并删除容器后宿主机日志仍保留。
+需要更换日志根目录时，在原命令后加 `--log-dir "$HOME/其他日志目录"`，
+或设置 `HOST_LOG_DIR`。现有目录不会被批量 chmod，必须对当前账号可写、可进入。
+下面手动容器内入口的日志默认值不变；已有受限日志需要目录拥有者处理。
+
 310P 加入 Ray 后保持容器前台运行。测试结束时两边分别 Ctrl+C，或由容器拥有者
-停止本次容器；容器退出自动删除，项目日志保留。已有同名容器时 Docker 会拒绝，
+停止本次容器；容器退出自动删除，宿主机日志保留。已有同名容器时 Docker 会拒绝，
 脚本不会先强制删除。没有使用 `--init`，不要求宿主机提供 `docker-init`。
 
 在命令后加 `--dry-run` 可以先显示将执行的 Docker 命令，不启动容器或 NPU。
