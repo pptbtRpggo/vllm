@@ -53,6 +53,10 @@ bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
 不覆盖镜像自带 CANN。
 Ray head/API 默认端口仍为 16379/8000，可通过 `--ray-port` / `--api-port` 修改；
 其他 Ray/Gloo 端口仍动态分配。
+两端 Ray 显式传入 `--min-worker-port=0 --max-worker-port=0`，让系统为 worker
+分配可用端口，避免默认 worker 范围 `10002–19999` 与主端口 `16379` 或
+自定义的 `16389` 重叠。`Ray component worker_ports ... used by other components`
+是 Ray 参数配置冲突，不等同于旧进程占用；真正的监听占用可用 `ss -lntp` 查看。
 
 宿主机入口的日志默认写到：
 

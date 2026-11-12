@@ -67,6 +67,8 @@ def test_same_script_plans_both_roles_without_starting_ray_or_loading_npu(
     ray = plan["ray_command"]
     assert ray[1:5] == ["-m", "ray.scripts.scripts", "start", "--num-cpus=4"]
     assert '--resources={"NPU":2}' in ray
+    assert "--min-worker-port=0" in ray
+    assert "--max-worker-port=0" in ray
     if role == "head":
         assert "--head" in ray
         serve = plan["serve_command"]
@@ -118,6 +120,38 @@ def launcher(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("head_port", [16379, 16389])
+def test_ray_head_port_does_not_overlap_reserved_worker_ports(
+    launcher, model, head_port
+):
+    # Exercise Ray's real configuration checker without starting any Ray process.
+    parameter = pytest.importorskip("ray._private.parameter")
+    args = launcher.argument_parser().parse_args(
+        [
+            "--head",
+            "192.0.2.10",
+            "--peer",
+            "192.0.2.20",
+            "--model",
+            str(model),
+            "--ray-port",
+            str(head_port),
+        ]
+    )
+    command = launcher.make_launch(args, args.head, sys.executable, {})["ray_command"]
+    ports = dict(
+        item[2:].split("=", 1)
+        for item in command
+        if item.startswith("--") and "=" in item
+    )
+    params = parameter.RayParams(
+        gcs_server_port=int(ports["port"]),
+        min_worker_port=int(ports.get("min-worker-port", "10002")),
+        max_worker_port=int(ports.get("max-worker-port", "19999")),
+    )
+    params.update_pre_selected_port()
 
 
 def test_automatic_role_rejects_unrelated_machine_and_wrong_interface(launcher):

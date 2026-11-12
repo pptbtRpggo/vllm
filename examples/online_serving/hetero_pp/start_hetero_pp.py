@@ -157,6 +157,10 @@ def make_launch(args, node_ip, python, environment):
         '--resources={"NPU":2}',
         "--object-store-memory=268435456",
         "--disable-usage-stats",
+        # Ray CLI's default 10002..19999 worker range includes our GCS port.
+        # Explicit zeros let workers bind OS-selected ports on both nodes.
+        "--min-worker-port=0",
+        "--max-worker-port=0",
         f"--node-ip-address={node_ip}",
     ]
     if role == "head":
