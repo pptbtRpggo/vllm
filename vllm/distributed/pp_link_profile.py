@@ -8,11 +8,15 @@ from collections import defaultdict
 
 def measured_transfer_ms(record: dict) -> float:
     value = record.get("send_service_ms")
-    if record.get("send_service_source") != "measured_serving_overlap" or value is None:
+    if (
+        record.get("send_service_source")
+        not in ("measured_serving_overlap", "measured_serving_ack")
+        or value is None
+    ):
         raise ValueError(
             "missing measured send_service_ms; "
             f"pairing status: {record.get('send_overlap_status')}; "
-            "collect matching serving send/recv traces on a shared host clock. "
+            "collect matching serving traces using a shared clock or READY/DONE ACK. "
             "Network/mock configuration is not a measured communication cost"
         )
     if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:

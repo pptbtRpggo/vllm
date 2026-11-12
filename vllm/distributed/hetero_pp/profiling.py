@@ -12,6 +12,10 @@ Profiling alone waits for the local execute completion event before starting
 the send window. Otherwise the send's blocking D2H copy could also include the
 forward tail already measured by compute events. This readiness checkpoint can
 remove native metadata/forward overlap; trace-off redeployment is required.
+
+Opt-in ACK mode additionally exchanges READY and DONE. DONE is posted after
+the receiver's H2D completes. Only sender-clock deltas become planner costs;
+receiver-readiness waits are retained separately, never subtracted across hosts.
 """
 
 from __future__ import annotations
@@ -29,6 +33,58 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
+
+
+class AckControl:
+    """Bounded, identity-bound CPU control frames on reserved Gloo tags.
+
+    Data uses header tag 0 and tensor tags 100..163. Profiling controls use
+    17000/17001 on the same explicit CPU group, with no Ray serialization.
+    """
+
+    TAGS = {"READY": 17000, "DONE": 17001}
+
+    def __init__(self, channel, rank, timeout_s):
+        from datetime import timedelta
+
+        self.group, self.rank = channel.group, rank
+        self.timeout = timedelta(seconds=timeout_s)
+
+    @staticmethod
+    def frame(kind, identity):
+        encoded = json.dumps(
+            dict(protocol="cpu-gloo-profile-ack-v1", kind=kind, **identity),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return torch.tensor(
+            list(hashlib.sha256(encoded).digest()), dtype=torch.uint8, device="cpu"
+        )
+
+    def _exchange(self, kind, peer, identity, *, sending):
+        expected = self.frame(kind, identity)
+        frame = expected if sending else torch.empty_like(expected, device="cpu")
+        try:
+            work = (
+                dist.isend(frame, dst=peer, group=self.group, tag=self.TAGS[kind])
+                if sending
+                else dist.irecv(frame, src=peer, group=self.group, tag=self.TAGS[kind])
+            )
+            if work.wait(self.timeout) is False:
+                raise TimeoutError("control frame timed out")
+        except Exception as exc:
+            raise RuntimeError(
+                f"{kind} acknowledgement with rank {peer}: {exc}"
+            ) from exc
+        if not sending and not torch.equal(frame, expected):
+            raise ValueError(f"{kind} acknowledgement mismatch with rank {peer}")
+
+    def send(self, kind, peer, identity):
+        self._exchange(kind, peer, identity, sending=True)
+
+    def receive(self, kind, peer, identity):
+        self._exchange(kind, peer, identity, sending=False)
 
 
 def monotonic_clock_domain():
@@ -132,6 +188,8 @@ class _Step:
     send_ready_wait_end_ns: int | None = None
     send_ready_wait_ms: float = 0.0
     send_readiness_checkpoint: bool = False
+    send_ack: dict | None = None
+    recv_ack: dict | None = None
     recv_bytes: int | None = None
     send_bytes: int | None = None
     materialization: dict[str, dict[str, int]] = field(default_factory=dict)
@@ -161,7 +219,7 @@ class _TraceLink:
         self.step.recv_bytes = tensor_bytes(values)
         return values
 
-    def send(self, values, sequence):
+    def _compute_ready(self, values):
         self.step.send_submit_start_ns = time.perf_counter_ns()
         self.step.send_bytes = tensor_bytes(values)
         capture = self.step.execute
@@ -176,6 +234,9 @@ class _TraceLink:
             self.step.send_ready_wait_ms = (
                 self.step.send_ready_wait_end_ns - self.step.send_ready_wait_start_ns
             ) / 1e6
+
+    def send(self, values, sequence):
+        self._compute_ready(values)
         self.step.send_start_ns = time.perf_counter_ns()
         works = self.original.send(values, sequence)
         remaining = len(works)
@@ -191,6 +252,78 @@ class _TraceLink:
         return [_TraceWork(work, complete) for work in works]
 
 
+class _AckTraceLink(_TraceLink):
+    """Profile-only ready/data/done exchange; only sender-clock deltas are costs."""
+
+    def __init__(self, step, original, timeout_s):
+        super().__init__(step, original)
+        self.rank = original.rank
+        self.control = AckControl(original.channel, self.rank, timeout_s)
+
+    def _identity(self, sequence, src, dst, payload_bytes):
+        if sequence != self.step.metadata["step"]:
+            raise ValueError("ACK sequence does not match profiling step")
+        return dict(
+            session=self.step.metadata["trace_session"],
+            step=sequence,
+            batch_id=self.step.metadata["batch_id"],
+            src_rank=src,
+            dst_rank=dst,
+            payload_bytes=payload_bytes,
+        )
+
+    def recv(self, sequence):
+        peer = self.rank - 1
+        identity = self._identity(sequence, peer, self.rank, 0)
+        ready_start = time.perf_counter_ns()
+        self.control.send("READY", peer, identity)
+        ready_end = time.perf_counter_ns()
+        values = super().recv(sequence)  # Returns only after all H2D copies finish.
+        identity = self._identity(sequence, peer, self.rank, self.step.recv_bytes)
+        done_start = time.perf_counter_ns()
+        self.control.send("DONE", peer, identity)
+        self.step.recv_ack = dict(
+            protocol=1,
+            identity=identity,
+            ready_sent=True,
+            done_sent=True,
+            ready_start_ns=ready_start,
+            ready_end_ns=ready_end,
+            data_ready_ns=self.step.recv_end_ns,
+            done_start_ns=done_start,
+            done_end_ns=time.perf_counter_ns(),
+        )
+        return values
+
+    def send(self, values, sequence):
+        self._compute_ready(values)
+        peer = self.rank + 1
+        identity = self._identity(sequence, self.rank, peer, 0)
+        ready_start = time.perf_counter_ns()
+        self.control.receive("READY", peer, identity)
+        ready_end = time.perf_counter_ns()
+        self.step.send_start_ns = time.perf_counter_ns()
+        works = self.original.send(values, sequence)
+        for work in works:
+            work.wait(self.control.timeout)
+        self.step.send_end_ns = time.perf_counter_ns()
+        identity = self._identity(sequence, self.rank, peer, self.step.send_bytes)
+        self.control.receive("DONE", peer, identity)
+        self.step.send_ack = dict(
+            protocol=1,
+            identity=identity,
+            ready_received=True,
+            done_received=True,
+            ready_start_ns=ready_start,
+            ready_end_ns=ready_end,
+            start_ns=self.step.send_start_ns,
+            end_ns=time.perf_counter_ns(),
+        )
+        # run_stage already drains sends before returning. This profiling mode
+        # additionally drains DONE, and never exposes a partially completed hop.
+        return []
+
+
 class StageProfiler:
     """Finite background writer for real per-module timing observations."""
 
@@ -204,6 +337,7 @@ class StageProfiler:
         pp_size,
         identity=None,
         timeout_s=60,
+        comm_timing=None,
     ):
         inner = getattr(model, "model", model)
         start, end = (
@@ -240,6 +374,11 @@ class StageProfiler:
             else torch.get_device_module(self.device.type)
         )
         self.timeout_s = min(float(timeout_s), 60.0)
+        self.comm_timing = (
+            comm_timing or os.environ.get("VLLM_PP_COMM_TIMING") or "shared-clock"
+        )
+        if self.comm_timing not in ("shared-clock", "ack"):
+            raise ValueError("unknown profiling communication timing")
         self.rank, self.pp_size = rank, pp_size
         self.session = session
         self.clock_domain = monotonic_clock_domain()
@@ -257,7 +396,12 @@ class StageProfiler:
             "local_device_id": self.identity.get("device_id"),
             "timing_source": "device_events_and_host_perf_counter",
             "compute_interval_kind": "sum_of_execute_and_sample_device_intervals",
-            "communication_scope": "completed_cpu_staged_handoff_including_peer_wait",
+            "communication_scope": (
+                "ready_to_remote_npu_ready_plus_done_return"
+                if self.comm_timing == "ack"
+                else "completed_cpu_staged_handoff_including_peer_wait"
+            ),
+            "comm_timing": self.comm_timing,
             "send_readiness_instrumentation": (
                 "local_execute_completion_event_before_metadata_and_D2H"
             ),
@@ -336,12 +480,17 @@ class StageProfiler:
             "compute_interval_kind": "sum_of_execute_and_sample_device_intervals",
             "profile_provenance_sha256": self.provenance_sha,
             "comm_delay_in_window": False,
+            "comm_timing": self.comm_timing,
         }
         self.pending = _Step(metadata)
         return self.pending
 
     def timed_link(self, step, original):
-        return original if step is None else _TraceLink(step, original)
+        if step is None:
+            return original
+        if self.comm_timing == "ack":
+            return _AckTraceLink(step, original, self.timeout_s)
+        return _TraceLink(step, original)
 
     def execute(self, step, fn):
         if step is None:
@@ -416,6 +565,8 @@ class StageProfiler:
         residual = max(0.0, residual)
         overhead = max(0.0, overhead)
         row.update(
+            send_ack=step.send_ack,
+            recv_ack=step.recv_ack,
             layer_compute_ms=layers,
             **endpoints,
             compute_ms=wall,
@@ -451,6 +602,12 @@ class StageProfiler:
             )
             if begin is not None and end is None:
                 raise ValueError("communication interval has unfinished work")
+            if (
+                self.comm_timing == "ack"
+                and begin is not None
+                and getattr(step, kind + "_ack") is None
+            ):
+                raise ValueError("communication interval has unfinished ACK")
             row[kind + "_start_ns"], row[kind + "_end_ns"] = begin, end
             row[kind + "_ms"] = (end - begin) / 1e6 if begin is not None else None
             row[kind + "_bytes"] = getattr(step, kind + "_bytes")

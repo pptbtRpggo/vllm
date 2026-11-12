@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Pair serving communication windows on a verified shared monotonic clock.
+"""Pair serving handoffs using shared-clock windows or sender-clock ACKs.
 
 recv_end - max(send_start, recv_start) removes the initial arrival gap only.
 It still includes metadata, allocation, backend scheduling and synchronization;
 it is not a device-event measurement of wire transmission or an idle-link cost.
+ACK mode validates READY/DONE receipts on both endpoints, then uses only the
+sender's data-start to DONE-received interval. Clock domains may differ.
 """
 
 from collections import defaultdict
@@ -22,6 +24,8 @@ def attach_paired_communication(by_key: dict[tuple[int, int], list[dict]]) -> No
                 "send_overlap_sender_ms",
                 "send_arrival_wait_ms",
                 "recv_arrival_wait_ms",
+                "send_ack_ms",
+                "send_ack_ready_wait_ms",
             ):
                 sender.pop(field, None)
             sender["send_overlap_status"] = "no_outgoing_transfer"
@@ -41,6 +45,13 @@ def attach_paired_communication(by_key: dict[tuple[int, int], list[dict]]) -> No
 def paired_transfer(sender: dict, receiver: dict) -> tuple[str, dict]:
     if sender.get("tp_size", 1) != 1 or receiver.get("tp_size", 1) != 1:
         return "unsupported_tp", {}
+    mode = sender.get("comm_timing", "shared-clock")
+    if mode != receiver.get("comm_timing", "shared-clock"):
+        return "unmatched_communication_timing", {}
+    if mode == "ack":
+        return paired_ack_transfer(sender, receiver)
+    if mode != "shared-clock":
+        return "unknown_communication_timing", {}
     if not sender.get("clock_domain") or (
         sender["clock_domain"] != receiver.get("clock_domain")
     ):
@@ -74,6 +85,84 @@ def paired_transfer(sender: dict, receiver: dict) -> tuple[str, dict]:
     )
 
 
+def paired_ack_transfer(sender: dict, receiver: dict) -> tuple[str, dict]:
+    """Validate both receipts, subtracting only timestamps from the same host."""
+    sent, received = sender.get("send_ack"), receiver.get("recv_ack")
+    if not isinstance(sent, dict) or not isinstance(received, dict):
+        return "missing_ack_evidence", {}
+    expected = dict(
+        session=sender.get("trace_session"),
+        step=sender.get("step"),
+        batch_id=sender.get("batch_id"),
+        src_rank=sender.get("pp_rank"),
+        dst_rank=receiver.get("pp_rank"),
+        payload_bytes=sender.get("send_bytes"),
+    )
+    if (
+        not expected["session"]
+        or not expected["batch_id"]
+        or type(expected["step"]) is not int
+        or type(expected["src_rank"]) is not int
+        or expected["dst_rank"] != expected["src_rank"] + 1
+        or receiver.get("trace_session") != expected["session"]
+        or receiver.get("step") != expected["step"]
+        or receiver.get("batch_id") != expected["batch_id"]
+        or type(expected["payload_bytes"]) is not int
+        or expected["payload_bytes"] < 0
+        or receiver.get("recv_bytes") != expected["payload_bytes"]
+        or sent.get("identity") != expected
+        or received.get("identity") != expected
+    ):
+        return "unmatched_ack_identity", {}
+    if (
+        type(sent.get("protocol")) is not int
+        or sent["protocol"] != 1
+        or type(received.get("protocol")) is not int
+        or received["protocol"] != 1
+        or sent.get("ready_received") is not True
+        or sent.get("done_received") is not True
+        or received.get("ready_sent") is not True
+        or received.get("done_sent") is not True
+        or sender.get("comm_scale", 1) != 1
+        or receiver.get("comm_scale", 1) != 1
+    ):
+        return "invalid_ack_evidence", {}
+    send_times = [
+        sent.get(k) for k in ("ready_start_ns", "ready_end_ns", "start_ns", "end_ns")
+    ]
+    recv_times = [
+        received.get(k)
+        for k in (
+            "ready_start_ns",
+            "ready_end_ns",
+            "data_ready_ns",
+            "done_start_ns",
+            "done_end_ns",
+        )
+    ]
+    raw = [
+        sender.get("send_start_ns"),
+        sender.get("send_end_ns"),
+        receiver.get("recv_start_ns"),
+        receiver.get("recv_end_ns"),
+    ]
+    if any(type(t) is not int or t < 0 for t in send_times + recv_times + raw):
+        return "invalid_ack_evidence", {}
+    sr, ready, start, end = cast(tuple[int, int, int, int], tuple(send_times))
+    rr, rr_end, data, done, done_end = cast(
+        tuple[int, int, int, int, int], tuple(recv_times)
+    )
+    ss, se, rs, re = cast(tuple[int, int, int, int], tuple(raw))
+    if not (
+        sr <= ready <= start == ss < se <= end
+        and rr <= rr_end <= rs < re == data <= done <= done_end
+    ):
+        return "invalid_ack_evidence", {}
+    return "paired_ack", dict(
+        send_ack_ms=(end - start) / 1e6, send_ack_ready_wait_ms=(ready - sr) / 1e6
+    )
+
+
 def select_serving_communication(records: list[dict]) -> None:
     for record in records:
         record.pop("send_service_ms", None)
@@ -82,3 +171,6 @@ def select_serving_communication(records: list[dict]) -> None:
         if record.get("send_overlap_status") == "paired":
             record["send_service_ms"] = record["send_overlap_ms"]
             record["send_service_source"] = "measured_serving_overlap"
+        elif record.get("send_overlap_status") == "paired_ack":
+            record["send_service_ms"] = record["send_ack_ms"]
+            record["send_service_source"] = "measured_serving_ack"

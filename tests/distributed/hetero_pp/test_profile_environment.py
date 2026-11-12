@@ -34,6 +34,7 @@ class ProfileEnvironmentTests(unittest.TestCase):
                 "VLLM_PP_STAGE_TRACE": "",
                 "VLLM_PP_TRACE_SESSION": "",
                 "VLLM_PP_COMPUTE_MODEL": "",
+                "VLLM_PP_COMM_TIMING": "",
             },
         )
 
@@ -42,6 +43,7 @@ class ProfileEnvironmentTests(unittest.TestCase):
             "VLLM_PP_STAGE_TRACE": "/tmp/new-profile",
             "VLLM_PP_TRACE_SESSION": "unique-session",
             "VLLM_PP_COMPUTE_MODEL": "layer-measured",
+            "VLLM_PP_COMM_TIMING": "ack",
             "UNRELATED": "secret-fixture",
         }
         settings = self.module().profile_actor_environment(env)
@@ -52,6 +54,7 @@ class ProfileEnvironmentTests(unittest.TestCase):
             {"VLLM_PP_TRACE_SESSION": ""},
             {"VLLM_PP_COMPUTE_MODEL": "shape-affine"},
             {"VLLM_PP_STAGE_TRACE": "relative-path"},
+            {"VLLM_PP_COMM_TIMING": "assume-synced"},
         ]:
             env = {
                 "VLLM_PP_STAGE_TRACE": "/tmp/new-profile",

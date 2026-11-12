@@ -23,8 +23,11 @@
 
 本轮目标硬件是 hw/hw2 两个容器各两张 910B3，共四张不同的物理卡，
 **两个容器位于同一物理宿主机**。这既不是 310P 验收，也不是跨物理机网络性能测试。
-当前通信成本配对要求两端有已验证相同的单调时钟域；两台独立物理机的时间戳
-不能直接相减。仅有网络互通或 NTP 对时，并不足以满足这个条件。
+原 `shared-clock` 通信成本配对要求两端有已验证相同的单调时钟域；
+两台独立物理机的时间戳不能直接相减，NTP 对时也不足以满足这个条件。
+2026-11-12 新增 `--comm-timing ack`，允许不同单调时钟域，用发送端计时和
+接收完成确认测交接成本，详见第 3.1 节。该新增模式的 CPU/Gloo 测试与既有
+910B 实机证据分开；尚未把它标为跨物理机 NPU 性能验收通过。
 
 先按[CPU/Gloo 手动启动指南](hetero_pp_cpu_gloo_zh.md)准备匹配环境、核对源码导入位置，
 并分别启动 Ray head 与 worker。采集前不要同时运行 API 或另一套占卡任务。
@@ -43,7 +46,8 @@ export VLLM_USE_V2_MODEL_RUNNER=0
 
 `PLAN` 是原来的 topology JSON，本轮采集使用 32 层模型的 `8/8/8/8`：
 节点 IP、SoC 和 stage 顺序都要正确。模型路径和源码应在双方一致可用。
-`TRACE` 目录需要在双方相同绝对路径可见；本轮的共享 userdata 满足这个条件。
+`TRACE` 目录需要在双方相同绝对路径可见且实际共享；本轮的共享 userdata 满足这个条件。
+仅创建两个同名本地目录不够：Ray 不自动共享文件，本入口也不自动搬运远端 raw。
 共享模型、共享 trace 目录不等于拥有两份独立备份。
 
 ## 2. 先采集：只收真实测量，不立即选层数
@@ -57,7 +61,7 @@ test ! -e "$TRACE"
 
 "$PY" -m vllm.entrypoints.cli.main pp-profile "$MODEL" \
   --hetero-plan "$PLAN" --trace-dir "$TRACE" --collect-only \
-  --compute-model layer-measured \
+  --compute-model layer-measured --comm-timing ack \
   --input-len 64 --output-len 16 --num-prompts 4 \
   --num-iters-warmup 1 --num-iters 2 --seed 7 \
   --dtype float16 --enforce-eager --no-async-scheduling \
@@ -69,6 +73,8 @@ test ! -e "$TRACE"
 
 这就是 `vllm pp-profile` 的显式 Python 入口，确保使用 `$PY` 所在的匹配环境。
 它选用真正的 `HeteroPPExecutor` 类；不要改成普通 Ray executor 或旧 HCCL worker。
+上面使用新 ACK 口径，适用于同机或跨物理机的三条链路。要复用原共享时钟口径，
+显式换成 `--comm-timing shared-clock`；不传参数时，实时采集仍默认 `shared-clock`。
 
 这个例子中，每次 `generate()` 输入四条合成 token prompt：一轮 warmup，
 两轮正式采集。warmup 与正式 prompt 不同，正式迭代之间的 prompt 也不同。
@@ -104,13 +110,62 @@ SHA、读取内存证据，并完成服务收尾后，才写 `profile_manifest.j
 不能把“没有观察到”写成零成本。
 
 通信走同一个 CPU/Gloo 通道，包含真实 D2H、Gloo 和 H2D 的完成依赖。
-配对窗口来自实际发送/接收 host 时间戳，不由“配置了多少 Gbit/s”换算出来。
+原 `shared-clock` 配对窗口来自实际发送/接收 host 时间戳，
+不由“配置了多少 Gbit/s”换算出来。
 它含 CPU 复制、元数据、分配、Gloo 排程和同步，**不等于纯网卡传输时间**。
 
 profiling 还在发送前增加完成事件检查，防止把尚未完成的计算尾部再次计入通信成本。
 这段 readiness 等待已有计算计时覆盖，不会另加一次成本。
 这种 instrumentation 可能改变原有的元数据与设备尾部重叠；
 trace-off 服务没有这项 profiling 检查。因此不能直接把 profile 中的耗时当原生服务延迟。
+
+### 3.1 跨物理机：READY/DONE ACK 计时
+
+实时采集加 `--comm-timing ack`，head 会把该设置显式传给所有 Ray actors，
+无需修改 Ray daemon 环境。三个相邻 hop 都采用相同口径：
+
+1. 接收端进入本 step，发送 `READY`，然后调用原来的 tensor 接收通道。
+2. 发送端等本地计算完成，再等到 `READY`。从此后发送数据之前记录 `t0`。
+3. 原有通道发送元数据和实际 tensor，保留 hidden states/residual 等原始内容。
+4. 接收端等全部 Gloo 接收及 CPU→NPU 复制完成，再发送 `DONE`。
+5. 发送端收到 `DONE`，记录 `t1`，交接成本为本机时钟的 `t1−t0`。
+
+这个窗口包含元数据、D2H、Gloo、分配、H2D 和 DONE 返回成本；
+不包含发送端等待 READY 的时间，也不包含已经单独计时的计算就绪检查。
+它不是纯网卡传输时间、物理单向延迟或 NPU 原生互联带宽，不应除以二。
+`payload_bytes×8/(耗时ms×10^6)` 可称为本次 payload 的 **有效交接速率（Gbps）**，
+该 payload 不含控制消息/元数据的线缆开销，不是对物理链路速率的验收。
+
+控制帧使用同一显式 CPU/Gloo group 的保留 tag `17000/17001`，
+与原 header tag `0`、tensor tag `100..163` 分开。
+帧通过 SHA256 绑定协议版本、READY/DONE、session、step、batch、源/目的 rank、
+payload 字节数。DONE 只在实际接收完成后发送；错误身份、丢失确认或超时会失败，
+不自动重试，不发布完整 profile manifest。每条控制消息等待有上限
+`min(topology timeout_s, 60)` 秒，另保留 Gloo group 和父执行器的原有超时。
+
+四份 `pp_stage_pp*_tp0.jsonl` 会增加这些字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `comm_timing` | 本轮为 `ack`；旧口径为 `shared-clock` |
+| `send_ack.identity` / `recv_ack.identity` | 两端相同的 session、step、batch、rank、字节数 |
+| `send_ack.ready_start_ns/ready_end_ns` | 发送端等待 READY 的本地时间，单列、不加进交接成本 |
+| `send_ack.start_ns/end_ns` | 发送端数据开始至收到 DONE 的本地时间 |
+| `recv_ack.data_ready_ns` | 接收通道返回、所有 H2D 已完成的本地时间 |
+| `recv_ack.done_start_ns/done_end_ns` | 接收端发送 DONE 的本地时间 |
+| `send_start_ns/end_ns`、`recv_start_ns/end_ns` | 原发送/接收窗口仍保存，不与 ACK 窗口重复相加 |
+
+`profile_manifest.json` 和每个 worker 的 flush receipt 都绑定 `comm_timing`。
+离线 `--skip-run` 默认读取 manifest 中的口径；显式传入另一种口径会拒绝，
+不能把旧 trace 改标为新测量。分析时完整配对记为 `paired_ack`，
+规划器来源记为 `measured_serving_ack`，每条 hop 只加入一次成本；
+`pp_partition_plan.json` 的 rank 成本中可检查该来源和 `t_comm_out_ms`。
+两种口径不能混在一轮或多个拟合 trace 中。新模式目前只用于固定设备顺序切层，
+不用于设备子集选择或设备重排。
+
+READY/DONE 会改变 profiling 的握手和部分重叠。推荐分区仍须在 trace-off 模式
+重新部署，核对输出 IDs，并另测 TTFT/TPOT/吞吐。没有启用 tracing 的服务不增加
+任何 READY/DONE；原成功数据和历史 shared-clock 结果不改写。
 
 raw 中 `device_id` / `profile_device_id` 是全局 profiling 身份 `0/1/2/3`，
 用于把设备成本与 stage 绑定；`local_device_id` 才是节点内逻辑卡号，

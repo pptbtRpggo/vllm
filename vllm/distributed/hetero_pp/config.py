@@ -151,15 +151,22 @@ def validate_runtime(cfg, size):
 def profile_actor_environment(environment=None):
     """Forward only explicit profile settings and clear stale daemon values."""
     source = os.environ if environment is None else environment
-    keys = ("VLLM_PP_STAGE_TRACE", "VLLM_PP_TRACE_SESSION", "VLLM_PP_COMPUTE_MODEL")
+    keys = (
+        "VLLM_PP_STAGE_TRACE",
+        "VLLM_PP_TRACE_SESSION",
+        "VLLM_PP_COMPUTE_MODEL",
+        "VLLM_PP_COMM_TIMING",
+    )
     if not source.get(keys[0]):
         return dict.fromkeys(keys, "")
     values = {key: source.get(key, "") for key in keys}
+    values["VLLM_PP_COMM_TIMING"] = source.get("VLLM_PP_COMM_TIMING") or "shared-clock"
     if (
         not all(isinstance(v, str) for v in values.values())
         or not Path(values[keys[0]]).is_absolute()
         or not values[keys[1]]
         or values[keys[2]] != "layer-measured"
+        or values[keys[3]] not in ("shared-clock", "ack")
     ):
         raise ValueError(
             "profiling needs an absolute trace path, session and layer-measured mode"

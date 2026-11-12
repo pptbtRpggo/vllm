@@ -37,6 +37,7 @@ _TRACE_ENV = (
     "VLLM_PP_STAGE_TRACE",
     "VLLM_PP_TRACE_SESSION",
     "VLLM_PP_COMPUTE_MODEL",
+    "VLLM_PP_COMM_TIMING",
     "VLLM_HETERO_PP_PLAN",
 )
 _TRANSPORT = "cpu_gloo"
@@ -117,8 +118,12 @@ def build_profile_workload(
     )
 
 
-def prepare_trace_dir(dump_dir: str | Path | None = None) -> Path:
+def prepare_trace_dir(
+    dump_dir: str | Path | None = None, comm_timing="shared-clock"
+) -> Path:
     """Reserve a new/empty trace directory; never delete prior evidence."""
+    if comm_timing not in ("shared-clock", "ack"):
+        raise ValueError("unknown communication timing")
     if dump_dir is None:
         path = Path(tempfile.mkdtemp(prefix="vllm_staged_pp_profile_"))
     else:
@@ -131,6 +136,7 @@ def prepare_trace_dir(dump_dir: str | Path | None = None) -> Path:
     os.environ["VLLM_PP_STAGE_TRACE"] = str(path)
     os.environ["VLLM_PP_TRACE_SESSION"] = uuid.uuid4().hex
     os.environ["VLLM_PP_COMPUTE_MODEL"] = "layer-measured"
+    os.environ["VLLM_PP_COMM_TIMING"] = comm_timing
     return path
 
 
@@ -193,6 +199,8 @@ def validate_profile_args(args: Any) -> None:
     """Reject unsupported requests before constructing a real engine."""
     if not getattr(args, "hetero_plan", None):
         raise ValueError("--hetero-plan is required")
+    if getattr(args, "comm_timing", None) not in (None, "shared-clock", "ack"):
+        raise ValueError("unknown communication timing")
     if getattr(args, "collect_only", False) and getattr(args, "skip_run", False):
         raise ValueError("--collect-only cannot be combined with --skip-run")
     if getattr(args, "skip_run", False) and not getattr(args, "trace_dir", None):
@@ -424,12 +432,19 @@ def _validate_startup(reports, topology, config):
             raise ValueError("profile requires two distinct actual devices per node")
 
 
-def _validate_flush(directory, receipts, session, topology, *, live=False):
+def _validate_flush(
+    directory, receipts, session, topology, *, live=False, comm_timing=None
+):
     if not isinstance(receipts, list) or len(receipts) != 4:
         raise ValueError("flush must return exactly four rank receipts")
     ordered = sorted(receipts, key=lambda r: r.get("rank", r.get("pp_rank", -1)))
+    timing = comm_timing or ordered[0].get("comm_timing", "shared-clock")
+    if timing not in ("shared-clock", "ack"):
+        raise ValueError("unknown communication timing")
     raw_files, end = {}, 0
     for rank, receipt in enumerate(ordered):
+        if receipt.get("comm_timing", "shared-clock") != timing:
+            raise ValueError("rank receipt communication timing mismatch")
         name = f"pp_stage_pp{rank}_tp0.jsonl"
         path = directory / name
         remote_path = Path(receipt.get("trace_path", receipt.get("trace_file", "")))
@@ -465,6 +480,8 @@ def _validate_flush(directory, receipts, session, topology, *, live=False):
             raise ValueError(f"rank {rank} trace count differs from flush")
         stop = end + topology["stages"][rank]["layers"]
         for row in rows:
+            if row.get("comm_timing", "shared-clock") != timing:
+                raise ValueError("rank raw communication timing mismatch")
             if (
                 row.get("pp_rank") != rank
                 or row.get("tp_rank") != 0
@@ -480,6 +497,14 @@ def _validate_flush(directory, receipts, session, topology, *, live=False):
                 raise ValueError(f"rank {rank} raw identity/config/transport mismatch")
         raw_files[name] = _sha(path)
         end = stop
+    if timing == "ack":
+        from vllm.distributed.pp_link_profile import measured_transfer_ms
+        from vllm.distributed.pp_partition import load_trace_records
+
+        paired = load_trace_records(directory)
+        for rank in range(3):
+            for row in paired[rank]:
+                measured_transfer_ms(row)
     return ordered, raw_files
 
 
@@ -508,7 +533,11 @@ def _load_bound_manifest(directory, topology):
         if not file.is_relative_to(_ROOT) or not file.is_file() or _sha(file) != digest:
             raise ValueError(f"profile source SHA changed: {relative}")
     _, raw = _validate_flush(
-        directory, manifest["flush_receipts"], manifest["trace_session"], topology
+        directory,
+        manifest["flush_receipts"],
+        manifest["trace_session"],
+        topology,
+        comm_timing=manifest.get("comm_timing", "shared-clock"),
     )
     if raw != manifest.get("raw_files"):
         raise ValueError("raw trace hash manifest changed")
@@ -545,6 +574,7 @@ def _collect(*, directory, topology, args, llm_factory, workload, memory):
             os.environ["VLLM_PP_TRACE_SESSION"],
             topology,
             live=True,
+            comm_timing=os.environ.get("VLLM_PP_COMM_TIMING", "shared-clock"),
         )
         # Worker provenance crosses the same RPC boundary in both in-process
         # and multiprocess EngineCore mode. The driver need not own Executor.
@@ -598,6 +628,7 @@ def _collect(*, directory, topology, args, llm_factory, workload, memory):
             version=1,
             complete=True,
             transport=_TRANSPORT,
+            comm_timing=os.environ.get("VLLM_PP_COMM_TIMING", "shared-clock"),
             trace_session=os.environ["VLLM_PP_TRACE_SESSION"],
             hetero_plan=topology,
             topology_sha256=_digest(topology),
@@ -675,9 +706,12 @@ def profile_pp_partition(
     collect_only=False,
     device_selection=False,
     layer_aggregation="microbatch",
+    comm_timing=None,
 ):
     """Collect/validate bound staged traces and optionally run fixed-order DP."""
     topology = _load_topology(hetero_plan)
+    if comm_timing not in (None, "shared-clock", "ack"):
+        raise ValueError("unknown communication timing")
     if collect_only and skip_run:
         raise ValueError("--collect-only cannot be combined with --skip-run")
     if (
@@ -712,7 +746,7 @@ def profile_pp_partition(
             )
         previous = {key: os.environ.get(key) for key in _TRACE_ENV}
         try:
-            directory = prepare_trace_dir(dump_dir)
+            directory = prepare_trace_dir(dump_dir, comm_timing or "shared-clock")
             os.environ["VLLM_HETERO_PP_PLAN"] = json.dumps(topology)
             workload = workload or build_profile_workload(
                 num_prompts=num_prompts,
@@ -742,6 +776,12 @@ def profile_pp_partition(
             raise ValueError("--trace-dir is required with --skip-run")
         directory = Path(dump_dir).expanduser().resolve()
         manifest = _load_bound_manifest(directory, topology)
+        if comm_timing is not None and comm_timing != manifest.get(
+            "comm_timing", "shared-clock"
+        ):
+            raise ValueError(
+                "requested communication timing differs from bound profile"
+            )
         memory = memory or PPMemoryProfile.from_file(
             directory / "pp_memory_profile.json"
         )
@@ -887,6 +927,15 @@ def add_cli_args(parser):
     parser.add_argument("--output-json", type=str)
     parser.add_argument("--collect-only", action="store_true")
     parser.add_argument("--skip-run", action="store_true")
+    parser.add_argument(
+        "--comm-timing",
+        choices=("shared-clock", "ack"),
+        default=None,
+        help=(
+            "Live default: shared-clock; use ack across physical hosts. "
+            "Offline default: infer bound mode."
+        ),
+    )
     parser.add_argument("--input-len", type=int, default=256)
     parser.add_argument("--output-len", type=int, default=32)
     parser.add_argument("--num-prompts", type=int, default=16)
@@ -952,6 +1001,7 @@ def run_from_cli_args(args):
         compute_model=args.compute_model,
         layer_aggregation=args.layer_aggregation,
         collect_only=args.collect_only,
+        comm_timing=getattr(args, "comm_timing", None),
     )
 
 

@@ -203,6 +203,13 @@ def load_trace_records(
             rec = json.loads(line)
             by_key[(int(rec["pp_rank"]), int(rec["tp_rank"]))].append(rec)
 
+    modes = {
+        row.get("comm_timing", "shared-clock")
+        for rows in by_key.values()
+        for row in rows
+    }
+    if len(modes) != 1 or not modes.issubset({"shared-clock", "ack"}):
+        raise ValueError("profiles mix or have unknown communication timing methods")
     attach_paired_communication(by_key)
     select_serving_communication([r for rows in by_key.values() for r in rows])
     by_rank: dict[int, list[dict[str, Any]]] = {}
@@ -557,6 +564,16 @@ def plan_from_trace_dir(
             else fit_shape_rank_costs
         )
         trace_sets = [records] + [load_trace_records(p) for p in fit_trace_dirs]
+        timing = {
+            r.get("comm_timing", "shared-clock")
+            for traces in trace_sets
+            for rows in traces.values()
+            for r in rows
+        }
+        if len(timing) != 1:
+            raise ValueError("profiles mix communication timing methods across runs")
+        if timing == {"ack"} and device_selection:
+            raise ValueError("ACK profiles currently require fixed device order")
         if compute_model == "shape-affine" and any(
             row.get("profile_device_id", rank) != rank
             for traces in trace_sets

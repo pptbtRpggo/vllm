@@ -8,6 +8,7 @@ import shlex
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -20,6 +21,14 @@ class ProfileCLITests(unittest.TestCase):
         assert spec is not None and spec.loader is not None
         self.mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.mod)
+        # Parser validation uses real EngineArgs, but needs an explicit platform
+        # in a source checkout without installed vLLM build metadata.
+        import vllm.platforms
+        from vllm.platforms.cpu import CpuPlatform
+
+        platform = patch.object(vllm.platforms, "_current_platform", CpuPlatform())
+        platform.start()
+        self.addCleanup(platform.stop)
         from vllm.utils.argparse_utils import FlexibleArgumentParser
 
         parser = FlexibleArgumentParser()
@@ -33,6 +42,22 @@ class ProfileCLITests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "hetero.plan"):
             self.mod.PPProfileSubcommand().validate(args)
+
+    def test_ack_communication_timing_is_explicit(self):
+        args = self.parser.parse_args(
+            [
+                "pp-profile",
+                "fixture-model",
+                "--hetero-plan",
+                "plan.json",
+                "--enforce-eager",
+                "--no-async-scheduling",
+                "--comm-timing",
+                "ack",
+            ]
+        )
+        self.mod.PPProfileSubcommand().validate(args)
+        self.assertEqual(args.comm_timing, "ack")
 
     def test_defaults_are_fixed_order_layer_measured_latency(self):
         args = self.parser.parse_args(
