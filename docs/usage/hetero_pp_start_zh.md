@@ -4,6 +4,61 @@
 这是现有异构 PP 后端的启动脚本，不自动安装依赖、重建镜像或发测试请求。
 通信检查通过之后，仍需用真实模型完成下面的验证。
 
+## 宿主机自动选择镜像并启动容器
+
+不想手工启动 Docker 时，两边在宿主机的项目根目录使用：
+
+```bash
+bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
+  --head 53 --peer 54 \
+  --model /本机的完整模型目录
+```
+
+将 `53` 改为 910B 机器的 IP 末段，`54` 改为 310P 机器的 IP 末段。
+默认前缀为 `141.147.135`；以上示例展开为 `141.147.135.53` 和
+`141.147.135.54`。也可以直接传完整 IPv4。先运行 910B 端，等待时再运行 310P 端。
+两端宿主机模型目录可以不同，容器内统一挂到 `/workspace/model`；内容必须一致。
+
+也可以在脚本开头或环境中填写 `HEAD_LAST`、`PEER_LAST`、`HOST_MODEL_DIR`，
+之后直接运行脚本。空的 `RAY_PORT` / `SERVICE_PORT` 使用默认值 16379 / 8000。
+
+宿主机入口按本机拥有哪个 IP 判断角色，再选择镜像：
+
+| 角色 | 默认镜像 |
+| --- | --- |
+| 910B / head | `quay.io/ascend/vllm-ascend:v0.23.0-openeuler` |
+| 310P / worker | `quay.io/ascend/vllm-ascend:v0.23.0-310p-openeuler-mixed-pp` |
+
+310P 默认值是用户本次使用的自定义镜像名，不代表它是官方发布的标签。
+优先使用 Docker 本地已有镜像；不存在时 Docker 会按这个名称尝试拉取，
+若自定义标签未发布，需要先导入同事提供的镜像。需要换镜像时，可以使用
+`--image 镜像名`，或分别设置环境变量 `IMAGE_910B` / `IMAGE_310P`。
+
+选镜像依据是用户填写的 IP 角色，不是宿主机硬件探测结果。实际型号、卡数
+和两张卡的初始化由容器内 TorchNPU 检查，角色与实际型号不符时拒绝启动。
+全流程不要求宿主机有 `npu-smi`、TorchNPU 或 CANN 用户态环境。
+
+网卡通过 `ip -4 route get 对端IP from 本机IP` 自动选择并检查本机地址归属，
+设置 `GLOO_SOCKET_IFNAME` 与 `VLLM_HOST_IP`。宿主机需要已有 `ip` 和 Docker。
+可用 `--interface 网卡名` 明确指定；指定接口必须拥有填写的本机 IP。
+
+默认映射宿主机卡设备文件 `davinci0` / `davinci1`。需要其他卡时使用
+`--devices 0,2`；只改变 Docker 设备映射，不再设置容器的
+`ASCEND_RT_VISIBLE_DEVICES`，避免宿主机编号和容器逻辑编号重复筛选。
+这是选卡配置，不是空闲检测；必须确认这些卡可以供本次使用。
+
+容器参数保留 `seccomp=unconfined`、host 网络、1GiB 共享内存和镜像原始
+entrypoint。模型只读挂载，项目可写挂载以保存日志；不覆盖镜像自带 CANN。
+Ray head/API 默认端口仍为 16379/8000，可通过 `--ray-port` / `--api-port` 修改；
+其他 Ray/Gloo 端口仍动态分配。
+
+310P 加入 Ray 后保持容器前台运行。测试结束时两边分别 Ctrl+C，或由容器拥有者
+停止本次容器；容器退出自动删除，项目日志保留。已有同名容器时 Docker 会拒绝，
+脚本不会先强制删除。没有使用 `--init`，不要求宿主机提供 `docker-init`。
+
+在命令后加 `--dry-run` 可以先显示将执行的 Docker 命令，不启动容器或 NPU。
+此入口先做 Docker 编排；下文是已经位于容器内部时使用的原入口。
+
 ## 准备
 
 - 在两边已经能通过 NPU/CPU/Gloo 检查的容器里运行，保留成功的 Docker
