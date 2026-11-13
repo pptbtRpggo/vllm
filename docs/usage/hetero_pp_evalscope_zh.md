@@ -4,6 +4,25 @@
 它仅调用已有的 EvalScope，向已启动的 OpenAI-compatible API 发请求。
 不启动/停止模型、Docker、Ray，不修改 NPU 或服务参数，不安装依赖。
 
+## Windows 下载、打包后上传 Linux
+
+Windows Git 的 `core.autocrlf=true` 可能把仓库 LF 换行转换成工作目录中的
+CRLF。压缩、加密和 SCP 通常只是保留文件字节，Linux 解压后仍是 CRLF，
+Bash 就可能把 `pipefail` 读成 `pipefail\r`，或报 `do\r` 语法错误。
+
+本目录的 `.gitattributes` 现在强制 `*.sh` 检出为 LF，并保留原始数据的字节。
+在 **Windows 项目目录**、打包之前检查：
+
+```bash
+git config --show-origin --get core.autocrlf
+git ls-files --eol "examples/online_serving/hetero_pp/*.sh"
+```
+
+脚本应显示 `i/lf w/lf` 和 `eol=lf`。新规则不会改写已经制作的旧压缩包，
+也不能阻止编辑器再次保存为 CRLF。已有文件若仍显示 `w/crlf`，
+先在编辑器中转为 LF 并保存，再重新打包；不要在打包前把脚本转回 CRLF。
+启动时使用 `bash start_evalscope_docker.sh`，不单独用 `sh` 执行容器内部安装脚本。
+
 ## 0. 推荐：新建专用 EvalScope 客户端容器
 
 旧环境 EvalScope 缺少预热参数时，不需要修改原推理容器或宿主机 Python。

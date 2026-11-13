@@ -1,0 +1,7 @@
+# Bash scripts must remain runnable after a Windows checkout and archive copy.
+*.sh text eol=lf
+.gitattributes text eol=lf
+
+# Preserve the pinned upstream data and license bytes on every platform.
+data/gsm8k/test.jsonl -text
+data/gsm8k/LICENSE -text
