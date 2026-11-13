@@ -80,6 +80,40 @@ $HOME/vllm_hetero_pp_logs/hetero_pp_worker_时间_标识/start/
 在命令后加 `--dry-run` 可以先显示将执行的 Docker 命令，不启动容器或 NPU。
 此入口先做 Docker 编排；下文是已经位于容器内部时使用的原入口。
 
+### 只进入 Bash 调试
+
+在原宿主机命令后加 `--shell`，或执行（IP 改成实际值）：
+
+```bash
+bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
+  --head 53 --peer 54 --devices 0,1 --shell
+```
+
+仍按本机 IP 选择 910B/310P 镜像和网卡，复用设备、驱动和项目目录挂载；
+可以用 `--image`、`--devices`、`--name` 覆盖。不需要另一台机器同时运行。
+此模式不需要 `--model`，不挂载模型或实验日志，不创建日志目录，
+不执行 NPU 预检、Ray 或模型启动。`--dry-run --shell` 可预览 Docker 命令。
+
+调试模式强制 `--entrypoint /bin/bash`，也跳过镜像入口中的自动环境初始化；
+需要时在 Bash 内手动加载该镜像的 CANN 环境。两种角色均设置
+`--security-opt seccomp=unconfined`，用于复现前述调试容器配置，
+这会关闭该容器的默认系统调用过滤，并不表示已确认 NPU 错误由它导致。
+普通服务模式的 entrypoint 和安全配置保持原样。
+
+默认生成独立的 `hetero-pp-debug-...` 容器名，启动时打印实际名称。
+调试容器退出后保留，不使用 `--rm`，不会删除或重启原服务容器。
+将下面的 `容器名` 替换为打印的名称：
+
+```bash
+# 容器仍在运行时，另开一个 Bash
+docker exec -it 容器名 /bin/bash
+# exit 退出后，再次启动只进入 Bash
+docker start -ai 容器名
+```
+
+普通服务容器的 `docker start -ai` 会重新执行服务启动命令，
+可能因 `/work/hetero_logs/start` 已存在而拒绝启动；不要为此删除旧日志。
+
 ## 准备
 
 - 在两边已经能通过 NPU/CPU/Gloo 检查的容器里运行，保留成功的 Docker

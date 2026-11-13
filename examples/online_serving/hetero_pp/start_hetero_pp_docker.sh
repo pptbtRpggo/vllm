@@ -17,7 +17,7 @@ image="${IMAGE:-}"
 devices="${HOST_NPU_DEVICES:-0,1}"
 ray_port="${RAY_PORT:-16379}" api_port="${SERVICE_PORT:-8000}"
 layers="${PP_LAYERS:-18,18,6,6}"
-interface="" dry_run=false
+interface="" dry_run=false debug_shell=false
 forward=()
 
 usage() {
@@ -45,6 +45,10 @@ usage() {
   --chat-template codellama-instruct / PATH
                        内置 CodeLlama-Instruct 模板或容器内文件路径；省略沿用 tokenizer
   --dry-run            只显示命令，不启动 Docker，不初始化 NPU
+  --shell              只进 Bash，不启动服务/预检，不创建实验日志目录
+                       无需 --model；仍用 --head/--peer 选择本机镜像/网卡
+                       两种角色都禁用 seccomp 过滤，覆盖镜像 ENTRYPOINT
+                       退出保留容器，可用 docker start -ai 容器名再次进入
 EOF
 }
 die() { echo "错误：$*" >&2; exit 2; }
@@ -53,6 +57,7 @@ while (($#)); do
   case "$1" in
     --help|-h) usage; exit 0 ;;
     --dry-run) dry_run=true; shift ;;
+    --shell) debug_shell=true; shift ;;
     --head|--peer|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--api-port|--layers|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python|--chat-template)
       (($# >= 2)) && [[ -n "$2" && "$2" != --* ]] || die "$1 缺少参数"
       case "$1" in
@@ -93,8 +98,10 @@ for port in "$ray_port" "$api_port"; do
 done
 [[ "$ray_port" != "$api_port" ]] || die "Ray 和 API 不能使用同一端口"
 [[ "$layers" =~ ^[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]*$ ]] || die "layers 需要四个正整数"
-[[ -d "$model" ]] || die "模型目录不存在：$model"
-model="$(cd -- "$model" && pwd -P)"
+if ! "$debug_shell"; then
+  [[ -d "$model" ]] || die "模型目录不存在：$model"
+  model="$(cd -- "$model" && pwd -P)"
+fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd -- "$script_dir/../../.." && pwd)"
 [[ "$repo" != *,* && "$model" != *,* ]] || die "Docker bind mount 路径不能含逗号"
@@ -133,6 +140,12 @@ while read -r _ nic family cidr _; do
 done <<< "$addresses"
 "$valid_interface" && [[ "$interface" != lo ]] || die "所选网卡不拥有本机 IP：$interface / $local_ip"
 
+if "$debug_shell"; then
+  name="${name:-hetero-pp-debug-${role}-$(date +%Y%m%d_%H%M%S)-$$}"
+  command=(docker run --name "$name" --net=host --shm-size=1g
+    --security-opt seccomp=unconfined -i)
+  if [[ -t 0 && -t 1 ]]; then command+=(-t); fi
+else
 if [[ "$log_dir" != /* ]]; then log_dir="$(pwd -P)/$log_dir"; fi
 [[ "$log_dir" != *,* ]] || die "日志 bind mount 路径不能含逗号"
 if "$dry_run"; then
@@ -148,6 +161,7 @@ name="${name:-hetero-pp-$role}"
 command=(docker run --rm --name "$name" --net=host --shm-size=1g)
 if [[ "$role" == worker ]]; then command+=(--security-opt seccomp=unconfined); fi
 if [[ -t 0 && -t 1 ]]; then command+=(-it); fi
+fi
 for device in "davinci$first" "davinci$second" davinci_manager hisi_hdc; do
   command+=(--device "/dev/$device")
 done
@@ -157,10 +171,14 @@ for path in /usr/local/dcmi /usr/local/Ascend/driver/lib64 \
   /usr/local/Ascend/driver/version.info /etc/ascend_install.info; do
   command+=(--mount "type=bind,src=$path,dst=$path,readonly")
 done
-command+=(--mount "type=bind,src=$repo,dst=/work/vllm"
-  --mount "type=bind,src=$run_dir,dst=/work/hetero_logs"
-  --mount "type=bind,src=$model,dst=/workspace/model,readonly" -w /work/vllm
-  -e "GLOO_SOCKET_IFNAME=$interface" -e "VLLM_HOST_IP=$local_ip" -e "HETERO_PP_ROLE=$role")
+command+=(--mount "type=bind,src=$repo,dst=/work/vllm" -w /work/vllm
+  -e "GLOO_SOCKET_IFNAME=$interface" -e "VLLM_HOST_IP=$local_ip")
+if "$debug_shell"; then
+  command+=(--entrypoint /bin/bash "$image")
+else
+command+=(--mount "type=bind,src=$run_dir,dst=/work/hetero_logs"
+  --mount "type=bind,src=$model,dst=/workspace/model,readonly"
+  -e "HETERO_PP_ROLE=$role")
 # Retain the image's entrypoint so custom image initialization is not bypassed.
 # Expanded only in the container. A joined worker must keep PID 1 alive for Ray.
 # shellcheck disable=SC2016
@@ -181,6 +199,7 @@ while true; do sleep 5 & wait $!; done
   --ray-port "$ray_port" --api-port "$api_port" --output /work/hetero_logs/start)
 # Bash 3 treats an empty array as unset under nounset.
 if [[ -n "${forward[*]-}" ]]; then command+=("${forward[@]}"); fi
+fi
 if "$dry_run"; then
   printf '%q ' "${command[@]}"
   echo
@@ -188,7 +207,13 @@ if "$dry_run"; then
 fi
 command -v docker >/dev/null || die "找不到 docker 命令"
 echo "本机角色=$role，IP=$local_ip，网卡=$interface，镜像=$image" >&2
+if "$debug_shell"; then
+  echo "只进 Bash：跳过镜像入口/自动环境初始化、NPU 预检、Ray 和模型启动；不挂载模型或实验日志。" >&2
+  echo "调试容器禁用 seccomp 过滤；退出后保留，可用 docker start -ai $name 再次进入。" >&2
+  echo "另开终端进入：docker exec -it $name /bin/bash" >&2
+else
 echo "选择镜像依据 IP 角色；容器内将实际校验两张 NPU 型号及初始化。" >&2
 echo "Ray端口=$ray_port，API端口=$api_port；不删除已有容器、不重新设置 NPU 可见性。" >&2
 echo "宿主机本轮日志：$run_dir/start；目录和日志文件将允许宿主机用户读取。" >&2
+fi
 exec "${command[@]}"

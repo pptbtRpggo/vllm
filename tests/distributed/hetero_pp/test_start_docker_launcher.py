@@ -48,8 +48,11 @@ def invoke(environment, *arguments):
             "53",
             "--peer",
             "54",
-            "--model",
-            environment["TEST_MODEL"],
+            *(
+                ["--model", environment["TEST_MODEL"]]
+                if environment["TEST_MODEL"]
+                else []
+            ),
             *arguments,
         ],
         env=environment,
@@ -252,6 +255,52 @@ def test_container_failure_is_preserved_without_removing_existing_container(
     docker.chmod(0o700)
     result = invoke(environment)
     assert result.returncode == 7
+
+
+@pytest.mark.parametrize("local", ["141.147.135.53", "141.147.135.54"])
+def test_shell_bypasses_service_entrypoint_and_model_requirement(environment, local):
+    environment["TEST_LOCAL_IP"] = local
+    environment["TEST_MODEL"] = ""
+    result = invoke(environment, "--shell", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout)
+    assert command[command.index("--entrypoint") + 1] == "/bin/bash"
+    assert command[-1].startswith("quay.io/ascend/vllm-ascend:")
+    assert "--rm" not in command
+    assert "seccomp=unconfined" in command
+    assert "/dev/davinci0" in command and "/dev/davinci1" in command
+    assert command[command.index("--name") + 1].startswith("hetero-pp-debug-")
+    assert not any("start_hetero_pp.sh" in value for value in command)
+    assert not any("dst=/work/hetero_logs" in value for value in command)
+    assert not any("dst=/workspace/model" in value for value in command)
+    assert not (Path(environment["HOME"]) / "vllm_hetero_pp_logs").exists()
+
+
+def test_shell_executes_docker_without_creating_logs_and_keeps_overrides(
+    environment, tmp_path
+):
+    docker = tmp_path / "docker"
+    capture = tmp_path / "docker.args"
+    docker.write_text('#!/bin/bash\nprintf "%s\\0" "$@" > "$CAPTURE"\nexit 7\n')
+    docker.chmod(0o700)
+    environment["CAPTURE"] = str(capture)
+    result = invoke(
+        environment,
+        "--shell",
+        "--devices",
+        "0,2",
+        "--name",
+        "my-debug",
+        "--image",
+        "admin/910b:tested",
+    )
+    assert result.returncode == 7, result.stderr
+    command = capture.read_bytes().decode().rstrip("\0").split("\0")
+    assert command[-1] == "admin/910b:tested"
+    assert command[command.index("--name") + 1] == "my-debug"
+    assert "/dev/davinci2" in command and "/dev/davinci1" not in command
+    assert "--rm" not in command
+    assert not (Path(environment["HOME"]) / "vllm_hetero_pp_logs").exists()
 
 
 def test_worker_container_stays_alive_after_ray_join(environment, tmp_path):
