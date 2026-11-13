@@ -4,6 +4,64 @@
 它仅调用已有的 EvalScope，向已启动的 OpenAI-compatible API 发请求。
 不启动/停止模型、Docker、Ray，不修改 NPU 或服务参数，不安装依赖。
 
+## 0. 推荐：新建专用 EvalScope 客户端容器
+
+旧环境 EvalScope 缺少预热参数时，不需要修改原推理容器或宿主机 Python。
+在 **vLLM head 所在宿主机**的项目根目录运行：
+
+```bash
+bash examples/online_serving/hetero_pp/start_evalscope_docker.sh
+```
+
+默认复用普通 `quay.io/ascend/vllm-ascend:v0.23.0-openeuler` 镜像，
+本地没有时尝试拉取。使用镜像自带的 Python 3.12 在客户端专属的
+`/tmp/evalscope-client/.venv` 中自动安装最新版 `evalscope[perf]`，
+不使用 Python 3.9 的旧包，不修改镜像原有 Python 包或原服务容器。
+首次需要联网下载依赖；安装日志与实际安装版本清单保存到宿主机结果目录。
+可用 `--index-url https://pypi.tuna.tsinghua.edu.cn/simple` 指定包索引，
+或用 `--evalscope-version 版本号` 固定 EvalScope 版本。
+
+安装及必要参数检查通过后进入 Bash，不会自动发请求。直接手动执行：
+
+```bash
+# 先试 4 个请求
+benchmark_gsm8k.sh --parallel 1 --number 4 --warmup-num 0 --max-tokens 32
+
+# 成功后再测 8 / 16 / 32 / 64，每档 512 正式 + 64 预热
+benchmark_gsm8k.sh
+```
+
+`evalscope` 与 `benchmark_gsm8k.sh` 已自动加入容器 PATH。
+脚本和项目内置的 GSM8K 已实际复制到 `/tmp/evalscope-client/tools/`，
+不需要手动找路径、重新下载数据或挂载模型。需要指定其他服务时：
+
+```bash
+benchmark_gsm8k.sh --url http://服务地址:8000 --model 实际服务模型名
+```
+
+客户端使用 host 网络，同一宿主机上可访问 `http://127.0.0.1:8000`。
+不分配 NPU、不挂载驱动，不需要 `--privileged` 或关闭 seccomp，
+也不启动 Ray/vLLM。请保持模型服务运行，并且只运行一个压测客户端。
+
+客户端不带 `--rm`，退出后保留。实际容器名与宿主机结果目录会打印出来：
+
+```bash
+# 容器退出后再次进入（复用已安装环境）
+docker start -ai 实际客户端容器名
+# 容器仍在运行时，另开一个终端
+docker exec -it 实际客户端容器名 /bin/bash
+```
+
+压测结果默认写入容器 HOME 下的 `vllm_hetero_pp_logs`，它指向 `/results`，
+对应宿主机 `$HOME/vllm_hetero_pp_logs/evalscope_client_唯一标识/`。
+容器按当前宿主机 UID/GID 运行，结果归当前用户所有。
+也可用 `--output-dir /你的路径/全新目录` 指定宿主机结果目录。
+删除客户端容器会丢失其 venv，但已经挂载回宿主机的结果保留。
+
+验证范围：本地用隔离的 Docker/包下载替身验证编排和安装错误处理，
+并实际执行容器准备脚本、复制数据、打开 Bash 和运行压测 dry-run。
+尚未在真实 Docker 镜像中完成联网安装或向模型服务发压，不能将这些测试视为实机验收。
+
 ## 1. 在一个客户端执行
 
 选择能访问 vLLM head API、且已经安装 EvalScope perf 的环境。
