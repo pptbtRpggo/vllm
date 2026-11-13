@@ -12,12 +12,10 @@ import ipaddress
 import json
 import math
 import os
-import shutil
 import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -84,7 +82,7 @@ def argument_parser():
         help="连接 Ray 后采集并生成 DP 推荐，不启动 API",
     )
     parser.add_argument(
-        "--trace-root", type=Path, help="profiling 两端真正共享的结果根目录"
+        "--trace-root", type=Path, help="可选，profiling 本地结果根目录，无需共享存储"
     )
     parser.add_argument(
         "--profile-timeout",
@@ -103,10 +101,13 @@ def argument_parser():
 
 def validate_options(args):
     if args.profile:
-        if args.trace_root is None or not args.trace_root.is_absolute():
-            raise ValueError("--profile 需要 --trace-root 共享目录的绝对路径")
-        if not args.trace_root.is_dir():
-            raise ValueError("--trace-root 必须是已有共享目录；不会自动建立共享存储")
+        args.trace_root = (
+            args.trace_root or Path.home() / "vllm_hetero_pp_logs/profiles"
+        )
+        if not args.trace_root.is_absolute():
+            raise ValueError("--trace-root 需要本地目录的绝对路径")
+        if args.trace_root.exists() and not args.trace_root.is_dir():
+            raise ValueError("--trace-root 不是目录")
     elif args.trace_root is not None:
         raise ValueError("--trace-root 仅用于 --profile")
     if (
@@ -289,47 +290,6 @@ def make_launch(args, node_ip, python, environment):
     )
 
 
-def verify_profile_storage(address, head, peer, root, timeout):
-    """Round-trip fresh files on both nodes before any model is loaded."""
-    import ray
-    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
-    def check(probe, nonce, ip):
-        from pathlib import Path
-
-        path = Path(probe)
-        if (path / "head_nonce").read_text() != nonce:
-            raise RuntimeError("两端不是同一个共享结果目录")
-        answer = f"{ip}:{nonce}"
-        (path / ip).write_text(answer)
-        return answer
-
-    ray.init(address=address)
-    try:
-        nodes = {n["NodeManagerAddress"]: n for n in ray.nodes() if n["Alive"]}
-        probe = Path(tempfile.mkdtemp(prefix=".edgeshard_shared_check_", dir=root))
-        nonce = uuid.uuid4().hex
-        (probe / "head_nonce").write_text(nonce)
-        tasks = [
-            ray.remote(num_cpus=0)(check)
-            .options(
-                scheduling_strategy=NodeAffinitySchedulingStrategy(
-                    node_id=nodes[ip]["NodeID"], soft=False
-                )
-            )
-            .remote(str(probe), nonce, ip)
-            for ip in (head, peer)
-        ]
-        answers = ray.get(tasks, timeout=float(timeout))
-        for ip, answer in zip((head, peer), answers):
-            if answer != f"{ip}:{nonce}" or (probe / ip).read_text() != answer:
-                raise RuntimeError("无法读回远端写入的共享目录记录")
-        shutil.rmtree(probe)  # Only this successful check's newly created files.
-        print(json.dumps({"shared_trace_verified": True, "root": root}), flush=True)
-    finally:
-        ray.shutdown()
-
-
 def profile_foreground(command, environment, log, timeout):
     """Stream finite profiling output; interrupt only this owned child tree."""
     with log.open("w") as writer, log.open() as reader:
@@ -476,29 +436,6 @@ finally:
     if rc:
         raise RuntimeError("Ray 集群未就绪；不启动模型，见 cluster_wait.log")
     if args.profile:
-        code = (
-            "import sys; sys.path.insert(0, sys.argv[1]); "
-            "from start_hetero_pp import verify_profile_storage; "
-            "verify_profile_storage(*sys.argv[2:])"
-        )
-        rc, text = capture(
-            [
-                python,
-                "-c",
-                code,
-                str(Path(__file__).parent),
-                environment["RAY_ADDRESS"],
-                args.head,
-                args.peer,
-                str(args.trace_root),
-                str(min(args.startup_timeout, 60)),
-            ],
-            environment,
-            min(args.startup_timeout, 90),
-        )
-        (output / "shared_storage_check.log").write_text(text)
-        if rc:
-            raise RuntimeError("两端共享结果目录检查失败；见 shared_storage_check.log")
         profile_env = dict(
             environment,
             **launch["profile_environment"],
@@ -506,7 +443,8 @@ finally:
             PLAN=str(output / "plan.json"),
         )
         print(
-            f"Ray 和共享目录已就绪，开始 profiling；日志 {output / 'profile.log'}",
+            "Ray 已就绪，开始本地采集并自动回收 peer 记录；"
+            f"日志 {output / 'profile.log'}",
             flush=True,
         )
         rc = profile_foreground(

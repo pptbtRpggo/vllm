@@ -460,9 +460,7 @@ def _validate_flush(
         ):
             raise ValueError(f"incomplete or mismatched rank {rank} flush receipt")
         if live and remote_path.resolve() != path.resolve():
-            raise ValueError(
-                "collect each rank trace into the declared shared trace directory"
-            )
+            raise ValueError("rank trace path must match this profiling run directory")
         if not path.is_file() or _sha(path) != receipt.get("trace_sha256"):
             raise ValueError(f"raw trace SHA changed or missing: {name}")
         rows = [
@@ -568,6 +566,9 @@ def _collect(*, directory, topology, args, llm_factory, workload, memory):
             memory.validate_engine_config(config)
         run_traced_generate(llm, workload)
         receipts = llm.collective_rpc("flush_pp_profile")
+        from vllm.distributed.hetero_pp.trace_export import collect_profile_traces
+
+        collect_profile_traces(llm, directory, receipts)
         receipts, raw_files = _validate_flush(
             directory,
             receipts,

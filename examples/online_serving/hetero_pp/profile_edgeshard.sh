@@ -10,7 +10,7 @@ REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 MODEL="${MODEL:-}"                    # 容器内模型目录，两边相同路径可用
 PLAN="${PLAN:-}"                      # 当前已跑通的 PP4 topology JSON
 RAY_ADDRESS="${RAY_ADDRESS:-}"         # 例如 141.147.135.53:16379
-TRACE_ROOT="${TRACE_ROOT:-}"           # 两机真正共享的目录，不是同名本地目录
+TRACE_ROOT="${TRACE_ROOT:-}"           # 本地结果根目录；自动回收远端 rank 记录
 PY="${PY:-${VIRTUAL_ENV:-$REPO/.venv}/bin/python}"
 
 profile_statistics() {
@@ -210,12 +210,12 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
 用法：在 head 容器中编辑本文件顶部配置后运行：
   bash examples/online_serving/hetero_pp/profile_edgeshard.sh
 只统计已有完整 ACK 采集（不占 NPU、不重跑模型）：
-  bash examples/online_serving/hetero_pp/profile_edgeshard.sh --stats-only /共享目录/某轮结果
+  bash examples/online_serving/hetero_pp/profile_edgeshard.sh --stats-only /本地目录/某轮结果
 
 也可用环境变量传入 MODEL、PLAN、RAY_ADDRESS、TRACE_ROOT、PY。
 PY 是当前能运行异构 vLLM 的 Python 路径；默认当前虚拟环境或项目 .venv。
 Ray 必须已连接，两边使用匹配的项目代码与环境，四张卡供本次采集使用。
-TRACE_ROOT 必须真正共享且容器内绝对路径相同，本脚本不自动建立共享存储。
+TRACE_ROOT 为本地结果根目录；采集结束后自动通过已有 Ray 回收 peer 原始记录。
 
 流程：4 条合成输入，1 轮预热 + 2 轮采集，打印耗时和通信速率表，再离线 DP 推荐层数。
 统计排除预热，按四 stage/三条链路及 prefill/decode/mixed 分组，保存汇总与逐步 CSV。
@@ -234,7 +234,7 @@ if (($#)); then echo '未知参数；使用 --help 查看说明。' >&2; exit 2;
 [[ -d "$MODEL" ]] || { echo '请设置 MODEL 为可读模型目录。' >&2; exit 2; }
 [[ -r "$PLAN" && -f "$PLAN" ]] || { echo '请设置 PLAN 为当前 PP4 topology JSON。' >&2; exit 2; }
 [[ -n "$RAY_ADDRESS" ]] || { echo '请设置 RAY_ADDRESS=head_IP:端口。' >&2; exit 2; }
-[[ "$TRACE_ROOT" == /* ]] || { echo '请设置 TRACE_ROOT 为共享目录的绝对路径。' >&2; exit 2; }
+[[ "$TRACE_ROOT" == /* ]] || { echo '请设置 TRACE_ROOT 为本地结果目录的绝对路径。' >&2; exit 2; }
 [[ -x "$PY" && -f "$PY" ]] || { echo '请设置 PY 为匹配服务环境的 Python 绝对路径。' >&2; exit 2; }
 
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"

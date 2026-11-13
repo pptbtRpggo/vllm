@@ -378,9 +378,12 @@ def test_profile_mounts_shared_directory_and_forwards_mode(
     assert any("dst=/workspace/model,readonly" in arg for arg in command)
 
 
-def test_profile_without_shared_directory_is_rejected(environment):
+def test_profile_defaults_to_local_logs_without_shared_mount(environment):
     result = invoke(environment, "--profile", "--dry-run")
-    assert result.returncode != 0 and "trace-root" in result.stderr
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout)
+    assert command[command.index("--trace-root") + 1] == "/work/hetero_logs/profiles"
+    assert not any("dst=/work/hetero_profiles" in value for value in command)
 
 
 def test_shell_and_profile_cannot_be_combined(environment, tmp_path):

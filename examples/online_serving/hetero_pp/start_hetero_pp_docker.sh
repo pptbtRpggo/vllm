@@ -39,8 +39,8 @@ usage() {
   --api-port PORT      默认 8000，API 仅在 910B 的 127.0.0.1 上监听
   --layers A,B,C,D     默认 18,18,6,6；总和须等于模型层数
   --profile           两边启动并连接 Ray，head 自动采集/打印统计/生成 DP，不启动 API
-  --trace-root DIR    profiling 必填：宿主机已有真正共享的目录，两边都传
-                       挂载到两边容器 /work/hetero_profiles，并自动校验跨机读写
+  --trace-root DIR    可选，本机结果目录；不需要共享，默认随本轮日志保存
+                       peer 记录由 master 通过现有 Ray 连接自动收回并校验
   --profile-timeout N profiling 全流程上限秒数，默认 3600
   --block-size N / --num-gpu-blocks-override N
                        可选，显式 KV 配置；profiling 默认 128 / 64
@@ -83,10 +83,12 @@ done
 
 if "$profile"; then
   "$debug_shell" && die '--profile 和 --shell 不能同时使用'
-  [[ "$trace_root" == /* && -d "$trace_root" && -w "$trace_root" && -x "$trace_root" ]] ||
-    die '--profile 需要 --trace-root 指定已有、可写的共享目录绝对路径'
-  trace_root="$(cd -- "$trace_root" && pwd -P)"
-  [[ "$trace_root" != *,* ]] || die '共享目录路径不能含逗号'
+  if [[ -n "$trace_root" ]]; then
+    [[ "$trace_root" == /* && -d "$trace_root" && -w "$trace_root" && -x "$trace_root" ]] ||
+      die '--trace-root 需要已有、可写的本地目录绝对路径'
+    trace_root="$(cd -- "$trace_root" && pwd -P)"
+    [[ "$trace_root" != *,* ]] || die '本地结果目录路径不能含逗号'
+  fi
 elif [[ -n "$trace_root" ]]; then
   die '--trace-root 仅用于 --profile'
 fi
@@ -197,7 +199,7 @@ else
 command+=(--mount "type=bind,src=$run_dir,dst=/work/hetero_logs"
   --mount "type=bind,src=$model,dst=/workspace/model,readonly"
   -e "HETERO_PP_ROLE=$role")
-if "$profile"; then
+if "$profile" && [[ -n "$trace_root" ]]; then
   command+=(--mount "type=bind,src=$trace_root,dst=/work/hetero_profiles"
     -e HETERO_PP_MODE=profile)
 fi
@@ -219,7 +221,11 @@ while true; do sleep 5 & wait $!; done
 ' hetero-pp --head "$head" --peer "$peer" --model /workspace/model
   --node-ip "$local_ip" --interface "$interface" --layers "$layers"
   --ray-port "$ray_port" --api-port "$api_port" --output /work/hetero_logs/start)
-if "$profile"; then command+=(--profile --trace-root /work/hetero_profiles); fi
+if "$profile"; then
+  profile_root=/work/hetero_logs/profiles
+  if [[ -n "$trace_root" ]]; then profile_root=/work/hetero_profiles; fi
+  command+=(--profile --trace-root "$profile_root")
+fi
 # Bash 3 treats an empty array as unset under nounset.
 if [[ -n "${forward[*]-}" ]]; then command+=("${forward[@]}"); fi
 fi

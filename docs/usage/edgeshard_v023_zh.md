@@ -46,9 +46,9 @@ export VLLM_USE_V2_MODEL_RUNNER=0
 
 `PLAN` 是原来的 topology JSON，本轮采集使用 32 层模型的 `8/8/8/8`：
 节点 IP、SoC 和 stage 顺序都要正确。模型路径和源码应在双方一致可用。
-`TRACE` 目录需要在双方相同绝对路径可见且实际共享；本轮的共享 userdata 满足这个条件。
-仅创建两个同名本地目录不够：Ray 不自动共享文件，本入口也不自动搬运远端 raw。
-共享模型、共享 trace 目录不等于拥有两份独立备份。
+`TRACE` 是本地结果目录，不要求共享存储。各 worker 先在本机相同容器路径写记录，
+采集结束后 controller 通过已有 Ray/EngineCore RPC 收回缺失的 rank 原始文件与完成回执，
+核对 SHA 后才发布完整 manifest。每 rank 导出上限 64 MiB，超限报错并保留原件。
 
 ## 2. 先采集：只收真实测量，不立即选层数
 
@@ -104,13 +104,13 @@ SHA、读取内存证据，并完成服务收尾后，才写 `profile_manifest.j
 ### 2.1 单文件脚本与通信速率统计
 
 如果尚未启动容器和 Ray，优先按
-[双端启动指南的自动 profiling 模式](hetero_pp_start_zh.md#自动-profiling-模式两边仍使用原入口)
-在两台宿主机运行 `start_hetero_pp_docker.sh --profile --trace-root ...`。
+[双端启动指南的自动 profiling 模式](hetero_pp_start_zh.md#自动-profiling不需要共享目录)
+在两台宿主机运行 `start_hetero_pp_docker.sh --profile`。
 该模式复用原环境探测和 Ray 连接，head 自动调用下方脚本；不需要先启动 API，
 也无需手工填写 Python/plan 路径。它的显存默认值为原启动入口的 0.8。
 
 也可使用 `examples/online_serving/hetero_pp/profile_edgeshard.sh`，在文件顶部
-填写 `MODEL`、`PLAN`、`RAY_ADDRESS`、真正共享的 `TRACE_ROOT`，并指定匹配服务
+填写 `MODEL`、`PLAN`、`RAY_ADDRESS`、本地结果目录 `TRACE_ROOT`，并指定匹配服务
 环境的 Python 路径 `PY`，只在 head 容器中执行：
 
 ```bash

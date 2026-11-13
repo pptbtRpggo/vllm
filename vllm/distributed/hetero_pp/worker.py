@@ -68,6 +68,18 @@ class StagingWorkerMixin:
             else {"enabled": False, "complete": False, "pending": 0}
         )
 
+    def export_pp_profile(self, rank):
+        if type(rank) is not int or not 0 <= rank < self.parallel_config.world_size:
+            raise ValueError("invalid profile export rank")
+        if rank != self.rank:
+            return None
+        from vllm.distributed.hetero_pp.trace_export import export_profile
+
+        profiler = self._get_hetero_profiler()
+        if profiler is None:
+            raise ValueError("profiling is not enabled")
+        return export_profile(profiler)
+
     def get_pp_memory_observation(self):
         import json
 
