@@ -101,6 +101,49 @@ test ! -e "$TRACE"
 SHA、读取内存证据，并完成服务收尾后，才写 `profile_manifest.json` 的完整回执。
 发生错误时保留原目录诊断，不能把失败目录清空后当同一轮重试成功。
 
+### 2.1 单文件脚本与通信速率统计
+
+也可使用 `examples/online_serving/hetero_pp/profile_edgeshard.sh`，在文件顶部
+填写 `MODEL`、`PLAN`、`RAY_ADDRESS`、真正共享的 `TRACE_ROOT`，并指定匹配服务
+环境的 Python 路径 `PY`，只在 head 容器中执行：
+
+```bash
+bash examples/online_serving/hetero_pp/profile_edgeshard.sh
+```
+
+它采用上面的小规模采集配置，采集后打印计算/交接耗时表及三条相邻链路的有效
+交接速率，再运行离线 latency 目标 DP。每个 stage/链路分别列出全部、prefill、decode 和存在时的 mixed
+step；阶段由真实调度 token 计数判定。排除预热，零 payload 只计排除数量，
+不计入速率样本。汇总和逐交接记录分别保存到采集目录的
+`communication_speed_summary.csv`、`communication_speed_samples.csv`。
+
+耗时表 `stage_and_link_timing_summary.csv` 包含四个 stage 的 `compute` 行与
+三条链路的 `handoff` 行，列出样本数、平均值、P50/P90/P95/P99，单位 ms，
+另存总和、最小值和最大值。逐步计算保存在 `stage_compute_samples.csv`。
+计算时长取 `compute_wall_ms`，这是 `execute_device_ms + sample_device_ms`
+两个设备事件区间的和，不是 host 函数调用时长，不包含两个 RPC 之间的空档；
+包含末 stage 的采样设备区间。缺少有效事件时长或区间不守恒会拒绝汇总，
+不会把缺失值补成零。交接时长取配对核验后的 `send_ack_ms`，包含零 payload
+交接；速率统计则排除零 payload。各阶段/链路的分位数不能直接相加得到请求延迟。
+
+- `mean_gbps`：逐交接有效速率的算术平均。
+- `aggregate_gbps`：总 payload 字节数乘 8，除以各交接耗时之和；不是整轮墙钟吞吐。
+- P10/P50/P90/P95/P99：逐交接速率排序后按 `(n-1)×q` 线性插值。
+  P10 表示慢侧，P90/P99 表示快侧；CSV 另存最小值、最大值、样本数、payload 范围。
+
+所有速率单位为 Gbps，窗口使用第 3.1 节的 ACK 完成交接口径，包括 D2H、Gloo、
+H2D 和 DONE 确认，不是物理网卡带宽。all 行会混合不同 payload，阶段拆分也不
+代表固定 payload 测速；当前小规模配置的样本量有限，分位数不代表稳定性能边界。
+统计会核对完整采集 manifest、四份 raw SHA、step 配对和两端 ACK 证据；这是通信
+统计的输入检查，不代替后续 DP 的完整配置/内存校验或推荐方案实机复验。
+
+已有完整 ACK 采集可以只重算统计，不启动 Ray、模型或 NPU：
+
+```bash
+PY=/path/to/matched/venv/bin/python \
+  bash examples/online_serving/hetero_pp/profile_edgeshard.sh --stats-only "$TRACE"
+```
+
 ## 3. 测到的“计算”和“通信”分别是什么
 
 `layer-measured` 用实际模块事件测每层 decoder、首端 embedding、末端 norm
