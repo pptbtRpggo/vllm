@@ -103,6 +103,12 @@ SHA、读取内存证据，并完成服务收尾后，才写 `profile_manifest.j
 
 ### 2.1 单文件脚本与通信速率统计
 
+如果尚未启动容器和 Ray，优先按
+[双端启动指南的自动 profiling 模式](hetero_pp_start_zh.md#自动-profiling-模式两边仍使用原入口)
+在两台宿主机运行 `start_hetero_pp_docker.sh --profile --trace-root ...`。
+该模式复用原环境探测和 Ray 连接，head 自动调用下方脚本；不需要先启动 API，
+也无需手工填写 Python/plan 路径。它的显存默认值为原启动入口的 0.8。
+
 也可使用 `examples/online_serving/hetero_pp/profile_edgeshard.sh`，在文件顶部
 填写 `MODEL`、`PLAN`、`RAY_ADDRESS`、真正共享的 `TRACE_ROOT`，并指定匹配服务
 环境的 Python 路径 `PY`，只在 head 容器中执行：

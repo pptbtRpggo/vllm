@@ -288,6 +288,8 @@ def test_profile_automatically_summarizes_only_after_success(tmp_path, collect_e
             "TRACE_ROOT": str(tmp_path / "shared"),
             "CALL_LOG": str(calls),
             "FIXTURE": str(fixture),
+            "PROFILE_GPU_MEMORY_UTILIZATION": "0.7",
+            "PROFILE_MAX_NUM_SEQS": "8",
         },
         capture_output=True,
         text=True,
@@ -296,6 +298,8 @@ def test_profile_automatically_summarizes_only_after_success(tmp_path, collect_e
     assert result.returncode == collect_exit, result.stderr
     captured = calls.read_text().splitlines()
     assert "--comm-timing ack" in captured[0]
+    assert "--gpu-memory-utilization 0.7" in captured[0]
+    assert "--max-num-seqs 8" in captured[0]
     summaries = list((tmp_path / "shared").glob("*/communication_speed_summary.csv"))
     if collect_exit:
         assert len(captured) == 1 and not summaries

@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -269,6 +270,210 @@ def test_cluster_failure_prevents_head_model_launch(
         launcher.start_services(args, launch, {}, tmp_path, sys.executable)
     assert not (tmp_path / "server_exit.json").exists()
     assert "peer missing" in (tmp_path / "cluster_wait.log").read_text()
+
+
+@pytest.mark.parametrize("ip", ["192.0.2.10", "192.0.2.20"])
+def test_profile_mode_plans_ray_and_head_profile_instead_of_api(model, tmp_path, ip):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    result = invoke(
+        model,
+        "--node-ip",
+        ip,
+        "--profile",
+        "--trace-root",
+        str(shared),
+        "--gpu-memory-utilization",
+        "0.7",
+        "--max-num-seqs",
+        "8",
+    )
+    assert result.returncode == 0, result.stderr
+    launch = json.loads(result.stdout)
+    assert launch["serve_command"] is None
+    if ip == "192.0.2.10":
+        assert launch["profile_command"] == [
+            "bash",
+            str(DIRECTORY / "profile_edgeshard.sh"),
+        ]
+        assert launch["profile_environment"]["PROFILE_GPU_MEMORY_UTILIZATION"] == "0.7"
+        assert launch["profile_environment"]["PROFILE_MAX_NUM_SEQS"] == "8"
+        assert launch["profile_environment"]["TRACE_ROOT"] == str(shared)
+    else:
+        assert launch["profile_command"] is None
+
+
+def test_profile_requires_explicit_shared_directory_before_ray(model):
+    result = invoke(model, "--profile")
+    assert result.returncode != 0 and "trace-root" in result.stderr
+
+
+def test_fixed_kv_configuration_is_replayed_in_normal_service(model):
+    result = invoke(model, "--block-size", "128", "--num-gpu-blocks-override", "64")
+    assert result.returncode == 0, result.stderr
+    command = json.loads(result.stdout)["serve_command"]
+    assert command[command.index("--block-size") + 1] == "128"
+    assert command[command.index("--num-gpu-blocks-override") + 1] == "64"
+
+
+@pytest.mark.parametrize("profile_exit", [0, 7])
+def test_profile_head_runs_storage_check_then_profile_without_serving(
+    launcher,
+    model,
+    tmp_path,
+    monkeypatch,
+    profile_exit,
+):
+    args = launcher.argument_parser().parse_args(
+        [
+            "--head",
+            "192.0.2.10",
+            "--peer",
+            "192.0.2.20",
+            "--model",
+            str(model),
+            "--profile",
+            "--trace-root",
+            str(tmp_path),
+        ]
+    )
+    launch = launcher.make_launch(args, args.head, sys.executable, {})
+    calls = []
+
+    def capture(command, env, timeout):
+        calls.append("ray" if "start" in command else "cluster/storage")
+        return 0, "ready"
+
+    def profile(command, env, log, timeout):
+        assert len(calls) == 3
+        calls.append("profile")
+        assert env["PLAN"] == str(tmp_path / "plan.json")
+        assert env["PY"] == sys.executable
+        return profile_exit
+
+    monkeypatch.setattr(launcher, "capture", capture)
+    monkeypatch.setattr(launcher, "profile_foreground", profile)
+    monkeypatch.setattr(
+        launcher, "serve_foreground", lambda *a: pytest.fail("API started")
+    )
+    assert (
+        launcher.start_services(args, launch, {}, tmp_path, sys.executable)
+        == profile_exit
+    )
+    assert calls == ["ray", "cluster/storage", "cluster/storage", "profile"]
+    receipt = json.loads((tmp_path / "profile_exit.json").read_text())
+    assert receipt["profile_and_planning_completed"] is (profile_exit == 0)
+    assert receipt["measured_performance_improvement"] is False
+
+
+def test_shared_storage_failure_blocks_profile_and_api(
+    launcher,
+    model,
+    tmp_path,
+    monkeypatch,
+):
+    args = launcher.argument_parser().parse_args(
+        [
+            "--head",
+            "192.0.2.10",
+            "--peer",
+            "192.0.2.20",
+            "--model",
+            str(model),
+            "--profile",
+            "--trace-root",
+            str(tmp_path),
+        ]
+    )
+    launch = launcher.make_launch(args, args.head, sys.executable, {})
+    responses = iter([(0, "Ray started"), (0, "cluster ready"), (1, "not shared")])
+    monkeypatch.setattr(launcher, "capture", lambda *a, **kw: next(responses))
+    monkeypatch.setattr(
+        launcher, "profile_foreground", lambda *a: pytest.fail("profile started")
+    )
+    with pytest.raises(RuntimeError, match="共享"):
+        launcher.start_services(args, launch, {}, tmp_path, sys.executable)
+    assert not (tmp_path / "profile_exit.json").exists()
+
+
+def test_profile_foreground_preserves_failure_and_output(launcher, tmp_path):
+    log = tmp_path / "profile.log"
+    rc = launcher.profile_foreground(
+        [sys.executable, "-c", "print('profile table'); raise SystemExit(7)"],
+        os.environ.copy(),
+        log,
+        5,
+    )
+    assert rc == 7
+    assert "profile table" in log.read_text()
+
+
+@pytest.mark.parametrize("mode", ["shared", "separate", "missing_writeback"])
+def test_shared_directory_checks_real_files_in_both_directions(
+    launcher,
+    tmp_path,
+    monkeypatch,
+    mode,
+):
+    class Remote:
+        def __init__(self, function):
+            self.function = function
+
+        def options(self, **kwargs):
+            return self
+
+        def remote(self, probe, nonce, ip):
+            path = Path(probe)
+            if mode == "separate" and ip == "192.0.2.20":
+                # Same relative name on another local filesystem is not shared.
+                probe = str(tmp_path / "not_shared" / path.name)
+            answer = self.function(probe, nonce, ip)
+            if mode == "missing_writeback" and ip == "192.0.2.20":
+                (path / ip).unlink()
+            return answer
+
+    ray = SimpleNamespace(
+        init=lambda **kwargs: None,
+        shutdown=lambda: None,
+        nodes=lambda: [
+            dict(NodeManagerAddress=ip, NodeID=ip, Alive=True)
+            for ip in ("192.0.2.10", "192.0.2.20")
+        ],
+        remote=lambda **kwargs: Remote,
+        get=lambda tasks, **kwargs: tasks,
+    )
+    monkeypatch.setitem(sys.modules, "ray", ray)
+    monkeypatch.setitem(
+        sys.modules,
+        "ray.util.scheduling_strategies",
+        SimpleNamespace(
+            NodeAffinitySchedulingStrategy=lambda **kwargs: kwargs,
+        ),
+    )
+    if mode == "shared":
+        launcher.verify_profile_storage(
+            "addr", "192.0.2.10", "192.0.2.20", str(tmp_path), 5
+        )
+        assert not list(tmp_path.glob(".edgeshard_shared_check_*"))
+    else:
+        with pytest.raises(OSError):
+            launcher.verify_profile_storage(
+                "addr", "192.0.2.10", "192.0.2.20", str(tmp_path), 5
+            )
+
+
+def test_profile_foreground_timeout_stops_owned_child(launcher, tmp_path):
+    pidfile = tmp_path / "pid"
+    program = (
+        "import os, time; from pathlib import Path; "
+        f"Path({str(pidfile)!r}).write_text(str(os.getpid())); time.sleep(60)"
+    )
+    with pytest.raises(TimeoutError, match="profiling"):
+        launcher.profile_foreground(
+            [sys.executable, "-c", program], os.environ.copy(), tmp_path / "log", 0.5
+        )
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pidfile.read_text()), 0)
 
 
 def test_api_failure_keeps_real_exit_status_and_log(launcher, tmp_path):

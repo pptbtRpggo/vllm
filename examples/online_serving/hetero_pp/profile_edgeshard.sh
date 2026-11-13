@@ -219,7 +219,8 @@ TRACE_ROOT 必须真正共享且容器内绝对路径相同，本脚本不自动
 
 流程：4 条合成输入，1 轮预热 + 2 轮采集，打印耗时和通信速率表，再离线 DP 推荐层数。
 统计排除预热，按四 stage/三条链路及 prefill/decode/mixed 分组，保存汇总与逐步 CSV。
-使用 ACK 测通信，固定 64 个 KV blocks；这是小规模流程验证，不是 GSM8K 压测。
+使用 ACK 测通信，默认固定 64 个 KV blocks；这是小规模流程验证，不是 GSM8K 压测。
+统一 --profile 入口会传入上下文、token budget、max seq、显存比例及 KV block 配置。
 不启动/停止 Ray，不安装依赖，不自动切换服务到推荐配置。
 EOF
   exit 0
@@ -253,9 +254,12 @@ echo '1/3 采集计算、通信和内存成本（请勿同时运行其他占卡�
   --input-len 64 --output-len 16 --num-prompts 4 \
   --num-iters-warmup 1 --num-iters 2 --seed 7 \
   --dtype float16 --enforce-eager --no-async-scheduling \
-  --max-model-len 512 --max-num-batched-tokens 256 --max-num-seqs 4 \
-  --block-size 128 --num-gpu-blocks-override 64 \
-  --gpu-memory-utilization 0.5 \
+  --max-model-len "${PROFILE_MAX_MODEL_LEN:-512}" \
+  --max-num-batched-tokens "${PROFILE_MAX_NUM_BATCHED_TOKENS:-256}" \
+  --max-num-seqs "${PROFILE_MAX_NUM_SEQS:-4}" \
+  --block-size "${PROFILE_BLOCK_SIZE:-128}" \
+  --num-gpu-blocks-override "${PROFILE_NUM_GPU_BLOCKS:-64}" \
+  --gpu-memory-utilization "${PROFILE_GPU_MEMORY_UTILIZATION:-0.5}" \
   --enable-chunked-prefill --no-enable-prefix-caching 2>&1 | tee "$TRACE.log"
 
 echo '2/3 打印各 stage 计算、链路交接耗时及有效速率表（不占 NPU）'

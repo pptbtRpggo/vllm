@@ -1,7 +1,8 @@
 # 两边运行同一脚本，启动 910B/310P 四卡 PP
 
 入口：`examples/online_serving/hetero_pp/start_hetero_pp.sh`。
-这是现有异构 PP 后端的启动脚本，不自动安装依赖、重建镜像或发测试请求。
+这是现有异构 PP 后端的启动脚本，不自动安装依赖或重建镜像。
+普通服务模式不发测试请求；显式 `--profile` 模式执行内部采集负载。
 通信检查通过之后，仍需用真实模型完成下面的验证。
 
 ## 宿主机自动选择镜像并启动容器
@@ -79,6 +80,66 @@ $HOME/vllm_hetero_pp_logs/hetero_pp_worker_时间_标识/start/
 
 在命令后加 `--dry-run` 可以先显示将执行的 Docker 命令，不启动容器或 NPU。
 此入口先做 Docker 编排；下文是已经位于容器内部时使用的原入口。
+
+### 自动 profiling 模式：两边仍使用原入口
+
+两边使用相同版本项目，先确认本次两张卡可以使用、没有本次旧容器占用。
+在两台宿主机分别运行下面命令，IP、模型目录和共享目录换成实际值：
+
+```bash
+bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
+  --head 53 --peer 54 --model /本机模型目录 \
+  --layers 18,18,6,6 \
+  --profile --trace-root /本机已挂载的共享目录 \
+  --gpu-memory-utilization 0.8
+```
+
+先运行 910B，等待时运行 310P，不用等待第一个命令结束。48 层模型默认
+`18,18,6,6`，要采集均分方案可改为 `12,12,12,12`；其他模型按实际总层数填写。
+两端可以使用不同宿主机模型路径，但模型内容须一致。
+
+`--trace-root` 必须是两台宿主机已挂载的**同一个可写共享存储**，例如已有 NFS。
+两边各建一个同名目录、各拷一份项目都不满足条件。目录映射到两边容器的统一路径
+`/work/hetero_profiles`。脚本会通过固定到两节点的 Ray CPU 任务，检查新随机标记
+能被远端读取、远端写入能被 head 读回；失败时保留检查日志，不加载模型。
+不会配置 NFS、修改网络、安装包或创建跨 SoC HCCL 通信器。
+
+本模式自动完成：Docker/本地 NPU 预检 → Ray head/worker 连接 → 共享目录检查 →
+head 内部加载四个 PP stage 并采集 → 打印计算/交接耗时与速率表 → 退出采集模型 →
+DP 生成 `recommended_hetero_plan.json`。不启动 HTTP API，不同时运行 EvalScope。
+默认负载为输入 64、输出 16、每轮 4 条合成 token prompt，1 轮预热和 2 轮采集；
+它只是一轮小规模采集，不是 GSM8K 质量测试或稳定性能结论。
+
+通过统一入口时，采集继承该入口的 `--max-model-len`、`--max-num-batched-tokens`、
+`--max-num-seqs`、`--gpu-memory-utilization`，默认分别为 512、256、4、0.8。
+profiling 默认 block size=128、固定 KV blocks=64，可用 `--block-size` 和
+`--num-gpu-blocks-override` 显式覆盖。独立运行 `profile_edgeshard.sh` 时显存默认
+仍为 0.5。推荐方案的复验应使用与该轮采集一致的执行/KV 配置。
+
+head 等集群的上限由 `--startup-timeout` 控制；采集、统计和 DP 的整体上限由
+`--profile-timeout` 控制，默认 3600 秒。子进程失败/超时会保留日志并返回错误，
+不会自动重跑或切换到正常服务，也不会全局停止其他人的 Ray 任务。
+
+head 宿主机本轮 `start/` 中保存 `launch.json`、`plan.json`、
+`shared_storage_check.log`、`profile.log`；正常结束时另有 `profile_exit.json`。
+共享目录中每轮新建 `edgeshard_时间_标识/`，保存原始 profile、四个统计 CSV 和
+DP 推荐。终端会打印实际结果目录。
+回执只表示采集/规划程序退出成功，不代表推荐方案已正确加载或已测得性能提升。
+
+采集完成后 head 容器退出；worker 容器继续等待，结束本轮时停止**自己的** worker
+容器。使用正常服务模式重新部署前，要结束本轮旧容器，避免同名容器或 Ray 端口冲突。
+然后查看推荐 JSON 的四个 `layers` 数，保持顺序，以 `--layers L0,L1,L2,L3` 传入
+正常启动命令，去掉 `--profile --trace-root ...`，并保留相同上下文、显存和固定 KV
+配置（例如 `--block-size 128 --num-gpu-blocks-override 64`）。不要并行启动两套模型。
+默认 head 层顺序仍为两张 910B、两张 310P，不自动重排设备。
+
+先核对推荐分区的实际层区间和输出正确性，再用
+[EvalScope 脚本](hetero_pp_evalscope_zh.md)测 TTFT/TPOT/E2E。
+原分区也要在相同配置、同样负载下关闭 tracing 测量，才能作性能对照；
+不能把带 tracing 的成本直接当正常服务延迟，或把 DP 推荐称为实测最优。
+
+已经在保留的容器中时，也可两端运行 `start_hetero_pp.sh`，使用完整 IP、
+`--profile --trace-root /两边真正共享且路径一致的目录`；此时不经过 Docker 自动挂载。
 
 ### 只进入 Bash 调试
 

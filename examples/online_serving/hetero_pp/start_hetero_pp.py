@@ -3,7 +3,8 @@
 """Start the existing mixed-Ascend PP service from the same CLI on both nodes.
 
 Run inside each already working container. No Docker, package installation,
-device remapping, global Ray stop or automatic model requests are performed.
+device remapping or global Ray stop is performed. Explicit profile mode runs
+the finite internal collection workload instead of an HTTP service.
 """
 
 import argparse
@@ -11,10 +12,12 @@ import ipaddress
 import json
 import math
 import os
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -71,6 +74,24 @@ def argument_parser():
     parser.add_argument("--max-num-batched-tokens", type=int, default=256)
     parser.add_argument("--max-num-seqs", type=int, default=4)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument("--block-size", type=int, help="可选，显式 KV block token 数")
+    parser.add_argument(
+        "--num-gpu-blocks-override", type=int, help="可选，固定 KV block 数"
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="连接 Ray 后采集并生成 DP 推荐，不启动 API",
+    )
+    parser.add_argument(
+        "--trace-root", type=Path, help="profiling 两端真正共享的结果根目录"
+    )
+    parser.add_argument(
+        "--profile-timeout",
+        type=float,
+        default=3600,
+        help="profiling 全流程上限秒数，默认 3600",
+    )
     parser.add_argument(
         "--output", type=Path, help="全新日志目录；默认 output/hetero_pp_start_*"
     )
@@ -81,6 +102,21 @@ def argument_parser():
 
 
 def validate_options(args):
+    if args.profile:
+        if args.trace_root is None or not args.trace_root.is_absolute():
+            raise ValueError("--profile 需要 --trace-root 共享目录的绝对路径")
+        if not args.trace_root.is_dir():
+            raise ValueError("--trace-root 必须是已有共享目录；不会自动建立共享存储")
+    elif args.trace_root is not None:
+        raise ValueError("--trace-root 仅用于 --profile")
+    if (
+        not math.isfinite(args.profile_timeout)
+        or not 30 <= args.profile_timeout <= 86400
+    ):
+        raise ValueError("profile-timeout 需在 30..86400 秒")
+    for value in (args.block_size, args.num_gpu_blocks_override):
+        if value is not None and value <= 0:
+            raise ValueError("KV block 参数必须为正整数")
     for name in ("head", "peer"):
         address = ipaddress.IPv4Address(getattr(args, name))
         if address.is_loopback or address.is_multicast or address.is_unspecified:
@@ -186,7 +222,7 @@ def make_launch(args, node_ip, python, environment):
     else:
         ray += [f"--address={args.head}:{args.ray_port}"]
     serve = None
-    if role == "head":
+    if role == "head" and not args.profile:
         serve = [
             python,
             "-m",
@@ -221,9 +257,108 @@ def make_launch(args, node_ip, python, environment):
         template = resolve_chat_template(args.chat_template)
         if template:
             serve += ["--chat-template", template]
+        if args.block_size is not None:
+            serve += ["--block-size", str(args.block_size)]
+        if args.num_gpu_blocks_override is not None:
+            serve += ["--num-gpu-blocks-override", str(args.num_gpu_blocks_override)]
+    profile_command = None
+    profile_environment = {}
+    if args.profile and role == "head":
+        profile_command = [
+            "bash",
+            str(Path(__file__).with_name("profile_edgeshard.sh")),
+        ]
+        profile_environment = {
+            "MODEL": str(args.model),
+            "TRACE_ROOT": str(args.trace_root),
+            "PROFILE_MAX_MODEL_LEN": str(args.max_model_len),
+            "PROFILE_MAX_NUM_BATCHED_TOKENS": str(args.max_num_batched_tokens),
+            "PROFILE_MAX_NUM_SEQS": str(args.max_num_seqs),
+            "PROFILE_GPU_MEMORY_UTILIZATION": str(args.gpu_memory_utilization),
+            "PROFILE_BLOCK_SIZE": str(args.block_size or 128),
+            "PROFILE_NUM_GPU_BLOCKS": str(args.num_gpu_blocks_override or 64),
+        }
     return dict(
-        role=role, plan=plan, environment=updates, ray_command=ray, serve_command=serve
+        role=role,
+        plan=plan,
+        environment=updates,
+        ray_command=ray,
+        serve_command=serve,
+        profile_command=profile_command,
+        profile_environment=profile_environment,
     )
+
+
+def verify_profile_storage(address, head, peer, root, timeout):
+    """Round-trip fresh files on both nodes before any model is loaded."""
+    import ray
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    def check(probe, nonce, ip):
+        from pathlib import Path
+
+        path = Path(probe)
+        if (path / "head_nonce").read_text() != nonce:
+            raise RuntimeError("两端不是同一个共享结果目录")
+        answer = f"{ip}:{nonce}"
+        (path / ip).write_text(answer)
+        return answer
+
+    ray.init(address=address)
+    try:
+        nodes = {n["NodeManagerAddress"]: n for n in ray.nodes() if n["Alive"]}
+        probe = Path(tempfile.mkdtemp(prefix=".edgeshard_shared_check_", dir=root))
+        nonce = uuid.uuid4().hex
+        (probe / "head_nonce").write_text(nonce)
+        tasks = [
+            ray.remote(num_cpus=0)(check)
+            .options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=nodes[ip]["NodeID"], soft=False
+                )
+            )
+            .remote(str(probe), nonce, ip)
+            for ip in (head, peer)
+        ]
+        answers = ray.get(tasks, timeout=float(timeout))
+        for ip, answer in zip((head, peer), answers):
+            if answer != f"{ip}:{nonce}" or (probe / ip).read_text() != answer:
+                raise RuntimeError("无法读回远端写入的共享目录记录")
+        shutil.rmtree(probe)  # Only this successful check's newly created files.
+        print(json.dumps({"shared_trace_verified": True, "root": root}), flush=True)
+    finally:
+        ray.shutdown()
+
+
+def profile_foreground(command, environment, log, timeout):
+    """Stream finite profiling output; interrupt only this owned child tree."""
+    with log.open("w") as writer, log.open() as reader:
+        process = subprocess.Popen(
+            command,
+            env=environment,
+            stdout=writer,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        family = owned_family(process.pid)
+        deadline = time.monotonic() + timeout
+        try:
+            while process.poll() is None:
+                remember_family(family, process.pid)
+                print(reader.read(), end="", flush=True)
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("profiling 超过时间上限；仅清理本轮子进程")
+                time.sleep(0.2)
+            print(reader.read(), end="", flush=True)
+            return process.returncode
+        except BaseException:
+            if process.poll() is None:
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGINT)
+                with suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=30)
+            stop_process(process, family)
+            raise
 
 
 def serve_foreground(command, environment, log, startup_timeout, api_port):
@@ -302,7 +437,9 @@ def start_services(args, launch, environment, output, python):
         },
     )
     if launch["role"] == "worker":
-        print("310P 已加入 Ray；本端不启动 API。请在 910B 端查看模型日志。", flush=True)
+        print(
+            "310P 已加入 Ray；本端不启动 API/采集，请在 910B 端查看日志。", flush=True
+        )
         print("Ray 保持运行；这不是模型推理通过回执。", flush=True)
         return 0
     print("910B Ray 已启动，等待两端各两张 NPU……", flush=True)
@@ -338,6 +475,57 @@ finally:
     (output / "cluster_wait.log").write_text(text)
     if rc:
         raise RuntimeError("Ray 集群未就绪；不启动模型，见 cluster_wait.log")
+    if args.profile:
+        code = (
+            "import sys; sys.path.insert(0, sys.argv[1]); "
+            "from start_hetero_pp import verify_profile_storage; "
+            "verify_profile_storage(*sys.argv[2:])"
+        )
+        rc, text = capture(
+            [
+                python,
+                "-c",
+                code,
+                str(Path(__file__).parent),
+                environment["RAY_ADDRESS"],
+                args.head,
+                args.peer,
+                str(args.trace_root),
+                str(min(args.startup_timeout, 60)),
+            ],
+            environment,
+            min(args.startup_timeout, 90),
+        )
+        (output / "shared_storage_check.log").write_text(text)
+        if rc:
+            raise RuntimeError("两端共享结果目录检查失败；见 shared_storage_check.log")
+        profile_env = dict(
+            environment,
+            **launch["profile_environment"],
+            PY=python,
+            PLAN=str(output / "plan.json"),
+        )
+        print(
+            f"Ray 和共享目录已就绪，开始 profiling；日志 {output / 'profile.log'}",
+            flush=True,
+        )
+        rc = profile_foreground(
+            launch["profile_command"],
+            profile_env,
+            output / "profile.log",
+            args.profile_timeout,
+        )
+        write_json(
+            output / "profile_exit.json",
+            {
+                "returncode": rc,
+                "profile_and_planning_completed": rc == 0,
+                "measured_performance_improvement": False,
+                "trace_off_validation_required": True,
+                "ray_left_running": True,
+            },
+        )
+        return rc if rc >= 0 else 128 - rc
     print(
         f"开始加载模型；API http://127.0.0.1:{args.api_port}；"
         f"日志 {output / 'api.log'}",
@@ -384,7 +572,7 @@ def main(argv=None):
             node_ip = network["node_ip"]
             if args.node_ip and node_ip != args.node_ip:
                 raise ValueError("--node-ip 不属于本机所选网卡")
-        if node_ip == args.head:
+        if node_ip == args.head and not args.profile:
             resolve_chat_template(args.chat_template)
         env = prepare_environment(ROOT, os.environ, args.devices)
         if network["interface"]:
@@ -415,10 +603,10 @@ def main(argv=None):
     print(f"本机日志目录：{output}", flush=True)
     try:
         if node_ip == args.head:
-            for address, port in (
-                (node_ip, args.ray_port),
-                ("127.0.0.1", args.api_port),
-            ):
+            ports = [(node_ip, args.ray_port)]
+            if not args.profile:
+                ports.append(("127.0.0.1", args.api_port))
+            for address, port in ports:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as check:
                     check.bind((address, port))
         python, env, inventory = discover_runtime(

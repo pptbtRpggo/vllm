@@ -358,3 +358,33 @@ def test_worker_container_stays_alive_after_ray_join(environment, tmp_path):
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
             process.wait(timeout=3)
+
+
+@pytest.mark.parametrize("local", ["141.147.135.53", "141.147.135.54"])
+def test_profile_mounts_shared_directory_and_forwards_mode(
+    environment, tmp_path, local
+):
+    environment["TEST_LOCAL_IP"] = local
+    shared = tmp_path / "shared traces"
+    shared.mkdir()
+    result = invoke(environment, "--profile", "--trace-root", str(shared), "--dry-run")
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout)
+    assert f"type=bind,src={shared},dst=/work/hetero_profiles" in command
+    assert "--profile" in command
+    assert command[command.index("--trace-root") + 1] == "/work/hetero_profiles"
+    assert "HETERO_PP_MODE=profile" in command
+    # Model remains mounted on both nodes for the Ray-launched profile workers.
+    assert any("dst=/workspace/model,readonly" in arg for arg in command)
+
+
+def test_profile_without_shared_directory_is_rejected(environment):
+    result = invoke(environment, "--profile", "--dry-run")
+    assert result.returncode != 0 and "trace-root" in result.stderr
+
+
+def test_shell_and_profile_cannot_be_combined(environment, tmp_path):
+    result = invoke(
+        environment, "--profile", "--trace-root", str(tmp_path), "--shell", "--dry-run"
+    )
+    assert result.returncode != 0

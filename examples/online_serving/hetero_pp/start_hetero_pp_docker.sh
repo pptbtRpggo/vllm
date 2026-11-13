@@ -17,7 +17,7 @@ image="${IMAGE:-}"
 devices="${HOST_NPU_DEVICES:-0,1}"
 ray_port="${RAY_PORT:-16379}" api_port="${SERVICE_PORT:-8000}"
 layers="${PP_LAYERS:-18,18,6,6}"
-interface="" dry_run=false debug_shell=false
+interface="" dry_run=false debug_shell=false profile=false trace_root=""
 forward=()
 
 usage() {
@@ -38,6 +38,12 @@ usage() {
   --ray-port PORT      默认 16379，两端一致；其他 Ray/Gloo 端口仍动态分配
   --api-port PORT      默认 8000，API 仅在 910B 的 127.0.0.1 上监听
   --layers A,B,C,D     默认 18,18,6,6；总和须等于模型层数
+  --profile           两边启动并连接 Ray，head 自动采集/打印统计/生成 DP，不启动 API
+  --trace-root DIR    profiling 必填：宿主机已有真正共享的目录，两边都传
+                       挂载到两边容器 /work/hetero_profiles，并自动校验跨机读写
+  --profile-timeout N profiling 全流程上限秒数，默认 3600
+  --block-size N / --num-gpu-blocks-override N
+                       可选，显式 KV 配置；profiling 默认 128 / 64
   --startup-timeout N  转发到容器内启动入口
   --max-model-len N / --max-num-batched-tokens N / --max-num-seqs N
   --gpu-memory-utilization N / --cann-env PATH / --python PATH
@@ -58,7 +64,8 @@ while (($#)); do
     --help|-h) usage; exit 0 ;;
     --dry-run) dry_run=true; shift ;;
     --shell) debug_shell=true; shift ;;
-    --head|--peer|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--api-port|--layers|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python|--chat-template)
+    --profile) profile=true; shift ;;
+    --head|--peer|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--api-port|--layers|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python|--chat-template|--trace-root|--profile-timeout|--block-size|--num-gpu-blocks-override)
       (($# >= 2)) && [[ -n "$2" && "$2" != --* ]] || die "$1 缺少参数"
       case "$1" in
         --head) head="$2" ;; --peer) peer="$2" ;; --model) model="$2" ;;
@@ -66,12 +73,23 @@ while (($#)); do
         --devices) devices="$2" ;; --interface) interface="$2" ;;
         --image) image="$2" ;; --name) name="$2" ;;
         --ray-port) ray_port="$2" ;; --api-port) api_port="$2" ;;
-        --layers) layers="$2" ;; *) forward+=("$1" "$2") ;;
+        --layers) layers="$2" ;; --trace-root) trace_root="$2" ;;
+        *) forward+=("$1" "$2") ;;
       esac
       shift 2 ;;
     *) die "未知参数：$1；使用 --help 查看" ;;
   esac
 done
+
+if "$profile"; then
+  "$debug_shell" && die '--profile 和 --shell 不能同时使用'
+  [[ "$trace_root" == /* && -d "$trace_root" && -w "$trace_root" && -x "$trace_root" ]] ||
+    die '--profile 需要 --trace-root 指定已有、可写的共享目录绝对路径'
+  trace_root="$(cd -- "$trace_root" && pwd -P)"
+  [[ "$trace_root" != *,* ]] || die '共享目录路径不能含逗号'
+elif [[ -n "$trace_root" ]]; then
+  die '--trace-root 仅用于 --profile'
+fi
 
 expand_ip() {
   local value="$1" part result="" parts=()
@@ -179,6 +197,10 @@ else
 command+=(--mount "type=bind,src=$run_dir,dst=/work/hetero_logs"
   --mount "type=bind,src=$model,dst=/workspace/model,readonly"
   -e "HETERO_PP_ROLE=$role")
+if "$profile"; then
+  command+=(--mount "type=bind,src=$trace_root,dst=/work/hetero_profiles"
+    -e HETERO_PP_MODE=profile)
+fi
 # Retain the image's entrypoint so custom image initialization is not bypassed.
 # Expanded only in the container. A joined worker must keep PID 1 alive for Ray.
 # shellcheck disable=SC2016
@@ -191,12 +213,13 @@ fi
 bash /work/vllm/examples/online_serving/hetero_pp/start_hetero_pp.sh "$@"
 status=$?
 if ((status != 0)); then exit "$status"; fi
-echo "310P Ray 已加入；保持此容器运行。结束测试后 Ctrl+C 停止本容器。"
+echo "310P Ray 已加入；保持此容器运行。head 完成本轮服务/采集后 Ctrl+C 停止本容器。"
 trap "exit 0" INT TERM HUP
 while true; do sleep 5 & wait $!; done
 ' hetero-pp --head "$head" --peer "$peer" --model /workspace/model
   --node-ip "$local_ip" --interface "$interface" --layers "$layers"
   --ray-port "$ray_port" --api-port "$api_port" --output /work/hetero_logs/start)
+if "$profile"; then command+=(--profile --trace-root /work/hetero_profiles); fi
 # Bash 3 treats an empty array as unset under nounset.
 if [[ -n "${forward[*]-}" ]]; then command+=("${forward[@]}"); fi
 fi
