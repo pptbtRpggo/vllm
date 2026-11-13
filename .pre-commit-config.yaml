@@ -17,6 +17,8 @@ repos:
   hooks:
   - id: typos
     args: [--force-exclude]
+    # Preserve upstream GSM8K text byte-for-byte, including original typos.
+    exclude: ^examples/online_serving/hetero_pp/data/gsm8k/test\.jsonl$
 - repo: https://github.com/pre-commit/mirrors-clang-format
   rev: v21.1.2
   hooks:

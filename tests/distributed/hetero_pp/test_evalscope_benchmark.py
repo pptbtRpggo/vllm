@@ -3,7 +3,9 @@
 """Exercise the benchmark launcher without EvalScope, HTTP, or NPUs."""
 
 import os
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -171,3 +173,60 @@ def test_sh_invocation_reexecutes_bash(benchmark):
     result = invoke(shell="sh")
     assert result.returncode == 0, result.stderr
     assert capture.exists()
+
+
+def test_python_module_mode_uses_bundled_data_outside_repo(tmp_path):
+    # A real module fixture catches loss of interpreter/module arguments.
+    package = tmp_path / "evalscope" / "cli"
+    package.mkdir(parents=True)
+    (package.parent / "__init__.py").write_text("")
+    (package / "__init__.py").write_text("")
+    (package / "cli.py").write_text(
+        "import os,sys\n"
+        "from pathlib import Path\n"
+        "if '--help' in sys.argv:\n"
+        "    print('--parallel --number --warmup-num --outputs-dir --stream')\n"
+        "elif '--version' in sys.argv:\n"
+        "    print('fixture-version')\n"
+        "else:\n"
+        "    Path(os.environ['CAPTURE']).write_text('\\0'.join(sys.argv[1:]))\n"
+    )
+    output = tmp_path / "results"
+    capture = tmp_path / "args"
+    result = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT),
+            "--python",
+            sys.executable,
+            "--output-dir",
+            str(output),
+            "--parallel",
+            "1",
+            "--number",
+            "4",
+            "--warmup-num",
+            "0",
+        ],
+        env={**os.environ, "PYTHONPATH": str(tmp_path), "CAPTURE": str(capture)},
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    args = read_args(capture)
+    data = SCRIPT.parent / "data/gsm8k/test.jsonl"
+    assert values(args, "--dataset-path") == [str(data)]
+    assert data.is_file() and data.stat().st_size > 0
+    assert values(args, "--parallel") == ["1"]
+    command = shlex.split((output / "command.sh").read_text(), comments=True)
+    assert command[:4] == [sys.executable, "-m", "evalscope.cli.cli", "perf"]
+
+
+def test_python_and_executable_modes_are_mutually_exclusive(benchmark):
+    invoke, _, output, capture = benchmark
+    result = invoke("--python", sys.executable)
+    assert result.returncode == 2
+    assert "不能同时" in result.stderr
+    assert not output.exists() and not capture.exists()

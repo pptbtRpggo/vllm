@@ -10,14 +10,52 @@
 不需要在两台 NPU 机器上同时执行；那会叠加请求，改变总并发。
 客户端本身不需要 NPU。
 
-准备本地 GSM8K **JSONL 文件**，每行一个对象，至少包含 `question`：
+### 当前环境：只有 Python 3.9 中的包，没有 evalscope 命令
+
+直接指定已安装 EvalScope 的 Python，不需要修改 PATH 或创建启动包装文件。
+在项目根目录先跑 4 条请求：
+
+```bash
+bash examples/online_serving/hetero_pp/benchmark_gsm8k.sh \
+  --python python3.9 \
+  --parallel 1 --number 4 --warmup-num 0 --max-tokens 32
+```
+
+小测试成功后，再跑完整的 8、16、32、64 并发：
+
+```bash
+bash examples/online_serving/hetero_pp/benchmark_gsm8k.sh \
+  --python python3.9 \
+  --url http://127.0.0.1:8000 \
+  --model hetero-model
+```
+
+若解释器不在 PATH 中，把 `python3.9` 换成它的绝对路径。
+实际执行的是 `指定Python -m evalscope.cli.cli perf ...`。
+脚本会先检查该环境的 `perf --help`，缺少必要参数/依赖就退出并显示原错误，
+不安装或升级任何包。Python 3.9 能否使用所需参数取决于你实际安装的
+EvalScope 版本，不保证它能安装当前最新版。`--python` 与 `--evalscope` 互斥。
+
+### 已内置官方测试集
+
+项目现在附带 **1,319 条官方 GSM8K test 数据**：
+
+```text
+examples/online_serving/hetero_pp/data/gsm8k/test.jsonl
+```
+
+默认按脚本位置读取它，不需要额外下载或填写 `--dataset-path`，
+也不要求执行时的当前目录固定。[出处、SHA256 和原始许可证](../../examples/online_serving/hetero_pp/data/gsm8k/README.md)随项目保存。
+
+如果要换成自己的文件，使用 `--dataset-path`。要求为 **JSONL**，
+每行一个对象，至少包含 `question`：
 
 ```json
 {"question": "A shop has 12 apples and sells 5. How many remain?", "answer": "7"}
 ```
 
 上面只是格式示例；正式比较请使用同一份真实 GSM8K 文件。
-脚本不会自动下载数据或把示例题当成 GSM8K。
+脚本不会在运行时下载数据或把示例题当成 GSM8K。
 `answer` 不会发送给模型，也不会在这项性能测试中评分。
 原始 Parquet/Arrow 需要先导出为这种 JSONL。
 若文件不够长，EvalScope 可能循环复用题目；默认每轮含预热共 576 请求，
