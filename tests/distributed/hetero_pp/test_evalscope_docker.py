@@ -15,7 +15,7 @@ LAUNCHER = DIRECTORY / "start_evalscope_docker.sh"
 BOOTSTRAP = DIRECTORY / "evalscope_container_setup.sh"
 
 
-def launch(tmp_path, fail=""):
+def launch(tmp_path, *extra, fail=""):
     capture = tmp_path / "docker.calls"
     docker = tmp_path / "docker"
     docker.write_text(
@@ -34,6 +34,7 @@ def launch(tmp_path, fail=""):
             "evalscope-test",
             "--output-dir",
             str(tmp_path / "results with spaces"),
+            *extra,
         ],
         env={
             **os.environ,
@@ -82,6 +83,20 @@ def test_copy_failure_never_starts_or_deletes_container(tmp_path):
     result, calls = launch(tmp_path, fail="cp")
     assert result.returncode == 9
     assert not any(call[0] in ("start", "rm", "stop") for call in calls)
+
+
+def test_client_forwards_explicit_http_mirror_and_trust_host(tmp_path):
+    result, calls = launch(
+        tmp_path,
+        "--index-url",
+        "http://mirrors.tools.huawei.com/pypi/simple",
+        "--trusted-host",
+        "mirrors.tools.huawei.com",
+    )
+    assert result.returncode == 0, result.stderr
+    create = next(call for call in calls if call[0] == "create")
+    assert "EVALSCOPE_INDEX_URL=http://mirrors.tools.huawei.com/pypi/simple" in create
+    assert "EVALSCOPE_TRUSTED_HOST=mirrors.tools.huawei.com" in create
 
 
 @pytest.fixture
@@ -151,6 +166,7 @@ def test_setup_prepares_manual_commands_and_resume_does_not_reinstall(
     assert str(home / ".venv/bin/evalscope") in first.stdout
     assert str(home / "tools/data/gsm8k/test.jsonl") in first.stdout
     previous = capture.read_text()
+    assert "--trusted-host" not in previous
     second = invoke()
     assert second.returncode == 0, second.stderr
     assert capture.read_text() == previous
@@ -163,3 +179,18 @@ def test_install_failure_never_marks_ready_or_claims_success(setup_environment):
     assert not (home / ".evalscope-ready").exists()
     assert "准备完成" not in result.stdout
     assert (results / "evalscope_install.log").exists()
+
+
+def test_setup_passes_http_mirror_trust_to_the_venv_installer(setup_environment):
+    invoke, _, _, capture = setup_environment
+    result = invoke(
+        EVALSCOPE_INDEX_URL="http://mirrors.tools.huawei.com/pypi/simple",
+        EVALSCOPE_TRUSTED_HOST="mirrors.tools.huawei.com",
+    )
+    assert result.returncode == 0, result.stderr
+    install = shlex.split(capture.read_text().splitlines()[0])
+    assert (
+        install[install.index("--index-url") + 1]
+        == "http://mirrors.tools.huawei.com/pypi/simple"
+    )
+    assert install[install.index("--trusted-host") + 1] == "mirrors.tools.huawei.com"

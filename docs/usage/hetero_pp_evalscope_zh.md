@@ -21,6 +21,18 @@ bash examples/online_serving/hetero_pp/start_evalscope_docker.sh
 可用 `--index-url https://pypi.tuna.tsinghua.edu.cn/simple` 指定包索引，
 或用 `--evalscope-version 版本号` 固定 EvalScope 版本。
 
+使用你所在网络的华为 HTTP 镜像源时，新建客户端容器的命令是：
+
+```bash
+bash examples/online_serving/hetero_pp/start_evalscope_docker.sh \
+  --index-url http://mirrors.tools.huawei.com/pypi/simple \
+  --trusted-host mirrors.tools.huawei.com
+```
+
+两项会一同传到容器中，在独立 venv 的安装命令里生效。
+`--trusted-host` 只填写主机名，不填 `http://` 或路径；不指定时不添加该选项。
+这些选项用于新建容器，不会改变旧客户端容器中已经保存的安装配置。
+
 安装及必要参数检查通过后进入 Bash，不会自动发请求。直接手动执行：
 
 ```bash

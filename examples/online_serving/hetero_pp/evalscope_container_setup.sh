@@ -29,9 +29,13 @@ if [[ ! -f "$HOME/.evalscope-ready" ]]; then
   fi
   package='evalscope[perf]'
   if [[ -n "${EVALSCOPE_VERSION:-}" ]]; then package+="==$EVALSCOPE_VERSION"; fi
+  pip_args=(--timeout 30 --retries 1
+    --index-url "${EVALSCOPE_INDEX_URL:-https://pypi.org/simple}")
+  if [[ -n "${EVALSCOPE_TRUSTED_HOST:-}" ]]; then
+    pip_args+=(--trusted-host "$EVALSCOPE_TRUSTED_HOST")
+  fi
   "$HOME/.venv/bin/python" -m pip --isolated install --upgrade \
-    --timeout 30 --retries 1 --index-url "${EVALSCOPE_INDEX_URL:-https://pypi.org/simple}" \
-    "$package" 2>&1 | tee -a "$results/evalscope_install.log"
+    "${pip_args[@]}" "$package" 2>&1 | tee -a "$results/evalscope_install.log"
   "$HOME/.venv/bin/python" -m pip freeze > "$results/client_environment.txt"
 fi
 if ! help_text="$(evalscope perf --help 2>&1)"; then

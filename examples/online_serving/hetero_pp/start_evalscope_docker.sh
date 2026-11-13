@@ -18,6 +18,7 @@ usage() {
   --python COMMAND       容器内用于创建 venv 的 Python，默认 python3.12
   --evalscope-version V  可选，指定版本；默认安装包索引中的最新版
   --index-url URL        包索引，默认 https://pypi.org/simple
+  --trusted-host HOST    可选，传给 pip 的可信主机名（不是完整 URL）
   -h, --help             显示帮助
 
 首次安装需要联网，退出保留容器；docker start -ai 容器名可再次进入。
@@ -28,15 +29,17 @@ die() { echo "错误：$*" >&2; exit 2; }
 image="quay.io/ascend/vllm-ascend:v0.23.0-openeuler"
 name="evalscope-client-$(date +%Y%m%d-%H%M%S)-$$" output=""
 bootstrap_python="python3.12" version="" index_url="https://pypi.org/simple"
+trusted_host=""
 while (($#)); do
   case "$1" in
     -h|--help) usage; exit 0 ;;
-    --image|--name|--output-dir|--python|--evalscope-version|--index-url)
+    --image|--name|--output-dir|--python|--evalscope-version|--index-url|--trusted-host)
       (($# >= 2)) && [[ -n "$2" && "$2" != --* ]] || die "$1 缺少参数"
       case "$1" in
         --image) image="$2" ;; --name) name="$2" ;; --output-dir) output="$2" ;;
         --python) bootstrap_python="$2" ;; --evalscope-version) version="$2" ;;
         --index-url) index_url="$2" ;;
+        --trusted-host) trusted_host="$2" ;;
       esac
       shift 2 ;;
     *) die "未知参数：$1" ;;
@@ -46,6 +49,7 @@ done
 [[ -z "$version" || "$version" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]] || die '无效版本号'
 [[ "$image" != -* && "$bootstrap_python" != -* ]] || die '无效镜像或 Python'
 case "$index_url" in http://*|https://*) ;; *) die '无效包索引 URL' ;; esac
+[[ -z "$trusted_host" || "$trusted_host" =~ ^[A-Za-z0-9][A-Za-z0-9.:-]*$ ]] || die 'trusted-host 只填写主机名或主机名:端口'
 directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 [[ -s "$directory/data/gsm8k/test.jsonl" ]] || die '缺少项目 GSM8K 数据，请更新完整项目'
 command -v docker >/dev/null || die '找不到 docker 命令'
@@ -76,7 +80,8 @@ command=(docker create -i --name "$name" --net=host --shm-size=1g
   -e "PATH=/tmp/evalscope-client/.venv/bin:/tmp/evalscope-client/tools:$image_path"
   -e PYTHONPATH= -e PYTHONNOUSERSITE=1 -e TORCH_DEVICE_BACKEND_AUTOLOAD=0
   -e "EVALSCOPE_BOOTSTRAP_PYTHON=$bootstrap_python"
-  -e "EVALSCOPE_VERSION=$version" -e "EVALSCOPE_INDEX_URL=$index_url")
+  -e "EVALSCOPE_VERSION=$version" -e "EVALSCOPE_INDEX_URL=$index_url"
+  -e "EVALSCOPE_TRUSTED_HOST=$trusted_host")
 if [[ -t 0 && -t 1 ]]; then command+=(-t); fi
 command+=(--entrypoint /bin/bash "$image" /tmp/evalscope-setup.sh
   /tmp/benchmark_gsm8k.sh /tmp/evalscope-gsm8k /results)
