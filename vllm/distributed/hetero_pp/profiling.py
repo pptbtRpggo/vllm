@@ -118,8 +118,10 @@ class _Capture:
         self.order = []
         self.handles = []
         self.stream_ids: set[str] = set()
+        self.record_thread_ids: set[int] = set()
 
     def mark(self):
+        self.record_thread_ids.add(threading.get_ident())
         backend = self.profiler.backend
         if backend is None:
             self.stream_ids.add("cpu")
@@ -183,6 +185,8 @@ class _Capture:
         detail = {
             "kind": self.kind,
             "stream_ids": sorted(self.stream_ids),
+            "record_thread_ids": sorted(self.record_thread_ids),
+            "read_thread_id": threading.get_ident(),
             "host_ms": (self.host_end_ns - self.host_start_ns) / 1e6,
             "endpoint_offsets_ms": {},
         }
@@ -449,6 +453,10 @@ class StageProfiler:
         self.zero_steps = self.unassociated_sample_calls = 0
         self.records = self.warmup_records = self.sample_records = 0
         self._error = None
+        self._failed_step = None
+        self._failed_traceback = None
+        self._event_reread = None
+        self._diagnostic_lock = threading.Lock()
         self._closed = False
         self._queue: queue.Queue[tuple[_Step, float] | threading.Event | None] = (
             queue.Queue()
@@ -672,7 +680,10 @@ class StageProfiler:
         failure = self.manifest_path.with_name(
             f"pp_profile_failure_pp{self.rank}_tp0.json"
         )
-        failure.write_text(json.dumps({**self.provenance, "error": error}, indent=2))
+        detail = {**self.provenance, "error": error}
+        if self._event_reread is not None:
+            detail["event_reread"] = self._event_reread
+        failure.write_text(json.dumps(detail, indent=2))
 
     def _write_loop(self):
         if self.backend is not None:
@@ -691,6 +702,7 @@ class StageProfiler:
             if self._error is not None:
                 continue
             step, deadline = item
+            resolving = True
             try:
                 while not all(
                     c.ready() for c in (step.execute, step.sample) if c is not None
@@ -698,14 +710,68 @@ class StageProfiler:
                     if time.monotonic() > deadline:
                         raise TimeoutError("profile completion event did not finish")
                     time.sleep(0.001)
-                self._write_row(self._resolve(step))
+                row = self._resolve(step)
+                resolving = False
+                self._write_row(row)
             except Exception as error:
-                self._error = error
-                self._failure(traceback.format_exc())
+                with self._diagnostic_lock:
+                    # Keep the exact failed Event objects alive for one reread.
+                    self._failed_step = step if resolving else None
+                    self._failed_traceback = traceback.format_exc()
+                    self._error = error
+                    self._failure(self._failed_traceback)
 
     def _check(self):
         if self._error is not None:
+            with self._diagnostic_lock:
+                if self._failed_step is not None and self._event_reread is None:
+                    self._reread_failed_events()
             raise RuntimeError("profile writer or capture failed") from self._error
+
+    def _reread_failed_events(self):
+        """Diagnose a rejected capture on the calling worker; never publish it.
+
+        This changes both the reader thread and the read time. A changed reading
+        therefore narrows the investigation but does not prove a thread bug.
+        """
+        step = self._failed_step
+        if step is None:
+            return
+        detail = {
+            "step": step.metadata["step"],
+            "read_thread_id": threading.get_ident(),
+            "resolved": False,
+            "diagnostic_only": True,
+            "original_failure_retained": True,
+            "published": False,
+        }
+        self._event_reread = detail  # Attempt once, including diagnostic failures.
+        captures = [c for c in (step.execute, step.sample) if c is not None]
+        try:
+            if self.backend is not None:
+                self.backend.set_device(self.device)
+                for capture in captures:
+                    capture.end.synchronize()
+            row = self._resolve(step)
+            detail.update(
+                resolved=True,
+                compute_wall_ms=row["compute_wall_ms"],
+                layer_compute_ms=row["layer_compute_ms"],
+                lm_head_ms=row["lm_head_ms"],
+            )
+        except Exception as error:
+            detail["error"] = f"{type(error).__name__}: {error}"
+        detail["captures"] = [c.diagnostics() for c in captures]
+        try:
+            self._failure(self._failed_traceback)
+        except Exception as error:
+            # Preserve the original exception even if the diagnostic file fails.
+            detail["write_error"] = f"{type(error).__name__}: {error}"
+        print(
+            f"PP event reread rank={self.rank} diagnostics="
+            + json.dumps(detail, sort_keys=True),
+            flush=True,
+        )
 
     def flush(self):
         if self._closed:

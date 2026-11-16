@@ -326,6 +326,69 @@ class ProfilingTests(unittest.TestCase):
         )
         self.assertFalse(self.rows())
 
+    def test_failed_events_are_reread_on_calling_worker_without_publishing(self):
+        import threading
+
+        self.addCleanup(lambda: self.prof.close(raise_errors=False))
+        caller = threading.get_ident()
+        step = self.prof.begin(schedule(), self.runner, 11)
+        self.prof.execute(step, lambda: self.model(torch.ones(1, 2)))
+        capture = step.execute
+        original_elapsed = capture.elapsed
+        readers = []
+
+        def thread_sensitive_elapsed(pair):
+            readers.append(threading.get_ident())
+            if threading.get_ident() == caller:
+                return original_elapsed(pair)
+            return 1.0 if pair == (capture.start, capture.end) else 2.0
+
+        with (
+            patch.object(capture, "elapsed", side_effect=thread_sensitive_elapsed),
+            self.assertRaisesRegex(RuntimeError, "profile writer") as raised,
+        ):
+            self.prof.flush()
+        failure = json.loads(
+            (Path(self.directory.name) / "pp_profile_failure_pp0_tp0.json").read_text()
+        )
+        reread = failure["event_reread"]
+        self.assertEqual(reread["read_thread_id"], caller)
+        self.assertEqual(reread["step"], 11)
+        self.assertTrue(reread["resolved"])
+        self.assertEqual(reread["captures"][0]["record_thread_ids"], [caller])
+        self.assertIn(str(raised.exception.__cause__), failure["error"])
+        self.assertIn(caller, readers)
+        self.assertTrue(any(reader != caller for reader in readers))
+        self.assertFalse(self.rows(), "a successful reread cannot rescue a failed row")
+
+    def test_failed_event_reread_keeps_original_error_if_second_read_fails(self):
+        import threading
+
+        self.addCleanup(lambda: self.prof.close(raise_errors=False))
+        caller = threading.get_ident()
+        step = self.prof.begin(schedule(), self.runner, 12)
+        self.prof.execute(step, lambda: self.model(torch.ones(1, 2)))
+        capture = step.execute
+
+        def elapsed(pair):
+            if threading.get_ident() == caller:
+                raise RuntimeError("second read failed")
+            return 1.0 if pair == (capture.start, capture.end) else 2.0
+
+        with (
+            patch.object(capture, "elapsed", side_effect=elapsed),
+            self.assertRaisesRegex(RuntimeError, "profile writer") as raised,
+        ):
+            self.prof.flush()
+        self.assertIsInstance(raised.exception.__cause__, ValueError)
+        failure = json.loads(
+            (Path(self.directory.name) / "pp_profile_failure_pp0_tp0.json").read_text()
+        )
+        self.assertFalse(failure["event_reread"]["resolved"])
+        self.assertIn("second read failed", failure["event_reread"]["error"])
+        self.assertIn(str(raised.exception.__cause__), failure["error"])
+        self.assertFalse(self.rows())
+
     def test_worker_routes_execute_and_sample_through_real_profiler(self):
         from contextlib import nullcontext
 
