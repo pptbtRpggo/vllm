@@ -13,6 +13,60 @@ RAY_ADDRESS="${RAY_ADDRESS:-}"         # 例如 141.147.135.53:16379
 TRACE_ROOT="${TRACE_ROOT:-}"           # 本地结果根目录；自动回收远端 rank 记录
 PY="${PY:-${VIRTUAL_ENV:-$REPO/.venv}/bin/python}"
 
+check_timing() {
+  "$PY" - "$1" <<'PY'
+import json
+import math
+import sys
+from pathlib import Path
+
+directory = Path(sys.argv[1])
+paths = sorted(directory.glob("pp_stage_pp*_tp0.jsonl"))
+if not directory.is_dir() or not paths:
+    raise SystemExit(f"没有找到 pp_stage_pp*_tp0.jsonl：{directory}")
+checked = invalid = 0
+for path in paths:
+    with path.open() as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if row.get("is_warmup", False):
+                continue
+            shape = row.get("batch_shape")
+            if shape is not None:
+                ctx = sum(s["prompt_tokens"] for s in shape)
+                gen = sum(s["query_tokens"] - s["prompt_tokens"] for s in shape)
+            else:
+                ctx, gen = row.get("num_ctx_tokens", 0), row.get("num_generation_tokens", 0)
+            if ctx <= 0 or gen != 0:
+                continue
+            checked += 1
+            fields = {k: row.get(k) for k in (
+                "compute_wall_ms", "non_layer_compute_ms", "runner_overhead_ms")}
+            fields.update({k: row[k] for k in (
+                "embedding_ms", "lm_head_ms", "final_norm_ms") if row.get(k) is not None})
+            layers = row.get("layer_compute_ms")
+            if isinstance(layers, dict) and layers:
+                fields.update({f"layer_compute_ms[{k}]": v for k, v in layers.items()})
+            else:
+                fields["layer_compute_ms"] = layers
+            for name, value in fields.items():
+                if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                    continue
+                invalid += 1
+                if invalid <= 20:
+                    print(f"{path.name}:{line_number} pp_rank={row.get('pp_rank')} "
+                          f"step={row.get('step')} field={name} value={value!r} "
+                          f"type={type(value).__name__}")
+print(f"checked_prefill_rows={checked} invalid_fields={invalid}")
+print("只读数值检查，不修改原数据、不加载模型；不代替完整 profile 验收。")
+if not checked:
+    raise SystemExit("没有非预热的 prefill 记录，请核对本轮结果目录。")
+raise SystemExit(1 if invalid else 0)
+PY
+}
+
 profile_statistics() {
   "$PY" - "$1" "$REPO" <<'PY'
 import csv
@@ -215,6 +269,8 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
   bash examples/online_serving/hetero_pp/profile_edgeshard.sh
 只统计已有完整 ACK 采集（不占 NPU、不重跑模型）：
   bash examples/online_serving/hetero_pp/profile_edgeshard.sh --stats-only /本地目录/某轮结果
+只读检查原始耗时字段（不需要完整 manifest，不加载模型）：
+  bash examples/online_serving/hetero_pp/profile_edgeshard.sh --check-timing /本地目录/某轮结果
 
 也可用环境变量传入 MODEL、PLAN、RAY_ADDRESS、TRACE_ROOT、PY。
 PY 是当前能运行异构 vLLM 的 Python 路径；默认当前虚拟环境或项目 .venv。
@@ -227,6 +283,12 @@ TRACE_ROOT 为本地结果根目录；采集结束后自动通过已有 Ray 回�
 统一 --profile 入口会传入上下文、token budget、max seq、显存比例及 KV block 配置。
 不启动/停止 Ray，不安装依赖，不自动切换服务到推荐配置。
 EOF
+  exit 0
+fi
+if [[ "${1:-}" == --check-timing && $# == 2 ]]; then
+  if [[ ! -x "$PY" ]]; then PY=$(command -v python || true); fi
+  [[ -x "$PY" ]] || { echo '请用 PY 指定已有 Python 路径。' >&2; exit 2; }
+  check_timing "$2"
   exit 0
 fi
 if [[ "${1:-}" == --stats-only && $# == 2 ]]; then

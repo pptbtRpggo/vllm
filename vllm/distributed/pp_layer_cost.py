@@ -22,9 +22,17 @@ if TYPE_CHECKING:
     from vllm.distributed.pp_partition import RankCost, Workload
 
 
-def _duration(value: Any) -> float:
+def _duration(value: Any, *, field="duration", row=None) -> float:
     if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
-        raise ValueError("layer-measured durations must be finite and nonnegative")
+        context = (
+            f"pp_rank={row.get('pp_rank')} step={row.get('step')} "
+            if row is not None
+            else ""
+        )
+        raise ValueError(
+            "layer-measured durations must be finite and nonnegative; "
+            f"{context}field={field} value={value!r} type={type(value).__name__}"
+        )
     return float(value)
 
 
@@ -129,17 +137,23 @@ def _validate_layer_record(row, pp_size):
         str(i) for i in range(row["start_layer"], row["end_layer"])
     }:
         raise ValueError("layer trace must contain every local global layer ID")
-    duration = sum(_duration(v) for v in layers.values())
-    residual = _duration(row.get("non_layer_compute_ms"))
-    wall = _duration(row.get("compute_wall_ms"))
+    duration = sum(
+        _duration(v, field=f"layer_compute_ms[{k}]", row=row) for k, v in layers.items()
+    )
+    residual = _duration(
+        row.get("non_layer_compute_ms"), field="non_layer_compute_ms", row=row
+    )
+    wall = _duration(row.get("compute_wall_ms"), field="compute_wall_ms", row=row)
     if abs(duration + residual - wall) > 0.01:
         raise ValueError("layer times plus residual must match stage wall time")
     endpoints = sum(
-        _duration(row[k])
+        _duration(row[k], field=k, row=row)
         for k in ("embedding_ms", "lm_head_ms", "final_norm_ms")
         if row.get(k) is not None
     )
-    overhead = _duration(row.get("runner_overhead_ms"))
+    overhead = _duration(
+        row.get("runner_overhead_ms"), field="runner_overhead_ms", row=row
+    )
     if abs(endpoints + overhead - residual) > 0.01:
         raise ValueError("endpoint times plus runner overhead must match residual")
 

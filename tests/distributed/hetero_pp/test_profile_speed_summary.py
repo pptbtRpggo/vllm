@@ -153,6 +153,69 @@ def run_summary(directory):
     )
 
 
+def test_readonly_timing_check_finds_invalid_fields_without_model_or_manifest(tmp_path):
+    path = tmp_path / "pp_stage_pp3_tp0.jsonl"
+    row = dict(
+        pp_rank=3,
+        step=10,
+        num_ctx_tokens=64,
+        num_generation_tokens=0,
+        layer_compute_ms={"36": -0.001},
+        compute_wall_ms=100.0,
+        non_layer_compute_ms=10.0,
+        runner_overhead_ms=10.0,
+        embedding_ms=None,
+        lm_head_ms=None,
+        final_norm_ms=0.0,
+    )
+    original = (json.dumps(row) + "\n").encode()
+    path.write_bytes(original)
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--check-timing", str(tmp_path)],
+        env={**os.environ, "PY": sys.executable},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 1, result.stderr
+    assert "pp_rank=3 step=10 field=layer_compute_ms[36] value=-0.001" in result.stdout
+    assert "field=lm_head_ms" not in result.stdout
+    assert path.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_readonly_timing_check_accepts_nullable_head_and_excludes_other_phases(
+    tmp_path,
+):
+    row = dict(
+        pp_rank=0,
+        step=1,
+        num_ctx_tokens=4,
+        num_generation_tokens=0,
+        layer_compute_ms={"0": 1.0},
+        compute_wall_ms=2.0,
+        non_layer_compute_ms=1.0,
+        runner_overhead_ms=1.0,
+        lm_head_ms=None,
+    )
+    rows = [
+        row,
+        dict(row, is_warmup=True, runner_overhead_ms=-999),
+        dict(row, num_ctx_tokens=0, num_generation_tokens=1, runner_overhead_ms=-999),
+    ]
+    path = tmp_path / "pp_stage_pp0_tp0.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--check-timing", str(tmp_path)],
+        env={**os.environ, "PY": sys.executable},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "checked_prefill_rows=1 invalid_fields=0" in result.stdout
+
+
 def test_prefill_speed_summary_excludes_other_phases_and_distinguishes_means(tmp_path):
     directory = tmp_path / "trace with spaces"
     write_trace(directory)

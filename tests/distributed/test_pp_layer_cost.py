@@ -127,6 +127,25 @@ def test_reject_invalid_traces(key, value, error):
         aggregate([rows])
 
 
+@pytest.mark.parametrize("value", [-0.001, float("nan"), float("inf"), None, "1.2"])
+def test_invalid_duration_identifies_stage_step_field_and_raw_value(value):
+    rows = layer_trace()
+    rows[0][0]["runner_overhead_ms"] = value
+    with pytest.raises(ValueError) as raised:
+        aggregate([rows])
+    message = str(raised.value)
+    assert "pp_rank=0" in message and "step=10" in message
+    assert "field=runner_overhead_ms" in message
+    assert f"value={value!r}" in message
+
+
+def test_invalid_layer_duration_identifies_its_global_layer_id():
+    rows = layer_trace()
+    rows[1][0]["layer_compute_ms"]["4"] = -0.001
+    with pytest.raises(ValueError, match=r"field=layer_compute_ms\[4\]"):
+        aggregate([rows])
+
+
 def test_missing_endpoint_is_unavailable_not_free():
     costs = aggregate([layer_trace()])
     costs[1] = replace(costs[1], t_head_ms=None)

@@ -111,6 +111,16 @@ SHA、读取内存证据，并完成服务收尾后，才写 `profile_manifest.j
 旧的独立 head 计时记录仍可单独分析，但不能与新口径混合拟合。
 逐层、stage 总区间和通信的校验继续保留；取消 head 拆分并不证明设备计时故障已修复。
 
+如果离线规划提示 `layer-measured durations must be finite and nonnegative`，
+不要重新跑模型。对已有本轮目录执行只读检查，打印异常字段的 rank、step 和原值：
+
+```bash
+bash examples/online_serving/hetero_pp/profile_edgeshard.sh --check-timing "$TRACE"
+```
+
+该检查仅使用 Python 标准库，不初始化 NPU、不要求完整 manifest、不修改任何记录。
+最多显示前 20 个非法字段；`lm_head_ms=null` 属于正常未单独计时，不会被报为错误。
+
 ### 2.1 单文件脚本与通信速率统计
 
 如果尚未启动容器和 Ray，优先按
