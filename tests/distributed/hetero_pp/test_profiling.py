@@ -263,6 +263,38 @@ class ProfilingTests(unittest.TestCase):
         # fixture during unittest cleanup.
         self.prof.close(raise_errors=False)
 
+    def test_inconsistent_event_times_preserve_values_without_publishing_a_row(self):
+        self.addCleanup(lambda: self.prof.close(raise_errors=False))
+        step = self.prof.begin(schedule(), self.runner, 7)
+        self.prof.execute(step, lambda: self.model(torch.ones(1, 2)))
+        capture = step.execute
+
+        def inconsistent_elapsed(pair):
+            # Outer interval is 1 ms, each of two layers/two endpoints is 2 ms.
+            return 1.0 if pair == (capture.start, capture.end) else 2.0
+
+        with (
+            patch.object(capture, "elapsed", side_effect=inconsistent_elapsed),
+            self.assertRaisesRegex(RuntimeError, "profile writer") as raised,
+        ):
+            self.prof.flush()
+        original = raised.exception.__cause__
+        self.assertIsInstance(original, ValueError)
+        self.assertIn("diagnostics=", str(original))
+        detail = json.loads(str(original).split("diagnostics=", 1)[1])
+        self.assertEqual(detail["pp_rank"], 0)
+        self.assertEqual(detail["step"], 7)
+        self.assertEqual(detail["execute_device_ms"], 1.0)
+        self.assertEqual(detail["sample_device_ms"], 0.0)
+        self.assertEqual(detail["layer_sum_ms"], 4.0)
+        self.assertEqual(detail["endpoint_sum_ms"], 4.0)
+        self.assertEqual(detail["non_layer_compute_ms"], -3.0)
+        self.assertEqual(detail["runner_overhead_ms"], -7.0)
+        failure = Path(self.directory.name) / "pp_profile_failure_pp0_tp0.json"
+        self.assertIn(str(original), json.loads(failure.read_text())["error"])
+        self.assertFalse(self.rows(), "invalid timing must not become planner input")
+        self.prof.close(raise_errors=False)
+
     def test_worker_routes_execute_and_sample_through_real_profiler(self):
         from contextlib import nullcontext
 

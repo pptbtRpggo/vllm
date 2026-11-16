@@ -560,7 +560,27 @@ class StageProfiler:
         residual = wall - sum(layers.values())
         overhead = residual - sum(v or 0 for v in endpoints.values())
         if min(wall, *layers.values(), residual, overhead) < -0.01:
-            raise ValueError("module events exceed the measured compute intervals")
+            # Preserve the values that failed validation. The outer worker error
+            # alone cannot distinguish an overlapping scope from event readings.
+            detail = {
+                "pp_rank": self.rank,
+                "step": row["step"],
+                "device": str(self.device),
+                "loaded_layers": self.provenance["loaded_layers"],
+                "execute_device_ms": durations[0],
+                "sample_device_ms": durations[1] if step.sample is not None else 0.0,
+                "compute_wall_ms": wall,
+                "layer_sum_ms": sum(layers.values()),
+                "endpoint_sum_ms": sum(v or 0 for v in endpoints.values()),
+                "non_layer_compute_ms": residual,
+                "runner_overhead_ms": overhead,
+                "layer_compute_ms": layers,
+                **endpoints,
+            }
+            raise ValueError(
+                "module events exceed the measured compute intervals; "
+                f"diagnostics={json.dumps(detail, sort_keys=True)}"
+            )
         # Preserve conservation; tolerate only device event quantization noise.
         residual = max(0.0, residual)
         overhead = max(0.0, overhead)
