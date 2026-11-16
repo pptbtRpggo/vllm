@@ -117,13 +117,18 @@ class _Capture:
         self.pairs = {}
         self.order = []
         self.handles = []
+        self.stream_ids: set[str] = set()
 
     def mark(self):
         backend = self.profiler.backend
         if backend is None:
+            self.stream_ids.add("cpu")
             return time.perf_counter_ns()
         event = backend.Event(enable_timing=True)
-        event.record(backend.current_stream(self.profiler.device))
+        stream = backend.current_stream(self.profiler.device)
+        event.record(stream)
+        stream_id = getattr(stream, "npu_stream", None)
+        self.stream_ids.add(str(stream_id) if stream_id is not None else "unknown")
         return event
 
     def before(self, name, _module, _args):
@@ -172,6 +177,28 @@ class _Capture:
         return (
             (b - a) / 1e6 if self.profiler.backend is None else float(a.elapsed_time(b))
         )
+
+    def diagnostics(self):
+        """Compare endpoint offsets from one origin only after validation fails."""
+        detail = {
+            "kind": self.kind,
+            "stream_ids": sorted(self.stream_ids),
+            "host_ms": (self.host_end_ns - self.host_start_ns) / 1e6,
+            "endpoint_offsets_ms": {},
+        }
+        # Extra device queries are restricted to an already rejected record.
+        # Failure of a diagnostic query must not hide the original error.
+        try:
+            detail["origin_total_ms"] = self.elapsed((self.start, self.end))
+            for name, (start, end) in self.pairs.items():
+                if not isinstance(name, int):
+                    detail["endpoint_offsets_ms"][name] = {
+                        "start": self.elapsed((self.start, start)),
+                        "end": self.elapsed((self.start, end)),
+                    }
+        except Exception as error:
+            detail["diagnostic_error"] = f"{type(error).__name__}: {error}"
+        return detail
 
 
 @dataclass
@@ -575,6 +602,7 @@ class StageProfiler:
                 "non_layer_compute_ms": residual,
                 "runner_overhead_ms": overhead,
                 "layer_compute_ms": layers,
+                "captures": [capture.diagnostics() for capture in captures],
                 **endpoints,
             }
             raise ValueError(

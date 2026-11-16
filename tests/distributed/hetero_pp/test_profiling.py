@@ -290,10 +290,41 @@ class ProfilingTests(unittest.TestCase):
         self.assertEqual(detail["endpoint_sum_ms"], 4.0)
         self.assertEqual(detail["non_layer_compute_ms"], -3.0)
         self.assertEqual(detail["runner_overhead_ms"], -7.0)
+        captures = detail["captures"]
+        self.assertEqual(len(captures), 1)
+        self.assertEqual(captures[0]["kind"], "execute")
+        self.assertEqual(captures[0]["stream_ids"], ["cpu"])
+        self.assertGreaterEqual(captures[0]["host_ms"], 0)
+        self.assertEqual(
+            captures[0]["endpoint_offsets_ms"]["embedding"],
+            {"start": 2.0, "end": 2.0},
+        )
         failure = Path(self.directory.name) / "pp_profile_failure_pp0_tp0.json"
         self.assertIn(str(original), json.loads(failure.read_text())["error"])
         self.assertFalse(self.rows(), "invalid timing must not become planner input")
         self.prof.close(raise_errors=False)
+
+    def test_extra_diagnostic_query_failure_preserves_original_validation_error(self):
+        self.addCleanup(lambda: self.prof.close(raise_errors=False))
+        step = self.prof.begin(schedule(), self.runner, 0)
+        self.prof.execute(step, lambda: self.model(torch.ones(1, 2)))
+        with (
+            patch.object(
+                step.execute,
+                "elapsed",
+                side_effect=[1, 2, 2, 2, 2, RuntimeError("diagnostic query failed")],
+            ),
+            self.assertRaisesRegex(RuntimeError, "profile writer") as raised,
+        ):
+            self.prof.flush()
+        original = raised.exception.__cause__
+        self.assertIsInstance(original, ValueError)
+        detail = json.loads(str(original).split("diagnostics=", 1)[1])
+        self.assertEqual(detail["runner_overhead_ms"], -7)
+        self.assertIn(
+            "diagnostic query failed", detail["captures"][0]["diagnostic_error"]
+        )
+        self.assertFalse(self.rows())
 
     def test_worker_routes_execute_and_sample_through_real_profiler(self):
         from contextlib import nullcontext
