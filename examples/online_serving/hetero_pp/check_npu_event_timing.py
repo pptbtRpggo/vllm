@@ -12,6 +12,7 @@ release gate or evidence that full model timing is correct.
 import argparse
 import json
 import math
+import queue
 import subprocess
 import sys
 import tempfile
@@ -70,7 +71,95 @@ def background_read(torch, device, events) -> dict:
     return result[0]
 
 
-def probe(device: int, repeats: int) -> dict:
+def queued_case(torch, device, stream, x, repeats: int, depth: int) -> list[dict]:
+    """Record 12 layer pairs plus one endpoint while a persistent reader runs.
+
+    Depth one waits for each capture to be read before recording the next.
+    Depth four permits recording and resolving different captures concurrently.
+    Both use end.query(), matching the profiler rather than a producer-side sync.
+    """
+    pending: queue.Queue = queue.Queue()
+    slots = threading.BoundedSemaphore(depth)
+    rows: list[dict] = []
+    errors: list[Exception] = []
+
+    def reader():
+        try:
+            torch.npu.set_device(device)
+        except Exception as error:
+            errors.append(error)
+        while True:
+            events = pending.get()
+            if events is None:
+                return
+            try:
+                if errors:
+                    continue
+                start, pairs, end = events
+                deadline = time.monotonic() + 10
+                while not end.query():
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("queued completion event did not finish")
+                    time.sleep(0.001)
+                total = float(start.elapsed_time(end))
+                intervals = []
+                for a, b in pairs:
+                    row = {
+                        "total_ms": total,
+                        "inner_ms": float(a.elapsed_time(b)),
+                        "start_ms": float(start.elapsed_time(a)),
+                        "end_ms": float(start.elapsed_time(b)),
+                    }
+                    row["consistent"] = consistent(row)
+                    intervals.append(row)
+                rows.append(
+                    {
+                        "total_ms": total,
+                        "intervals": intervals,
+                        "consistent": all(r["consistent"] for r in intervals)
+                        and sum(r["inner_ms"] for r in intervals) <= total + 0.01,
+                    }
+                )
+            except Exception as error:
+                errors.append(error)
+            finally:
+                events = None
+                slots.release()
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+
+    def mark():
+        event = torch.npu.Event(enable_timing=True)
+        event.record(stream)
+        return event
+
+    try:
+        for _ in range(repeats):
+            if not slots.acquire(timeout=10):
+                raise TimeoutError("queued event reader did not release a capture")
+            try:
+                start = mark()
+                pairs = []
+                for _ in range(13):
+                    a = mark()
+                    torch.mm(x, x)
+                    pairs.append((a, mark()))
+                pending.put((start, pairs, mark()))
+            except BaseException:
+                slots.release()
+                raise
+    finally:
+        pending.put(None)
+        thread.join(timeout=15)
+    if thread.is_alive():
+        raise TimeoutError("queued reader did not exit")
+    if errors:
+        raise errors[0]
+    return rows
+
+
+def probe(device: int, repeats: int, queued: bool = False) -> dict:
     import torch
     import torch_npu
 
@@ -81,6 +170,27 @@ def probe(device: int, repeats: int) -> dict:
         torch.mm(x, x)
     stream.synchronize()
     rows = []
+    if queued:
+        for depth in (1, 4):
+            captures = queued_case(torch, device, stream, x, repeats, depth)
+            rows.extend({"depth": depth, **row} for row in captures)
+            count = sum(not r["consistent"] for r in captures)
+            print(f"{depth=}: inconsistent={count}/{repeats}", flush=True)
+            bad = next((r for r in captures if not r["consistent"]), None)
+            if bad:
+                print("first_inconsistent=" + json.dumps(bad), flush=True)
+        stream.synchronize()
+        return {
+            "diagnostic_completed": True,
+            "mode": "queued_layer_events",
+            "device": device,
+            "device_name": torch.npu.get_device_name(device),
+            "torch": torch.__version__,
+            "torch_npu": torch_npu.__version__,
+            "rows": rows,
+            "all_intervals_consistent": all(r["consistent"] for r in rows),
+            "full_model_timing_validated": False,
+        }
     for sync in ("event", "stream"):
         for first in ("owner", "background"):
             group = []
@@ -151,6 +261,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument(
+        "--queued", action="store_true", help="compare serialized/queued layer events"
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -174,6 +287,7 @@ def main() -> int:
                     str(args.repeats),
                     "--output",
                     str(args.output),
+                    *(["--queued"] if args.queued else []),
                 ],
                 timeout=90,
             ).returncode
@@ -181,7 +295,7 @@ def main() -> int:
             print("Probe timed out after 90 seconds; worker stopped", file=sys.stderr)
             return 1
     try:
-        result = probe(args.device, args.repeats)
+        result = probe(args.device, args.repeats, args.queued)
     except Exception:
         result = {"diagnostic_completed": False, "error": traceback.format_exc()}
         print(result["error"], file=sys.stderr)
