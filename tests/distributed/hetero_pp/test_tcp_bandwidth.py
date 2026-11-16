@@ -3,6 +3,7 @@
 """Exercise the standalone TCP meter without vLLM or NPU imports."""
 
 import json
+import socket
 import subprocess
 import sys
 import unittest
@@ -15,7 +16,7 @@ SCRIPT = (
 
 
 class TCPBandwidthTest(unittest.TestCase):
-    def test_receiver_acknowledges_all_bytes_and_reports_same_result(self):
+    def run_transfer(self, parallel, warmup):
         # Catches sender-only timing and truncated/unacknowledged transfers.
         self.assertTrue(SCRIPT.exists(), "TCP meter has not been implemented")
         server = subprocess.Popen(
@@ -51,7 +52,11 @@ class TCPBandwidthTest(unittest.TestCase):
                     "--port",
                     port,
                     "--seconds",
-                    "0.15",
+                    "0.3",
+                    "--parallel",
+                    str(parallel),
+                    "--warmup",
+                    str(warmup),
                     "--timeout",
                     "5",
                 ],
@@ -60,17 +65,77 @@ class TCPBandwidthTest(unittest.TestCase):
                 timeout=10,
             )
             output, error = server.communicate(timeout=10)
-            self.assertEqual(client.returncode, 0, client.stderr)
+            self.assertEqual(client.returncode, 0, client.stderr + error)
             self.assertEqual(server.returncode, 0, error)
             received = json.loads(output)
             self.assertEqual(received, json.loads(client.stdout))
             self.assertGreater(received["received_bytes"], 0)
             self.assertGreater(received["seconds"], 0)
+            self.assertEqual(received["parallel"], parallel)
+            self.assertEqual(received["warmup_seconds"], warmup)
+            self.assertEqual(received["seconds"], 0.3)
+            self.assertEqual(len(set(received["receiver_processes"])), parallel)
+            self.assertTrue(all(n > 0 for n in received["per_stream_bytes"]))
+            self.assertEqual(
+                sum(received["per_stream_bytes"]), received["received_bytes"]
+            )
+            self.assertGreater(
+                received["total_received_bytes"], received["received_bytes"]
+            )
             self.assertAlmostEqual(
                 received["gbps"],
                 received["received_bytes"] * 8 / received["seconds"] / 1e9,
                 places=6,
             )
+        finally:
+            if server.poll() is None:
+                server.kill()
+            server.communicate(timeout=5)
+
+    def test_receiver_acknowledges_all_bytes_and_reports_same_result(self):
+        self.run_transfer(parallel=1, warmup=0)
+
+    def test_parallel_receivers_share_one_window_and_exclude_warmup(self):
+        self.run_transfer(parallel=2, warmup=0.2)
+
+    def test_four_independent_streams(self):
+        self.run_transfer(parallel=4, warmup=0.1)
+
+    def test_early_disconnect_is_not_reported_as_a_successful_measurement(self):
+        server = subprocess.Popen(
+            [
+                sys.executable,
+                "-S",
+                str(SCRIPT),
+                "server",
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--timeout",
+                "5",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert server.stdout is not None
+            port = int(server.stdout.readline().strip().rsplit(":", 1)[1])
+            with socket.create_connection(("127.0.0.1", port), 5) as control:
+                settings = {"parallel": 1, "warmup": 0, "seconds": 2}
+                control.sendall(json.dumps(settings).encode() + b"\n")
+                with control.makefile("rb") as reply:
+                    self.assertEqual(json.loads(reply.readline()), {"ready": True})
+                    with socket.create_connection(("127.0.0.1", port), 5) as data:
+                        self.assertEqual(data.recv(1), b"G")
+                        data.sendall(b"short transfer")
+                        data.shutdown(socket.SHUT_WR)
+                    self.assertEqual(reply.readline(), b"")
+            output, error = server.communicate(timeout=10)
+            self.assertEqual(server.returncode, 1, error)
+            self.assertIn("stream ended early", error)
+            self.assertNotIn("gbps", output)
         finally:
             if server.poll() is None:
                 server.kill()
