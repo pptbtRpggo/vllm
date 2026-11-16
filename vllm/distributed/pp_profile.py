@@ -38,6 +38,7 @@ _TRACE_ENV = (
     "VLLM_PP_TRACE_SESSION",
     "VLLM_PP_COMPUTE_MODEL",
     "VLLM_PP_COMM_TIMING",
+    "VLLM_PP_COMPUTE_TIMING",
     "VLLM_HETERO_PP_PLAN",
 )
 _TRANSPORT = "cpu_gloo"
@@ -119,11 +120,15 @@ def build_profile_workload(
 
 
 def prepare_trace_dir(
-    dump_dir: str | Path | None = None, comm_timing="shared-clock"
+    dump_dir: str | Path | None = None,
+    comm_timing="shared-clock",
+    compute_timing="event",
 ) -> Path:
     """Reserve a new/empty trace directory; never delete prior evidence."""
     if comm_timing not in ("shared-clock", "ack"):
         raise ValueError("unknown communication timing")
+    if compute_timing not in ("event", "host-sync"):
+        raise ValueError("unknown compute timing")
     if dump_dir is None:
         path = Path(tempfile.mkdtemp(prefix="vllm_staged_pp_profile_"))
     else:
@@ -137,6 +142,7 @@ def prepare_trace_dir(
     os.environ["VLLM_PP_TRACE_SESSION"] = uuid.uuid4().hex
     os.environ["VLLM_PP_COMPUTE_MODEL"] = "layer-measured"
     os.environ["VLLM_PP_COMM_TIMING"] = comm_timing
+    os.environ["VLLM_PP_COMPUTE_TIMING"] = compute_timing
     return path
 
 
@@ -201,6 +207,8 @@ def validate_profile_args(args: Any) -> None:
         raise ValueError("--hetero-plan is required")
     if getattr(args, "comm_timing", None) not in (None, "shared-clock", "ack"):
         raise ValueError("unknown communication timing")
+    if getattr(args, "compute_timing", None) not in (None, "event", "host-sync"):
+        raise ValueError("unknown compute timing")
     if getattr(args, "collect_only", False) and getattr(args, "skip_run", False):
         raise ValueError("--collect-only cannot be combined with --skip-run")
     if getattr(args, "skip_run", False) and not getattr(args, "trace_dir", None):
@@ -433,16 +441,28 @@ def _validate_startup(reports, topology, config):
 
 
 def _validate_flush(
-    directory, receipts, session, topology, *, live=False, comm_timing=None
+    directory,
+    receipts,
+    session,
+    topology,
+    *,
+    live=False,
+    comm_timing=None,
+    compute_timing=None,
 ):
     if not isinstance(receipts, list) or len(receipts) != 4:
         raise ValueError("flush must return exactly four rank receipts")
     ordered = sorted(receipts, key=lambda r: r.get("rank", r.get("pp_rank", -1)))
     timing = comm_timing or ordered[0].get("comm_timing", "shared-clock")
+    compute_mode = compute_timing or ordered[0].get("compute_timing", "event")
+    if compute_mode not in ("event", "host-sync"):
+        raise ValueError("unknown compute timing")
     if timing not in ("shared-clock", "ack"):
         raise ValueError("unknown communication timing")
     raw_files, end = {}, 0
     for rank, receipt in enumerate(ordered):
+        if receipt.get("compute_timing", "event") != compute_mode:
+            raise ValueError("rank receipt compute timing mismatch")
         if receipt.get("comm_timing", "shared-clock") != timing:
             raise ValueError("rank receipt communication timing mismatch")
         name = f"pp_stage_pp{rank}_tp0.jsonl"
@@ -478,6 +498,12 @@ def _validate_flush(
             raise ValueError(f"rank {rank} trace count differs from flush")
         stop = end + topology["stages"][rank]["layers"]
         for row in rows:
+            if row.get("compute_timing", "event") != compute_mode:
+                raise ValueError("rank raw compute timing mismatch")
+            if compute_mode == "host-sync":
+                from vllm.distributed.pp_layer_cost import _validate_layer_record
+
+                _validate_layer_record(row, 4)
             if row.get("comm_timing", "shared-clock") != timing:
                 raise ValueError("rank raw communication timing mismatch")
             if (
@@ -536,6 +562,7 @@ def _load_bound_manifest(directory, topology):
         manifest["trace_session"],
         topology,
         comm_timing=manifest.get("comm_timing", "shared-clock"),
+        compute_timing=manifest.get("compute_timing", "event"),
     )
     if raw != manifest.get("raw_files"):
         raise ValueError("raw trace hash manifest changed")
@@ -576,6 +603,7 @@ def _collect(*, directory, topology, args, llm_factory, workload, memory):
             topology,
             live=True,
             comm_timing=os.environ.get("VLLM_PP_COMM_TIMING", "shared-clock"),
+            compute_timing=os.environ["VLLM_PP_COMPUTE_TIMING"],
         )
         # Worker provenance crosses the same RPC boundary in both in-process
         # and multiprocess EngineCore mode. The driver need not own Executor.
@@ -630,6 +658,7 @@ def _collect(*, directory, topology, args, llm_factory, workload, memory):
             complete=True,
             transport=_TRANSPORT,
             comm_timing=os.environ.get("VLLM_PP_COMM_TIMING", "shared-clock"),
+            compute_timing=os.environ["VLLM_PP_COMPUTE_TIMING"],
             trace_session=os.environ["VLLM_PP_TRACE_SESSION"],
             hetero_plan=topology,
             topology_sha256=_digest(topology),
@@ -711,11 +740,14 @@ def profile_pp_partition(
     device_selection=False,
     layer_aggregation="microbatch",
     comm_timing=None,
+    compute_timing=None,
 ):
     """Collect/validate bound staged traces and optionally run fixed-order DP."""
     topology = _load_topology(hetero_plan)
     if comm_timing not in (None, "shared-clock", "ack"):
         raise ValueError("unknown communication timing")
+    if compute_timing not in (None, "event", "host-sync"):
+        raise ValueError("unknown compute timing")
     if collect_only and skip_run:
         raise ValueError("--collect-only cannot be combined with --skip-run")
     if (
@@ -750,7 +782,9 @@ def profile_pp_partition(
             )
         previous = {key: os.environ.get(key) for key in _TRACE_ENV}
         try:
-            directory = prepare_trace_dir(dump_dir, comm_timing or "shared-clock")
+            directory = prepare_trace_dir(
+                dump_dir, comm_timing or "shared-clock", compute_timing or "event"
+            )
             os.environ["VLLM_HETERO_PP_PLAN"] = json.dumps(topology)
             workload = workload or build_profile_workload(
                 num_prompts=num_prompts,
@@ -780,6 +814,10 @@ def profile_pp_partition(
             raise ValueError("--trace-dir is required with --skip-run")
         directory = Path(dump_dir).expanduser().resolve()
         manifest = _load_bound_manifest(directory, topology)
+        if compute_timing is not None and compute_timing != manifest.get(
+            "compute_timing", "event"
+        ):
+            raise ValueError("requested compute timing differs from bound profile")
         if comm_timing is not None and comm_timing != manifest.get(
             "comm_timing", "shared-clock"
         ):
@@ -818,6 +856,7 @@ def profile_pp_partition(
     _write(
         directory / "recommendation_receipt.json",
         {
+            "compute_timing": manifest.get("compute_timing", "event"),
             "profile_manifest_sha256": _sha(directory / "profile_manifest.json"),
             "recommended_hetero_plan_sha256": _sha(
                 directory / "recommended_hetero_plan.json"
@@ -909,6 +948,7 @@ def format_serve_command(plan: PPPartitionPlan, dump_dir=None) -> str:
         command += [served] if isinstance(served, str) else served
     prefix = (
         "env -u VLLM_PP_STAGE_TRACE -u VLLM_PP_TRACE_SESSION -u VLLM_PP_COMPUTE_MODEL "
+        "-u VLLM_PP_COMPUTE_TIMING "
     )
     prefix += (
         "VLLM_USE_V2_MODEL_RUNNER=0 VLLM_HETERO_PP_PLAN="
@@ -932,6 +972,13 @@ def add_cli_args(parser):
     parser.add_argument("--output-json", type=str)
     parser.add_argument("--collect-only", action="store_true")
     parser.add_argument("--skip-run", action="store_true")
+    parser.add_argument(
+        "--compute-timing",
+        choices=("event", "host-sync"),
+        default=None,
+        help="Live default: event. host-sync uses per-boundary device barriers and "
+        "CPU elapsed time on every rank. Offline default: infer bound mode.",
+    )
     parser.add_argument(
         "--comm-timing",
         choices=("shared-clock", "ack"),
@@ -1011,6 +1058,7 @@ def run_from_cli_args(args):
         layer_aggregation=args.layer_aggregation,
         collect_only=args.collect_only,
         comm_timing=getattr(args, "comm_timing", None),
+        compute_timing=getattr(args, "compute_timing", None),
     )
 
 

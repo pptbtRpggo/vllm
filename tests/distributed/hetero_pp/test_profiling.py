@@ -169,6 +169,116 @@ class ProfilingTests(unittest.TestCase):
             json.loads(line) for line in Path(self.prof.path).read_text().splitlines()
         ]
 
+    def test_host_sync_waits_for_real_work_without_reading_any_event(self):
+        # Replacing device barriers with mere CPU submission timing must fail:
+        # queued work advances this independent device fixture only at a barrier.
+        with tempfile.TemporaryDirectory() as directory:
+            prof = self.mod.StageProfiler(
+                directory,
+                "host-run",
+                self.model,
+                torch.device("cpu"),
+                0,
+                4,
+                compute_timing="host-sync",
+            )
+            self.addCleanup(prof.close)
+            state = NS(clock=0, pending=100_000_000, readers=[])
+
+            def synchronize(device):
+                self.assertEqual(device, torch.device("cpu"))
+                state.readers.append(threading.get_ident())
+                state.clock += state.pending
+                state.pending = 0
+
+            def forbidden_event(**_):
+                raise AssertionError("host-sync must not create device Events")
+
+            prof.backend = NS(synchronize=synchronize, Event=forbidden_event)
+            hooks = []
+            for module, duration in [
+                (self.model.model.embed_tokens, 2),
+                (self.model.model.layers[0], 3),
+                (self.model.model.layers[1], 4),
+                (self.model.model.norm, 1),
+                (self.model.logits_processor, 6),
+            ]:
+
+                def enqueue(*_, duration=duration):
+                    state.pending += duration * 1_000_000
+
+                hooks.append(module.register_forward_hook(enqueue))
+            try:
+                with patch.object(
+                    self.mod.time, "perf_counter_ns", lambda: state.clock
+                ):
+                    step = prof.begin(schedule(), self.runner, 0)
+                    x = prof.execute(step, lambda: self.model(torch.ones(1, 2)))
+                    self.assertEqual(state.pending, 0)
+                    state.clock += 50_000_000  # RPC gap is not compute.
+                    prof.sample(lambda: self.model.logits_processor(x))
+                    receipt = prof.flush()
+                row = json.loads(prof.path.read_text().splitlines()[0])
+                self.assertEqual(row["layer_compute_ms"], {"0": 3, "1": 4})
+                self.assertEqual(row["compute_wall_ms"], 16)
+                self.assertEqual(row["execute_compute_ms"], 10)
+                self.assertEqual(row["sample_compute_ms"], 6)
+                self.assertIsNone(row["execute_device_ms"])
+                self.assertIsNone(row["sample_device_ms"])
+                self.assertEqual(row["runner_overhead_ms"], 6)
+                self.assertEqual(row["compute_timing"], "host-sync")
+                self.assertEqual(receipt["compute_timing"], "host-sync")
+                self.assertEqual(row["timing_source"], "synchronized_host_perf_counter")
+                self.assertEqual(set(state.readers), {threading.get_ident()})
+                self.assertEqual(state.pending, 0)
+            finally:
+                for hook in hooks:
+                    hook.remove()
+                prof.close()
+
+    def test_host_sync_failure_keeps_native_error_and_no_successful_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prof = self.mod.StageProfiler(
+                directory,
+                "failed-sync",
+                self.model,
+                torch.device("cpu"),
+                0,
+                4,
+                compute_timing="host-sync",
+            )
+            self.addCleanup(lambda: prof.close(raise_errors=False))
+
+            def fail(_):
+                raise RuntimeError("device synchronization failed")
+
+            prof.backend = NS(synchronize=fail)
+            step = prof.begin(schedule(), self.runner, 0)
+            with self.assertRaisesRegex(RuntimeError, "device synchronization failed"):
+                prof.execute(step, lambda: self.model(torch.ones(1, 2)))
+            self.assertEqual(prof.path.read_text(), "")
+            self.assertTrue(
+                all(
+                    not m._forward_hooks and not m._forward_pre_hooks
+                    for m in self.model.modules()
+                )
+            )
+            prof.close(raise_errors=False)
+
+    def test_invalid_compute_timing_is_rejected_before_creating_trace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "compute timing"):
+                self.mod.StageProfiler(
+                    directory,
+                    "bad",
+                    self.model,
+                    torch.device("cpu"),
+                    0,
+                    4,
+                    compute_timing="auto-retry-event",
+                )
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
     def test_events_are_synchronized_read_and_released_before_each_rpc_returns(self):
         backend, state = event_backend()
         self.prof.backend = backend

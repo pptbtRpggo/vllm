@@ -27,6 +27,14 @@ def model(tmp_path):
     return path
 
 
+def test_profile_host_sync_reaches_the_real_profile_subprocess(model):
+    result = invoke(model, "--profile", "--profile-compute-timing", "host-sync")
+    assert result.returncode == 0, result.stderr
+    plan = json.loads(result.stdout)
+    assert plan["profile_environment"]["PROFILE_COMPUTE_TIMING"] == "host-sync"
+    assert plan["serve_command"] is None
+
+
 def invoke(model, *extra, environment=None):
     return subprocess.run(
         [

@@ -77,6 +77,16 @@ def _validate_trace_layout(trace_sets, num_layers):
     if not ranks or ranks != list(range(len(ranks))):
         raise ValueError("PP ranks must be contiguous from 0")
     totals = set()
+    timing_modes = {
+        r.get("compute_timing", "event")
+        for traces in trace_sets
+        for rows in traces.values()
+        for r in rows
+    }
+    if not timing_modes <= {"event", "host-sync"}:
+        raise ValueError("unknown compute timing in layer traces")
+    if len(timing_modes) != 1:
+        raise ValueError("profiles mix compute timing modes across ranks/runs")
     for traces in trace_sets:
         if sorted(traces) != ranks:
             raise ValueError(
@@ -112,6 +122,19 @@ def _validate_layer_record(row, pp_size):
         raise ValueError("trace PP size does not match its ranks")
     if row.get("tp_size") != 1 or row.get("tp_rank") != 0:
         raise ValueError("layer-measured currently requires TP=1")
+    if row.get("compute_timing", "event") == "host-sync":
+        if (
+            row.get("timing_source") != "synchronized_host_perf_counter"
+            or row.get("execute_device_ms") is not None
+            or row.get("sample_device_ms") is not None
+        ):
+            raise ValueError("host-sync must not claim device Event timing")
+        intervals = sum(
+            _duration(row.get(k), field=k, row=row)
+            for k in ("execute_compute_ms", "sample_compute_ms")
+        )
+        if abs(intervals - _duration(row.get("compute_wall_ms"))) > 0.01:
+            raise ValueError("host-sync compute intervals do not match stage wall")
     head_timing = row.get("lm_head_timing", "separate")
     if head_timing not in ("separate", "included_in_stage_residual"):
         raise ValueError("unknown head timing mode")

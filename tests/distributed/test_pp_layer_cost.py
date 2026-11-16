@@ -61,6 +61,23 @@ def aggregate(profiles, workload="all"):
     )
 
 
+def test_mixing_event_and_synchronized_host_layer_costs_is_rejected():
+    records = layer_trace()
+    for row in records[1]:
+        row["compute_timing"] = "host-sync"
+    with pytest.raises(ValueError, match="mix.*compute timing"):
+        aggregate([records])
+
+
+def test_unknown_layer_timing_mode_is_rejected():
+    records = layer_trace()
+    for rows in records.values():
+        for row in rows:
+            row["compute_timing"] = "unknown"
+    with pytest.raises(ValueError, match="compute timing"):
+        aggregate([records])
+
+
 def test_phase_means_are_equal_weighted_and_mixed_excluded():
     records = layer_trace()
     for rank, rows in records.items():

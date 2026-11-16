@@ -11,6 +11,19 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 class ProfileEnvironmentTests(unittest.TestCase):
+    def test_host_sync_is_explicit_actor_input_and_invalid_mode_is_rejected(self):
+        env = {
+            "VLLM_PP_STAGE_TRACE": "/tmp/new-profile",
+            "VLLM_PP_TRACE_SESSION": "host-sync-session",
+            "VLLM_PP_COMPUTE_MODEL": "layer-measured",
+            "VLLM_PP_COMPUTE_TIMING": "host-sync",
+        }
+        settings = self.module().profile_actor_environment(env)
+        self.assertEqual(settings["VLLM_PP_COMPUTE_TIMING"], "host-sync")
+        env["VLLM_PP_COMPUTE_TIMING"] = "unknown"
+        with self.assertRaises(ValueError):
+            self.module().profile_actor_environment(env)
+
     def module(self):
         path = ROOT / "vllm/distributed/hetero_pp/config.py"
         spec = importlib.util.spec_from_file_location("profile_env_policy", path)
@@ -35,6 +48,7 @@ class ProfileEnvironmentTests(unittest.TestCase):
                 "VLLM_PP_TRACE_SESSION": "",
                 "VLLM_PP_COMPUTE_MODEL": "",
                 "VLLM_PP_COMM_TIMING": "",
+                "VLLM_PP_COMPUTE_TIMING": "",
             },
         )
 
@@ -44,6 +58,7 @@ class ProfileEnvironmentTests(unittest.TestCase):
             "VLLM_PP_TRACE_SESSION": "unique-session",
             "VLLM_PP_COMPUTE_MODEL": "layer-measured",
             "VLLM_PP_COMM_TIMING": "ack",
+            "VLLM_PP_COMPUTE_TIMING": "event",
             "UNRELATED": "secret-fixture",
         }
         settings = self.module().profile_actor_environment(env)

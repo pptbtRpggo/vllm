@@ -62,6 +62,15 @@ def invoke(environment, *arguments):
     )
 
 
+def test_host_sync_profile_mode_is_forwarded_into_container(environment):
+    result = invoke(
+        environment, "--dry-run", "--profile", "--profile-compute-timing", "host-sync"
+    )
+    assert result.returncode == 0, result.stderr
+    words = shlex.split(result.stdout.splitlines()[-1])
+    assert words[words.index("--profile-compute-timing") + 1] == "host-sync"
+
+
 @pytest.mark.parametrize(
     "local,soc", [("141.147.135.53", "910b"), ("141.147.135.54", "310p")]
 )

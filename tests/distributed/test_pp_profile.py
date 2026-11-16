@@ -296,6 +296,81 @@ class ProfileControllerTests(unittest.TestCase):
             num_iters_warmup=1,
         )
 
+    def test_host_sync_collects_and_plans_offline_with_one_bound_mode(self):
+        class HostEngine(FixtureEngine):
+            def generate(self, *args, **kwargs):
+                super().generate(*args, **kwargs)
+                assert os.environ["VLLM_PP_COMPUTE_TIMING"] == "host-sync"
+                for rows in self.rows:
+                    rows[-1].update(
+                        compute_timing="host-sync",
+                        timing_source="synchronized_host_perf_counter",
+                        execute_compute_ms=3.0,
+                        sample_compute_ms=0.0,
+                        execute_device_ms=None,
+                        sample_device_ms=None,
+                    )
+
+            def collective_rpc(self, method, *args, **kwargs):
+                result = super().collective_rpc(method, *args, **kwargs)
+                if method == "flush_pp_profile":
+                    for receipt in result:
+                        receipt["compute_timing"] = "host-sync"
+                return result
+
+        engine = HostEngine()
+        self.mod.profile_pp_partition(
+            dump_dir=self.directory,
+            hetero_plan=topology(),
+            engine_args=engine_args(),
+            llm_factory=lambda: engine,
+            memory_profile=memory_profile(),
+            collect_only=True,
+            num_prompts=1,
+            input_len=2,
+            num_iters=1,
+            num_iters_warmup=1,
+            compute_timing="host-sync",
+        )
+        manifest = json.loads((self.directory / "profile_manifest.json").read_text())
+        self.assertEqual(manifest["compute_timing"], "host-sync")
+        self.assertTrue(engine.closed)
+        plan = self.mod.profile_pp_partition(
+            dump_dir=self.directory,
+            hetero_plan=topology(),
+            skip_run=True,
+        )
+        self.assertEqual(sum(plan.partitions), 8)
+        receipt = json.loads(
+            (self.directory / "recommendation_receipt.json").read_text()
+        )
+        self.assertEqual(receipt["compute_timing"], "host-sync")
+        with self.assertRaisesRegex(ValueError, "compute timing differs"):
+            self.mod.profile_pp_partition(
+                dump_dir=self.directory,
+                hetero_plan=topology(),
+                skip_run=True,
+                compute_timing="event",
+            )
+
+    def test_requested_host_sync_rejects_workers_that_silently_use_events(self):
+        engine = FixtureEngine()
+        with self.assertRaisesRegex(ValueError, "compute timing mismatch"):
+            self.mod.profile_pp_partition(
+                dump_dir=self.directory,
+                hetero_plan=topology(),
+                engine_args=engine_args(),
+                llm_factory=lambda: engine,
+                memory_profile=memory_profile(),
+                collect_only=True,
+                num_prompts=1,
+                input_len=2,
+                num_iters=1,
+                compute_timing="host-sync",
+            )
+        self.assertTrue(engine.closed)
+        self.assertFalse((self.directory / "profile_manifest.json").exists())
+
     def test_nonempty_trace_directory_is_preserved(self):
         self.directory.mkdir()
         receipt = self.directory / "successful_receipt.json"

@@ -83,6 +83,11 @@ $HOME/vllm_hetero_pp_logs/hetero_pp_worker_时间_标识/start/
 
 ### 自动 profiling：不需要共享目录
 
+310P 上需要保守计时，可在两边的 `--profile` 命令中同时加
+`--profile-compute-timing host-sync`。四个 stage 统一改为逐层 NPU 同步后的 CPU
+单调时钟计时，profiler 不读取 Event 时间戳；head 自动回收、统计和运行 DP。
+具体命令和结果字段见 [310P 保守计时](edgeshard_v023_zh.md#20-310p-保守计时host-sync)。
+
 两台宿主机更新到同一版本，在各自项目根目录运行（修改 IP 和本机模型路径）：
 
 ```bash

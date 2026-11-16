@@ -91,6 +91,12 @@ def argument_parser():
         help="profiling 全流程上限秒数，默认 3600",
     )
     parser.add_argument(
+        "--profile-compute-timing",
+        choices=("event", "host-sync"),
+        default="event",
+        help="profiling 计算计时；host-sync 为所有 stage 使用逐层同步 CPU 计时",
+    )
+    parser.add_argument(
         "--output", type=Path, help="全新日志目录；默认 output/hetero_pp_start_*"
     )
     parser.add_argument(
@@ -100,6 +106,8 @@ def argument_parser():
 
 
 def validate_options(args):
+    if not args.profile and args.profile_compute_timing != "event":
+        raise ValueError("--profile-compute-timing 仅用于 --profile")
     if args.profile:
         args.trace_root = (
             args.trace_root or Path.home() / "vllm_hetero_pp_logs/profiles"
@@ -278,6 +286,7 @@ def make_launch(args, node_ip, python, environment):
             "PROFILE_GPU_MEMORY_UTILIZATION": str(args.gpu_memory_utilization),
             "PROFILE_BLOCK_SIZE": str(args.block_size or 128),
             "PROFILE_NUM_GPU_BLOCKS": str(args.num_gpu_blocks_override or 64),
+            "PROFILE_COMPUTE_TIMING": args.profile_compute_timing,
         }
     return dict(
         role=role,

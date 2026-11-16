@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in direct layer events and completed CPU/Gloo handoff observations.
+"""Opt-in layer timing and completed CPU/Gloo handoff observations.
 
-No delay kernel, mock slowdown, model forward replacement, or per-layer device
-synchronization is used. Each execute/sample RPC synchronizes its capture stream
-and reads Event values on the recording thread; only numeric snapshots reach
+Event mode uses no per-layer synchronization. Each execute/sample synchronizes
+its stream and reads Event values on the recording thread; only numeric snapshots reach
 the bounded file-writer queue. This profiling changes submission overlap and
 host overhead; native performance still requires trace-off validation.
-Execute and sample are separate device intervals;
+Explicit host-sync mode instead synchronizes the device at every timing boundary
+and uses a CPU monotonic clock, including host submission and synchronization
+cost. It never creates/reads profiling Events. All ranks must use one mode.
+Execute and sample are separate compute intervals;
 their sum deliberately excludes the host gap between the two RPCs. Host send
 and receive windows include metadata, allocation, D2H/H2D and peer waiting.
 They are effective handoff windows, never a measurement of physical wire rate.
@@ -132,12 +134,17 @@ class _Capture:
         self.event_handles = []
         self.host_record_order_ns = []
         self.step_id = profiler.pending.metadata["step"] if profiler.pending else None
+        self.device_events = (
+            profiler.backend is not None and profiler.compute_timing == "event"
+        )
 
     def mark(self):
         self.record_thread_ids.add(threading.get_ident())
         backend = self.profiler.backend
-        if backend is None:
-            self.stream_ids.add("cpu")
+        if not self.device_events:
+            if backend is not None:
+                backend.synchronize(self.profiler.device)
+            self.stream_ids.add("host-sync" if backend is not None else "cpu")
             event = time.perf_counter_ns()
         else:
             event = backend.Event(enable_timing=True)
@@ -224,7 +231,7 @@ class _Capture:
                             self.event_handles[i] if i is not None else None
                             for i in pair
                         ]
-                        if self.profiler.backend is not None
+                        if self.device_events
                         else None,
                         "event_count": len(self._events),
                         "stream_synchronized": self._stream is not None,
@@ -285,9 +292,7 @@ class _Capture:
         if self._elapsed_cache is not None:
             return self._elapsed_cache[(a, b)]
         a, b = self._events[a], self._events[b]
-        return (
-            (b - a) / 1e6 if self.profiler.backend is None else float(a.elapsed_time(b))
-        )
+        return float(a.elapsed_time(b)) if self.device_events else (b - a) / 1e6
 
     def diagnostics(self):
         """Compare endpoint offsets from one origin only after validation fails."""
@@ -482,7 +487,13 @@ class StageProfiler:
         identity=None,
         timeout_s=60,
         comm_timing=None,
+        compute_timing=None,
     ):
+        self.compute_timing = (
+            compute_timing or os.environ.get("VLLM_PP_COMPUTE_TIMING") or "event"
+        )
+        if self.compute_timing not in ("event", "host-sync"):
+            raise ValueError("unknown compute timing")
         inner = getattr(model, "model", model)
         start, end = (
             getattr(inner, "start_layer", None),
@@ -529,6 +540,24 @@ class StageProfiler:
         self.session = session
         self.clock_domain = monotonic_clock_domain()
         self.identity = json.loads(json.dumps(identity or {}))
+        self.timing_metadata = {
+            "compute_timing": self.compute_timing,
+            "timing_source": (
+                "synchronized_host_perf_counter"
+                if self.compute_timing == "host-sync"
+                else "device_events_and_host_perf_counter"
+            ),
+            "compute_interval_kind": (
+                "sum_of_execute_and_sample_synchronized_host_intervals"
+                if self.compute_timing == "host-sync"
+                else "sum_of_execute_and_sample_device_intervals"
+            ),
+            "event_resolution": (
+                "not_used_host_sync"
+                if self.compute_timing == "host-sync"
+                else "recording_thread_stream_synchronized"
+            ),
+        }
         self.provenance = {
             "schema_version": 2,
             "transport": "cpu_gloo",
@@ -540,10 +569,8 @@ class StageProfiler:
             "identity": self.identity,
             "device_id": self.identity.get("profile_device_id", rank),
             "local_device_id": self.identity.get("device_id"),
-            "timing_source": "device_events_and_host_perf_counter",
-            "compute_interval_kind": "sum_of_execute_and_sample_device_intervals",
+            **self.timing_metadata,
             "lm_head_timing": self.lm_head_timing,
-            "event_resolution": "recording_thread_stream_synchronized",
             "communication_scope": (
                 "ready_to_remote_npu_ready_plus_done_return"
                 if self.comm_timing == "ack"
@@ -628,10 +655,8 @@ class StageProfiler:
             "compute_delay_placement": "none",
             "compute_delay_ms": 0.0,
             "transport": "cpu_gloo",
-            "timing_source": "device_events_and_host_perf_counter",
-            "compute_interval_kind": "sum_of_execute_and_sample_device_intervals",
+            **self.timing_metadata,
             "lm_head_timing": self.lm_head_timing,
-            "event_resolution": "recording_thread_stream_synchronized",
             "profile_provenance_sha256": self.provenance_sha,
             "comm_delay_in_window": False,
             "comm_timing": self.comm_timing,
@@ -766,8 +791,16 @@ class StageProfiler:
             compute_wall_ms=wall,
             non_layer_compute_ms=residual,
             runner_overhead_ms=overhead,
-            execute_device_ms=durations[0],
-            sample_device_ms=durations[1] if step.sample is not None else 0.0,
+            execute_compute_ms=durations[0],
+            sample_compute_ms=durations[1] if step.sample is not None else 0.0,
+            execute_device_ms=(
+                durations[0] if self.compute_timing == "event" else None
+            ),
+            sample_device_ms=(
+                (durations[1] if step.sample is not None else 0.0)
+                if self.compute_timing == "event"
+                else None
+            ),
             sample_called=step.sample is not None,
             output_materialization_windows=step.materialization,
         )

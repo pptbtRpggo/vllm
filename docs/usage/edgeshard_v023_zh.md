@@ -111,13 +111,56 @@ SHA、读取内存证据，并完成服务收尾后，才写 `profile_manifest.j
 旧的独立 head 计时记录仍可单独分析，但不能与新口径混合拟合。
 逐层、stage 总区间和通信的校验继续保留；取消 head 拆分并不证明设备计时故障已修复。
 
-当前改用保守的同步采集路径：每个 execute/sample RPC 结束后，在记录 Event 的
+默认 `event` 模式使用同步采集路径：每个 execute/sample RPC 结束后，在记录 Event 的
 同一线程同步目标 stream，立即读取总区间、各模块区间和起止偏移，再释放 Event。
 后台队列只保留数值快照，最多 8 条待写记录，不调用 NPU Event API。
 raw 和完成回执中的 `event_resolution=recording_thread_stream_synchronized`
 用于区别旧后台读取版本。负值、非有限值或明显越界会在采集时直接拒绝并保存诊断。
 如果底层 `elapsed_time()` 本身报错，日志会另打印 `PP Event read failed`，
 包含 `pp_rank / step / kind / field`，并保留失败 Event 配对、已读取数值及原始异常。
+
+### 2.0 310P 保守计时：host-sync
+
+对于 310P 上负 Event 耗时或 `event timestamp invalid`，可显式选择 `host-sync`。
+四个 stage 统一使用同一种计时模式，不自动回退、不混合新旧 trace。
+每层及 embedding/final norm 的边界先 `torch.npu.synchronize(device)`，再读
+CPU 单调时钟；整个 execute/sample 同样分别计时，不包含两次 RPC 间的空档。
+profiler 不创建、不读取设备 Event。head 不单独打点，其工作仍计入末 stage 固定成本。
+
+尚未启动容器/Ray：在两台宿主机使用原命令，追加以下两项，先 head 再 peer：
+
+```bash
+bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
+  --head 53 --peer 54 --model /本机/模型目录 --layers 18,18,6,6 \
+  --profile --profile-compute-timing host-sync
+```
+
+IP、模型路径、设备和内存参数沿用本机已跑通配置；这里的 `53/54` 是示例。
+head 自动采集、回收 peer trace、打印表格和输出 DP。peer 不重复运行采集脚本。
+已有容器且 Ray 已连好、推理服务已退出：只在 head 容器中运行：
+
+```bash
+export MODEL=/workspace/model
+export PLAN=/本机/当前已跑通的PP4配置.json
+export RAY_ADDRESS=141.147.135.53:16379
+export TRACE_ROOT="$HOME/edgeshard_profiles"
+export PY=/已有匹配环境/bin/python
+PROFILE_COMPUTE_TIMING=host-sync \
+  bash examples/online_serving/hetero_pp/profile_edgeshard.sh
+```
+
+单独使用 Python CLI 时，传 `pp-profile ... --compute-timing host-sync`。
+默认仍是 `event`；新 trace、四 rank 回执和 `profile_manifest.json` 均有
+`compute_timing=host-sync`、`timing_source=synchronized_host_perf_counter`。
+`execute_compute_ms/sample_compute_ms` 是新通用计算区间；host-sync 的
+`execute_device_ms/sample_device_ms` 为 `null`，避免冒称设备 Event 计时。
+
+本模式测的是包含主机提交与同步成本的同步 profile，逐层屏障会改变正常任务重叠。
+它用于保守估计和生成候选；推荐分层的实际 TTFT 仍在关闭 profile 后测量。
+默认只输出 1 token，只统计纯 prefill，1 轮 warmup + 2 轮正式、每轮 4 请求。
+完成后检查四个 rank receipt 的 `complete=true/errors=[]/pending=0`，
+以及总 manifest `complete=true/compute_timing=host-sync`；
+统计和 DP 均会拒绝跨 rank 或跨轮混用 Event/host-sync 数据。
 只需提供这一行就能确定失败的测量字段；这项错误信息补充不代表修复了底层时间戳问题。
 错误原值不会用绝对值或大负值归零代替；守恒计算原先的 0.01 ms 浮点容差不变，
 并额外保存 `raw_non_layer_compute_ms` / `raw_runner_overhead_ms`。
@@ -153,17 +196,19 @@ bash examples/online_serving/hetero_pp/profile_edgeshard.sh
 ```
 
 它采用上面的小规模采集配置，采集后打印计算/交接耗时表及三条相邻链路的有效
-交接速率，再运行离线 latency 目标 DP。每个 stage/链路分别列出全部、prefill、decode 和存在时的 mixed
-step；阶段由真实调度 token 计数判定。排除预热，零 payload 只计排除数量，
+交接速率，再运行离线 latency 目标 DP。仅保留纯 prefill step，阶段由真实调度 token
+计数判定；decode/mixed 不参与本表和切分推荐。排除预热，零 payload 只计排除数量，
 不计入速率样本。汇总和逐交接记录分别保存到采集目录的
 `communication_speed_summary.csv`、`communication_speed_samples.csv`。
 
 耗时表 `stage_and_link_timing_summary.csv` 包含四个 stage 的 `compute` 行与
 三条链路的 `handoff` 行，列出样本数、平均值、P50/P90/P95/P99，单位 ms，
 另存总和、最小值和最大值。逐步计算保存在 `stage_compute_samples.csv`。
-计算时长取 `compute_wall_ms`，这是 `execute_device_ms + sample_device_ms`
-两个设备事件区间的和，不是 host 函数调用时长，不包含两个 RPC 之间的空档；
-包含末 stage 的采样设备区间。缺少有效事件时长或区间不守恒会拒绝汇总，
+计算时长取 `compute_wall_ms`，这是 `execute_compute_ms + sample_compute_ms`
+两个区间的和，不包含两个 RPC 之间的空档。Event 模式为设备区间，
+host-sync 模式为同步主机区间，表和逐步 CSV 均标明 `compute_timing`；
+旧 Event trace 兼容原 `execute_device_ms + sample_device_ms` 字段。
+包含末 stage 的采样区间。缺少有效时长或区间不守恒会拒绝汇总，
 不会把缺失值补成零。交接时长取配对核验后的 `send_ack_ms`，包含零 payload
 交接；速率统计则排除零 payload。各阶段/链路的分位数不能直接相加得到请求延迟。
 

@@ -19,7 +19,7 @@ SCRIPT = (
 )
 
 
-def write_trace(directory, *, defect=None):
+def write_trace(directory, *, defect=None, compute_timing="event"):
     directory.mkdir()
     rows: list[list[dict]] = [[] for _ in range(4)]
     # Prefill speeds 8 / 2 Gbps; ignore warmup, decode and mixed steps.
@@ -104,6 +104,15 @@ def write_trace(directory, *, defect=None):
                         ),
                     ),
                 )
+            if compute_timing == "host-sync":
+                row.update(
+                    compute_timing="host-sync",
+                    timing_source="synchronized_host_perf_counter",
+                    execute_compute_ms=compute - sample,
+                    sample_compute_ms=sample,
+                    execute_device_ms=None,
+                    sample_device_ms=None,
+                )
             rows[rank].append(row)
     if defect == "missing_peer":
         rows[2].pop()
@@ -123,6 +132,8 @@ def write_trace(directory, *, defect=None):
         rows[0][1]["compute_wall_ms"] = -1
     elif defect == "compute_conservation":
         rows[3][1]["sample_device_ms"] += 3
+    elif defect == "mixed_compute_timing":
+        rows[3][1]["compute_timing"] = "event"
     raw = {}
     for rank, records in enumerate(rows):
         name = f"pp_stage_pp{rank}_tp0.jsonl"
@@ -136,6 +147,7 @@ def write_trace(directory, *, defect=None):
         comm_timing="ack",
         trace_session="test-session",
         raw_files=raw,
+        compute_timing=compute_timing,
     )
     (directory / "profile_manifest.json").write_text(json.dumps(manifest))
     if defect == "hash":
@@ -151,6 +163,26 @@ def run_summary(directory):
         text=True,
         timeout=15,
     )
+
+
+def test_host_sync_summary_uses_host_costs_without_claiming_device_events(tmp_path):
+    directory = tmp_path / "host-trace"
+    write_trace(directory, compute_timing="host-sync")
+    result = run_summary(directory)
+    assert result.returncode == 0, result.stderr
+    assert "host-sync" in result.stdout
+    assert "compute=execute+sample 的设备事件区间和" not in result.stdout
+    rows = list(csv.DictReader((directory / "stage_compute_samples.csv").open()))
+    assert rows and all(r["compute_timing"] == "host-sync" for r in rows)
+    assert all(float(r["execute_compute_ms"]) >= 0 for r in rows)
+
+
+def test_summary_rejects_mixed_host_and_event_compute_costs(tmp_path):
+    directory = tmp_path / "mixed-trace"
+    write_trace(directory, compute_timing="host-sync", defect="mixed_compute_timing")
+    result = run_summary(directory)
+    assert result.returncode != 0
+    assert not (directory / "stage_compute_samples.csv").exists()
 
 
 def test_readonly_timing_check_finds_invalid_fields_without_model_or_manifest(tmp_path):

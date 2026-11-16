@@ -11,6 +11,7 @@ MODEL="${MODEL:-}"                    # 容器内模型目录，两边相同路�
 PLAN="${PLAN:-}"                      # 当前已跑通的 PP4 topology JSON
 RAY_ADDRESS="${RAY_ADDRESS:-}"         # 例如 141.147.135.53:16379
 TRACE_ROOT="${TRACE_ROOT:-}"           # 本地结果根目录；自动回收远端 rank 记录
+PROFILE_COMPUTE_TIMING="${PROFILE_COMPUTE_TIMING:-event}" # event / host-sync
 PY="${PY:-${VIRTUAL_ENV:-$REPO/.venv}/bin/python}"
 
 check_timing() {
@@ -80,6 +81,9 @@ from pathlib import Path
 
 directory = Path(sys.argv[1]).resolve()
 manifest = json.loads((directory / "profile_manifest.json").read_text())
+compute_timing = manifest.get("compute_timing", "event")
+if compute_timing not in ("event", "host-sync"):
+    raise ValueError("未知 compute timing")
 if (manifest.get("complete") is not True
         or manifest.get("version") != 1
         or manifest.get("transport") != "cpu_gloo"
@@ -105,6 +109,7 @@ for rank in range(4):
                 or row.get("trace_session") != manifest["trace_session"]
                 or row.get("transport") != "cpu_gloo"
                 or row.get("comm_timing") != "ack"
+                or row.get("compute_timing", "event") != compute_timing
                 or type(row.get("is_warmup")) is not bool
                 or type(row.get("step")) is not int):
             raise ValueError(f"rank{rank} 原始记录身份或模式错误")
@@ -162,21 +167,31 @@ for rank, rows in enumerate(by_rank):
     for step, record in sorted(rows.items()):
         if record["is_warmup"]:
             continue
-        fields = ("compute_wall_ms", "execute_device_ms", "sample_device_ms")
+        fields = ("compute_wall_ms", "execute_compute_ms", "sample_compute_ms")
+        if compute_timing == "event" and "execute_compute_ms" not in record:
+            fields = ("compute_wall_ms", "execute_device_ms", "sample_device_ms")
         values = [record.get(key) for key in fields]
         if any(type(v) not in (int, float) or not math.isfinite(v) or v < 0
                for v in values):
-            raise ValueError(f"stage{rank} step{step} 缺少有效的设备计算时长")
+            raise ValueError(f"stage{rank} step{step} 缺少有效的计算时长")
+        if compute_timing == "host-sync" and (
+                record.get("timing_source") != "synchronized_host_perf_counter"
+                or record.get("execute_device_ms") is not None
+                or record.get("sample_device_ms") is not None):
+            raise ValueError("host-sync 不得标注为设备 Event 耗时")
         elapsed, execute, sample = values
         if not math.isclose(elapsed, execute + sample, rel_tol=1e-6, abs_tol=0.01):
-            raise ValueError(f"stage{rank} step{step} 设备计算区间不守恒")
+            raise ValueError(f"stage{rank} step{step} 计算区间不守恒")
         ctx, gen = record["num_ctx_tokens"], record["num_generation_tokens"]
         phase = "mixed" if ctx and gen else "prefill" if ctx else "decode"
         if phase != "prefill":
             continue
         compute_samples.append(dict(
             item=f"stage{rank}", kind="compute", phase=phase, step=step,
-            elapsed_ms=elapsed, execute_device_ms=execute, sample_device_ms=sample,
+            elapsed_ms=elapsed, compute_timing=compute_timing,
+            execute_compute_ms=execute, sample_compute_ms=sample,
+            execute_device_ms=record.get("execute_device_ms"),
+            sample_device_ms=record.get("sample_device_ms"),
         ))
 
 timing_summary = []
@@ -240,7 +255,11 @@ for row in timing_summary:
     print(f"{row['item']:<12} {row['kind']:<8} {row['phase']:<8} "
           f"{row['samples']:5d} {numbers}")
 print("-" * 90)
-print("compute=execute+sample 的设备事件区间和，不含两个 RPC 之间的空档。")
+print(f"compute_timing={compute_timing}")
+if compute_timing == "host-sync":
+    print("compute=execute+sample 的同步主机区间和，含 CPU 提交/同步成本；每层边界同步。")
+else:
+    print("compute=execute+sample 的设备事件区间和，不含两个 RPC 之间的空档。")
 print("handoff=发送端 ACK 完成窗口，含 D2H/Gloo/H2D/DONE；含零 payload 交接。")
 print("计算和通信的分位数不能直接相加得到请求延迟；本表不是 HTTP/排队延迟。")
 print(f"耗时表：{directory / 'stage_and_link_timing_summary.csv'}")
@@ -273,6 +292,9 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
   bash examples/online_serving/hetero_pp/profile_edgeshard.sh --check-timing /本地目录/某轮结果
 
 也可用环境变量传入 MODEL、PLAN、RAY_ADDRESS、TRACE_ROOT、PY。
+310P 保守计时：PROFILE_COMPUTE_TIMING=host-sync bash 本脚本
+四个 stage 统一使用 NPU 同步后的 CPU 单调时钟；不读取 profiling Event 时间戳。
+默认 event；host-sync 包含主机提交/同步成本，结果不可与旧 Event trace 混合。
 PY 是当前能运行异构 vLLM 的 Python 路径；默认当前虚拟环境或项目 .venv。
 Ray 必须已连接，两边使用匹配的项目代码与环境，四张卡供本次采集使用。
 TRACE_ROOT 为本地结果根目录；采集结束后自动通过已有 Ray 回收 peer 原始记录。
@@ -302,21 +324,26 @@ if (($#)); then echo '未知参数；使用 --help 查看说明。' >&2; exit 2;
 [[ -n "$RAY_ADDRESS" ]] || { echo '请设置 RAY_ADDRESS=head_IP:端口。' >&2; exit 2; }
 [[ "$TRACE_ROOT" == /* ]] || { echo '请设置 TRACE_ROOT 为本地结果目录的绝对路径。' >&2; exit 2; }
 [[ -x "$PY" && -f "$PY" ]] || { echo '请设置 PY 为匹配服务环境的 Python 绝对路径。' >&2; exit 2; }
+[[ "$PROFILE_COMPUTE_TIMING" == event || "$PROFILE_COMPUTE_TIMING" == host-sync ]] || {
+  echo 'PROFILE_COMPUTE_TIMING 只能是 event 或 host-sync。' >&2; exit 2;
+}
 
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export RAY_ADDRESS VLLM_USE_V2_MODEL_RUNNER=0
 # 由 pp-profile 分配本轮 session 和 trace 配置，避免继承旧采集环境。
-unset VLLM_PP_STAGE_TRACE VLLM_PP_TRACE_SESSION VLLM_PP_COMPUTE_MODEL
+unset VLLM_PP_STAGE_TRACE VLLM_PP_TRACE_SESSION VLLM_PP_COMPUTE_MODEL VLLM_PP_COMPUTE_TIMING
 
 mkdir -p -- "$TRACE_ROOT"
 TRACE=$(mktemp -d "$TRACE_ROOT/edgeshard_$(date +%Y%m%d_%H%M%S)_XXXXXX")
 echo "本轮结果：$TRACE"
 echo "日志：$TRACE.log"
+echo "计算计时：${PROFILE_COMPUTE_TIMING}（四个 stage 一致）"
 echo '1/3 采集 prefill 至首 token 的成本（每请求输出 1 token；请勿同时运行其他占卡任务）'
 # 日志放在 trace 目录外，保证 collector 启动前目录为空。
 "$PY" -m vllm.entrypoints.cli.main pp-profile "$MODEL" \
   --hetero-plan "$PLAN" --trace-dir "$TRACE" --collect-only \
   --compute-model layer-measured --comm-timing ack \
+  --compute-timing "$PROFILE_COMPUTE_TIMING" \
   --input-len 64 --output-len 1 --num-prompts 4 \
   --num-iters-warmup 1 --num-iters 2 --seed 7 \
   --dtype float16 --enforce-eager --no-async-scheduling \

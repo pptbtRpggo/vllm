@@ -42,6 +42,8 @@ usage() {
   --trace-root DIR    可选，本机结果目录；不需要共享，默认随本轮日志保存
                        peer 记录由 master 通过现有 Ray 连接自动收回并校验
   --profile-timeout N profiling 全流程上限秒数，默认 3600
+  --profile-compute-timing event|host-sync
+                       host-sync 为四个 stage 使用逐层同步 CPU 计时，绕开 profiling Event
   --block-size N / --num-gpu-blocks-override N
                        可选，显式 KV 配置；profiling 默认 128 / 64
   --startup-timeout N  转发到容器内启动入口
@@ -65,7 +67,7 @@ while (($#)); do
     --dry-run) dry_run=true; shift ;;
     --shell) debug_shell=true; shift ;;
     --profile) profile=true; shift ;;
-    --head|--peer|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--api-port|--layers|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python|--chat-template|--trace-root|--profile-timeout|--block-size|--num-gpu-blocks-override)
+    --head|--peer|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--api-port|--layers|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python|--chat-template|--trace-root|--profile-timeout|--profile-compute-timing|--block-size|--num-gpu-blocks-override)
       (($# >= 2)) && [[ -n "$2" && "$2" != --* ]] || die "$1 缺少参数"
       case "$1" in
         --head) head="$2" ;; --peer) peer="$2" ;; --model) model="$2" ;;

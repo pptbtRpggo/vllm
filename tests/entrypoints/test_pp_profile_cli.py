@@ -14,6 +14,24 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ProfileCLITests(unittest.TestCase):
+    def test_host_sync_parser_and_controller_dispatch(self):
+        args = self.parser.parse_args(
+            [
+                "pp-profile",
+                "fixture-model",
+                "--hetero-plan",
+                "plan.json",
+                "--enforce-eager",
+                "--no-async-scheduling",
+                "--compute-timing",
+                "host-sync",
+            ]
+        )
+        self.mod.PPProfileSubcommand().validate(args)
+        with patch("vllm.distributed.pp_profile.profile_pp_partition") as run:
+            self.mod.run_from_cli_args(args)
+        self.assertEqual(run.call_args.kwargs["compute_timing"], "host-sync")
+
     def setUp(self):
         path = ROOT / "vllm/entrypoints/cli/pp_profile.py"
         self.assertTrue(path.exists(), "v0.23 pp-profile CLI is not implemented")
