@@ -3,7 +3,11 @@
 """Opt-in direct layer events and completed CPU/Gloo handoff observations.
 
 No delay kernel, mock slowdown, model forward replacement, or per-layer device
-synchronization is used. Execute and sample are separate device intervals;
+synchronization is used. Each execute/sample RPC synchronizes its capture stream
+and reads Event values on the recording thread; only numeric snapshots reach
+the bounded file-writer queue. This profiling changes submission overlap and
+host overhead; native performance still requires trace-off validation.
+Execute and sample are separate device intervals;
 their sum deliberately excludes the host gap between the two RPCs. Host send
 and receive windows include metadata, allocation, D2H/H2D and peer waiting.
 They are effective handoff windows, never a measurement of physical wire rate.
@@ -22,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import queue
 import threading
@@ -110,7 +115,7 @@ def tensor_bytes(values):
 
 
 class _Capture:
-    """One RPC owns fresh events until its background record is resolved."""
+    """Read fresh events on their recording thread before returning the RPC."""
 
     def __init__(self, profiler, kind):
         self.profiler, self.kind = profiler, kind
@@ -119,19 +124,34 @@ class _Capture:
         self.handles = []
         self.stream_ids: set[str] = set()
         self.record_thread_ids: set[int] = set()
+        self._events = []
+        self._stream = None
+        self._elapsed_cache = None
+        self.resolution_host_ms = 0.0
+        self.resolved_by_thread_id = None
+        self.event_handles = []
+        self.host_record_order_ns = []
+        self.step_id = profiler.pending.metadata["step"] if profiler.pending else None
 
     def mark(self):
         self.record_thread_ids.add(threading.get_ident())
         backend = self.profiler.backend
         if backend is None:
             self.stream_ids.add("cpu")
-            return time.perf_counter_ns()
-        event = backend.Event(enable_timing=True)
-        stream = backend.current_stream(self.profiler.device)
-        event.record(stream)
-        stream_id = getattr(stream, "npu_stream", None)
-        self.stream_ids.add(str(stream_id) if stream_id is not None else "unknown")
-        return event
+            event = time.perf_counter_ns()
+        else:
+            event = backend.Event(enable_timing=True)
+            stream = backend.current_stream(self.profiler.device)
+            event.record(stream)
+            if self._stream is None:
+                self._stream = stream
+            stream_id = getattr(stream, "npu_stream", None)
+            self.stream_ids.add(str(stream_id) if stream_id is not None else "unknown")
+            self.event_handles.append(getattr(event, "npu_event", None))
+        marker = len(self._events)
+        self.host_record_order_ns.append(time.perf_counter_ns())
+        self._events.append(event)
+        return marker
 
     def before(self, name, _module, _args):
         if name in self.pairs:
@@ -164,18 +184,72 @@ class _Capture:
                     "profiling must observe every local decoder layer in order "
                     "during execute only"
                 )
-            return result
         finally:
             for handle in self.handles:
                 handle.remove()
+        self.freeze()
+        return result
+
+    def freeze(self):
+        """Synchronize one capture stream, read numbers and release all events."""
+        if len(self.stream_ids) != 1 or self.record_thread_ids != {
+            threading.get_ident()
+        }:
+            raise ValueError("profile capture requires one recording thread and stream")
+        begin = time.perf_counter_ns()
+        if self._stream is not None:
+            self._stream.synchronize()
+        pairs = {"total_ms": (self.start, self.end)}
+        for key, (a, b) in self.pairs.items():
+            name = f"layer_compute_ms[{key}]" if isinstance(key, int) else f"{key}_ms"
+            pairs[name] = (a, b)
+            pairs[name + ".start"] = (self.start, a)
+            pairs[name + ".end"] = (self.start, b)
+        values = {pair: self.elapsed(pair) for pair in dict.fromkeys(pairs.values())}
+        self._elapsed_cache = values
+        self.resolved_by_thread_id = threading.get_ident()
+        self.resolution_host_ms = (time.perf_counter_ns() - begin) / 1e6
+        self._events.clear()
+        self._stream = None
+        invalid = {
+            name: values[pair]
+            for name, pair in pairs.items()
+            if not math.isfinite(values[pair]) or values[pair] < 0
+        }
+        total = values[(self.start, self.end)]
+        for key, (a, b) in self.pairs.items():
+            name = f"layer_compute_ms[{key}]" if isinstance(key, int) else f"{key}_ms"
+            start, end, inner = (
+                values[(self.start, a)],
+                values[(self.start, b)],
+                values[(a, b)],
+            )
+            if (
+                end > total + 0.01
+                or start > end + 0.01
+                or abs(end - start - inner) > 0.01
+            ):
+                invalid[name + ".interval"] = dict(
+                    start=start, end=end, inner=inner, total=total
+                )
+        if invalid:
+            raise ValueError(
+                "invalid device Event timing; "
+                f"pp_rank={self.profiler.rank} step={self.step_id} kind={self.kind} "
+                f"invalid_fields={invalid!r}; "
+                f"diagnostics={json.dumps(self.diagnostics(), sort_keys=True)}"
+            )
 
     def ready(self):
-        return self.profiler.backend is None or self.end.query()
+        return self._elapsed_cache is not None
 
     def elapsed(self, pair):
         a, b = pair
         if b is None:
             raise ValueError("module completion event is missing")
+        if self._elapsed_cache is not None:
+            return self._elapsed_cache[(a, b)]
+        a, b = self._events[a], self._events[b]
         return (
             (b - a) / 1e6 if self.profiler.backend is None else float(a.elapsed_time(b))
         )
@@ -187,11 +261,14 @@ class _Capture:
             "stream_ids": sorted(self.stream_ids),
             "record_thread_ids": sorted(self.record_thread_ids),
             "read_thread_id": threading.get_ident(),
+            "resolved_by_thread_id": self.resolved_by_thread_id,
+            "event_handles": self.event_handles,
+            "host_record_order_ns": self.host_record_order_ns,
             "host_ms": (self.host_end_ns - self.host_start_ns) / 1e6,
             "endpoint_offsets_ms": {},
         }
-        # Extra device queries are restricted to an already rejected record.
-        # Failure of a diagnostic query must not hide the original error.
+        # A frozen capture uses cached numbers, including on failure. Diagnostic
+        # formatting must not hide the original error.
         try:
             detail["origin_total_ms"] = self.elapsed((self.start, self.end))
             for name, (start, end) in self.pairs.items():
@@ -257,10 +334,11 @@ class _TraceLink:
         if capture is not None and capture.profiler.backend is not None:
             self.step.send_readiness_checkpoint = True
             self.step.send_ready_wait_start_ns = time.perf_counter_ns()
-            # One local stream completion event, not a device-wide or
-            # per-layer synchronization. Its forward work is counted in the
-            # compute interval; this instrumentation wait is not added again.
-            capture.end.synchronize()
+            # The execute RPC already synchronized its stream and snapshotted
+            # its events. This host checkpoint does not reread device events or
+            # add its instrumentation wait to communication/compute costs.
+            if not capture.ready():
+                raise RuntimeError("execute events were not resolved before send")
             self.step.send_ready_wait_end_ns = time.perf_counter_ns()
             self.step.send_ready_wait_ms = (
                 self.step.send_ready_wait_end_ns - self.step.send_ready_wait_start_ns
@@ -430,6 +508,7 @@ class StageProfiler:
             "timing_source": "device_events_and_host_perf_counter",
             "compute_interval_kind": "sum_of_execute_and_sample_device_intervals",
             "lm_head_timing": self.lm_head_timing,
+            "event_resolution": "recording_thread_stream_synchronized",
             "communication_scope": (
                 "ready_to_remote_npu_ready_plus_done_return"
                 if self.comm_timing == "ack"
@@ -437,7 +516,7 @@ class StageProfiler:
             ),
             "comm_timing": self.comm_timing,
             "send_readiness_instrumentation": (
-                "local_execute_completion_event_before_metadata_and_D2H"
+                "execute_stream_synchronized_and_events_resolved_before_send"
             ),
             "readiness_wait_accounting": (
                 "excluded_from_communication_and_not_added_to_planner_cost"
@@ -461,8 +540,8 @@ class StageProfiler:
         self._event_reread = None
         self._diagnostic_lock = threading.Lock()
         self._closed = False
-        self._queue: queue.Queue[tuple[_Step, float] | threading.Event | None] = (
-            queue.Queue()
+        self._queue: queue.Queue[_Step | threading.Event | None] = queue.Queue(
+            maxsize=8
         )
         self._thread = threading.Thread(
             target=self._write_loop, name="staged-profile-writer", daemon=True
@@ -517,6 +596,7 @@ class StageProfiler:
             "timing_source": "device_events_and_host_perf_counter",
             "compute_interval_kind": "sum_of_execute_and_sample_device_intervals",
             "lm_head_timing": self.lm_head_timing,
+            "event_resolution": "recording_thread_stream_synchronized",
             "profile_provenance_sha256": self.provenance_sha,
             "comm_delay_in_window": False,
             "comm_timing": self.comm_timing,
@@ -578,7 +658,7 @@ class StageProfiler:
         if self.pending is not None:
             if self.pending.execute is None:
                 raise RuntimeError("profile step has no completed execute interval")
-            self._queue.put((self.pending, time.monotonic() + self.timeout_s))
+            self._queue.put(self.pending, timeout=self.timeout_s)
             self.pending = None
 
     def _resolve(self, step):
@@ -598,12 +678,27 @@ class StageProfiler:
         }
         residual = wall - sum(layers.values())
         overhead = residual - sum(v or 0 for v in endpoints.values())
-        if min(wall, *layers.values(), residual, overhead) < -0.01:
+        invalid_fields = {
+            **{f"{c.kind}_device_ms": v for c, v in zip(captures, durations)},
+            **{
+                f"layer_compute_ms[{k}]" if isinstance(k, int) else f"{k}_ms": v
+                for k, v in modules.items()
+            },
+        }
+        invalid_fields = {
+            k: v for k, v in invalid_fields.items() if not math.isfinite(v) or v < 0
+        }
+        if (
+            invalid_fields
+            or not all(math.isfinite(v) for v in (wall, residual, overhead))
+            or min(wall, *layers.values(), residual, overhead) < -0.01
+        ):
             # Preserve the values that failed validation. The outer worker error
             # alone cannot distinguish an overlapping scope from event readings.
             detail = {
                 "pp_rank": self.rank,
                 "step": row["step"],
+                "invalid_fields": invalid_fields,
                 "device": str(self.device),
                 "loaded_layers": self.provenance["loaded_layers"],
                 "execute_device_ms": durations[0],
@@ -622,6 +717,8 @@ class StageProfiler:
                 f"diagnostics={json.dumps(detail, sort_keys=True)}"
             )
         # Preserve conservation; tolerate only device event quantization noise.
+        row["raw_non_layer_compute_ms"] = residual
+        row["raw_runner_overhead_ms"] = overhead
         residual = max(0.0, residual)
         overhead = max(0.0, overhead)
         row.update(
@@ -650,6 +747,9 @@ class StageProfiler:
         if step.send_submit_start_ns is not None and step.send_start_ns is None:
             raise ValueError("send readiness checkpoint did not complete")
         for kind, capture in (("execute", step.execute), ("sample", step.sample)):
+            row[kind + "_event_resolution_host_ms"] = (
+                capture.resolution_host_ms if capture else 0.0
+            )
             row[kind + "_host_start_ns"] = capture.host_start_ns if capture else None
             row[kind + "_host_end_ns"] = capture.host_end_ns if capture else None
             row[kind + "_host_ms"] = (
@@ -690,12 +790,6 @@ class StageProfiler:
         failure.write_text(json.dumps(detail, indent=2))
 
     def _write_loop(self):
-        if self.backend is not None:
-            try:
-                self.backend.set_device(self.device)
-            except Exception as error:
-                self._error = error
-                self._failure(traceback.format_exc())
         while True:
             item = self._queue.get()
             if item is None:
@@ -705,21 +799,19 @@ class StageProfiler:
                 continue
             if self._error is not None:
                 continue
-            step, deadline = item
+            step = item
             resolving = True
             try:
-                while not all(
+                if not all(
                     c.ready() for c in (step.execute, step.sample) if c is not None
                 ):
-                    if time.monotonic() > deadline:
-                        raise TimeoutError("profile completion event did not finish")
-                    time.sleep(0.001)
+                    raise RuntimeError("background writer received unresolved events")
                 row = self._resolve(step)
                 resolving = False
                 self._write_row(row)
             except Exception as error:
                 with self._diagnostic_lock:
-                    # Keep the exact failed Event objects alive for one reread.
+                    # Keep the rejected numeric snapshot for diagnostics.
                     self._failed_step = step if resolving else None
                     self._failed_traceback = traceback.format_exc()
                     self._error = error
@@ -733,11 +825,7 @@ class StageProfiler:
             raise RuntimeError("profile writer or capture failed") from self._error
 
     def _reread_failed_events(self):
-        """Diagnose a rejected capture on the calling worker; never publish it.
-
-        This changes both the reader thread and the read time. A changed reading
-        therefore narrows the investigation but does not prove a thread bug.
-        """
+        """Recheck the rejected numeric snapshot; no device API or publishing."""
         step = self._failed_step
         if step is None:
             return
@@ -752,10 +840,7 @@ class StageProfiler:
         self._event_reread = detail  # Attempt once, including diagnostic failures.
         captures = [c for c in (step.execute, step.sample) if c is not None]
         try:
-            if self.backend is not None:
-                self.backend.set_device(self.device)
-                for capture in captures:
-                    capture.end.synchronize()
+            # Captures now contain only immutable numeric Event snapshots.
             row = self._resolve(step)
             detail.update(
                 resolved=True,
@@ -772,7 +857,7 @@ class StageProfiler:
             # Preserve the original exception even if the diagnostic file fails.
             detail["write_error"] = f"{type(error).__name__}: {error}"
         print(
-            f"PP event reread rank={self.rank} diagnostics="
+            f"PP cached timing check rank={self.rank} diagnostics="
             + json.dumps(detail, sort_keys=True),
             flush=True,
         )
@@ -783,7 +868,7 @@ class StageProfiler:
         self._check()
         self._finalize_pending()
         barrier = threading.Event()
-        self._queue.put(barrier)
+        self._queue.put(barrier, timeout=self.timeout_s)
         if not barrier.wait(self.timeout_s):
             raise TimeoutError("profile writer flush timed out")
         self._check()
@@ -820,7 +905,7 @@ class StageProfiler:
                 raise
         finally:
             self._closed = True
-            self._queue.put(None)
+            self._queue.put(None, timeout=self.timeout_s)
             self._thread.join(timeout=self.timeout_s)
             if self._thread.is_alive():
                 raise TimeoutError("profile writer did not exit")

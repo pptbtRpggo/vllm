@@ -111,6 +111,18 @@ SHA、读取内存证据，并完成服务收尾后，才写 `profile_manifest.j
 旧的独立 head 计时记录仍可单独分析，但不能与新口径混合拟合。
 逐层、stage 总区间和通信的校验继续保留；取消 head 拆分并不证明设备计时故障已修复。
 
+当前改用保守的同步采集路径：每个 execute/sample RPC 结束后，在记录 Event 的
+同一线程同步目标 stream，立即读取总区间、各模块区间和起止偏移，再释放 Event。
+后台队列只保留数值快照，最多 8 条待写记录，不调用 NPU Event API。
+raw 和完成回执中的 `event_resolution=recording_thread_stream_synchronized`
+用于区别旧后台读取版本。负值、非有限值或明显越界会在采集时直接拒绝并保存诊断。
+错误原值不会用绝对值或大负值归零代替；守恒计算原先的 0.01 ms 浮点容差不变，
+并额外保存 `raw_non_layer_compute_ms` / `raw_runner_overhead_ms`。
+
+这是 profiling 专用模式，会改变提交重叠并增加主机开销；不是原生性能测量。
+`execute_event_resolution_host_ms` / `sample_event_resolution_host_ms` 单列同步与
+解析开销，不额外累加到设备计算或交接成本。推荐方案仍需关闭 trace 后实机复验。
+
 如果离线规划提示 `layer-measured durations must be finite and nonnegative`，
 不要重新跑模型。对已有本轮目录执行只读检查，打印异常字段的 rank、step 和原值：
 

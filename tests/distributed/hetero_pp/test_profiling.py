@@ -6,8 +6,10 @@ import importlib.util
 import json
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import weakref
 from pathlib import Path
 from types import SimpleNamespace as NS
 from typing import TYPE_CHECKING
@@ -80,6 +82,55 @@ def schedule():
     )
 
 
+def event_backend(
+    *, invalid_norm=None, invalid_offset=None, entered=None, release=None
+):
+    """CPU Event double enforcing the device API ordering/thread contract."""
+    state = NS(clock=0, synced=False, readers=[], syncs=[], references=[])
+
+    class Stream:
+        npu_stream = 1
+
+        def synchronize(self):
+            if entered is not None:
+                entered.set()
+                if not release.wait(2):
+                    raise RuntimeError("stream completion was not released")
+            state.syncs.append(threading.get_ident())
+            state.synced = True
+
+    class Event:
+        def __init__(self, **_):
+            state.references.append(weakref.ref(self))
+
+        def record(self, stream):
+            self.value = state.clock
+            self.owner = threading.get_ident()
+            state.clock += 1
+            state.synced = False
+
+        def query(self):
+            return True
+
+        def elapsed_time(self, other):
+            if not state.synced:
+                raise RuntimeError("event read before stream synchronization")
+            if threading.get_ident() != self.owner:
+                raise RuntimeError("event read outside recording thread")
+            state.readers.append(threading.get_ident())
+            if self.value == 7 and other.value == 8 and invalid_norm is not None:
+                return invalid_norm
+            if self.value == 0 and other.value == 7 and invalid_offset is not None:
+                return invalid_offset
+            return float(other.value - self.value)
+
+    stream = Stream()
+    backend = NS(
+        Event=Event, current_stream=lambda _: stream, set_device=lambda _: None
+    )
+    return backend, state
+
+
 class ProfilingTests(unittest.TestCase):
     def setUp(self):
         self.mod = load_profiling()
@@ -108,6 +159,55 @@ class ProfilingTests(unittest.TestCase):
         return [
             json.loads(line) for line in Path(self.prof.path).read_text().splitlines()
         ]
+
+    def test_events_are_synchronized_read_and_released_before_each_rpc_returns(self):
+        backend, state = event_backend()
+        self.prof.backend = backend
+        owner = threading.get_ident()
+        step = self.prof.begin(schedule(), self.runner, 0)
+        self.prof.execute(step, lambda: self.model(torch.ones(1, 2)))
+        self.assertEqual(state.syncs, [owner])
+        self.assertTrue(state.readers)
+        self.assertEqual(set(state.readers), {owner})
+        self.assertTrue(all(ref() is None for ref in state.references))
+        self.prof.sample(lambda: self.model.logits_processor(torch.ones(1, 2)))
+        self.assertEqual(state.syncs, [owner, owner])
+        self.assertTrue(all(ref() is None for ref in state.references))
+        read_count = len(state.readers)
+        self.prof.flush()
+        self.assertEqual(len(state.readers), read_count)
+        row = self.rows()[0]
+        self.assertEqual(
+            row["event_resolution"], "recording_thread_stream_synchronized"
+        )
+        self.assertEqual(row["compute_wall_ms"], 10)
+        self.assertEqual(row["sample_device_ms"], 1)
+        self.assertEqual(row["final_norm_ms"], 1)
+
+    def test_negative_offset_is_rejected_even_when_inner_duration_is_positive(self):
+        self.addCleanup(lambda: self.prof.close(raise_errors=False))
+        self.prof.backend, _ = event_backend(invalid_offset=-179.43)
+        step = self.prof.begin(schedule(), self.runner, 10)
+        with self.assertRaisesRegex(ValueError, r"final_norm_ms.start.*-179.43"):
+            self.prof.execute(step, lambda: self.model(torch.ones(1, 2)))
+        self.assertFalse(self.rows())
+
+    def test_negative_or_nonfinite_endpoint_is_rejected_at_capture(self):
+        self.addCleanup(lambda: self.prof.close(raise_errors=False))
+        for invalid in (-0.001, -179.43, float("nan"), float("inf")):
+            with self.subTest(value=invalid):
+                self.prof.backend, _ = event_backend(invalid_norm=invalid)
+                step = self.prof.begin(schedule(), self.runner, 0)
+                with self.assertRaisesRegex(ValueError, "final_norm_ms"):
+                    self.prof.execute(step, lambda: self.model(torch.ones(1, 2)))
+                failure = json.loads(
+                    (
+                        Path(self.directory.name) / "pp_profile_failure_pp0_tp0.json"
+                    ).read_text()
+                )
+                self.assertIn(repr(invalid), failure["error"])
+                self.assertFalse(self.rows())
+                self.prof._error = None  # Next independent fixture; no bad row reused.
 
     def test_execute_and_sample_are_measured_once_without_rpc_gap(self):
         step = self.prof.begin(schedule(), self.runner, 0)
@@ -210,22 +310,10 @@ class ProfilingTests(unittest.TestCase):
         self.prof.execute(step, lambda: self.model(torch.ones(1, 2)))
 
     def test_gpu_like_send_waits_for_execute_completion_before_native_send(self):
-        import threading
-
         step = self.prof.begin(schedule(), self.runner, 0)
-        self.prof.execute(step, lambda: self.model(torch.ones(1, 2)))
         entered, ready = threading.Event(), threading.Event()
         calls, errors = [], []
-
-        class Completion:
-            def synchronize(self):
-                entered.set()
-                if not ready.wait(2):
-                    raise RuntimeError("fixture completion was not released")
-
-        original_end, original_backend = step.execute.end, self.prof.backend
-        step.execute.end = Completion()
-        self.prof.backend = object()  # Only the event dependency is doubled.
+        self.prof.backend, _ = event_backend(entered=entered, release=ready)
 
         def native_send(*_):
             calls.append("native_send")
@@ -235,6 +323,7 @@ class ProfilingTests(unittest.TestCase):
 
         def send():
             try:
+                self.prof.execute(step, lambda: self.model(torch.ones(1, 2)))
                 link.send({"x": torch.ones(2)}, 0)
             except Exception as error:
                 errors.append(error)
@@ -258,7 +347,6 @@ class ProfilingTests(unittest.TestCase):
         finally:
             ready.set()
             thread.join(2)
-            step.execute.end, self.prof.backend = original_end, original_backend
 
     def test_skipped_decoder_layer_fails_and_hooks_are_removed(self):
         step = self.prof.begin(schedule(), self.runner, 0)
@@ -485,7 +573,9 @@ class ProfilingTests(unittest.TestCase):
         # Rebuild the profiler's module map after changing the fixture model.
         self.prof.layers[0] = layer
         self.prof.backend = NS(
-            Event=Event, current_stream=lambda _: None, set_device=lambda _: None
+            Event=Event,
+            current_stream=lambda _: NS(npu_stream=1, synchronize=lambda: None),
+            set_device=lambda _: None,
         )
         entered, release = threading.Event(), threading.Event()
         resolve = self.prof._resolve
