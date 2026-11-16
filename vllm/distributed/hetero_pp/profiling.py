@@ -205,7 +205,42 @@ class _Capture:
             pairs[name] = (a, b)
             pairs[name + ".start"] = (self.start, a)
             pairs[name + ".end"] = (self.start, b)
-        values = {pair: self.elapsed(pair) for pair in dict.fromkeys(pairs.values())}
+        values = {}
+        completed: dict[str, float] = {}
+        for name, pair in pairs.items():
+            if pair not in values:
+                try:
+                    values[pair] = self.elapsed(pair)
+                except Exception as error:
+                    # Do not query, rerecord or retry an invalid Event. Preserve
+                    # the original API exception and already collected numbers.
+                    detail = {
+                        "pp_rank": self.profiler.rank,
+                        "step": self.step_id,
+                        "kind": self.kind,
+                        "field": name,
+                        "event_pair_indices": list(pair),
+                        "event_pair_handles": [
+                            self.event_handles[i] if i is not None else None
+                            for i in pair
+                        ]
+                        if self.profiler.backend is not None
+                        else None,
+                        "event_count": len(self._events),
+                        "stream_synchronized": self._stream is not None,
+                        "stream_ids": sorted(self.stream_ids),
+                        "record_thread_ids": sorted(self.record_thread_ids),
+                        "read_thread_id": threading.get_ident(),
+                        "completed_values_ms": completed,
+                        "host_record_order_ns": self.host_record_order_ns,
+                        "native_error": f"{type(error).__name__}: {error}",
+                    }
+                    raise RuntimeError(
+                        f"PP Event read failed: pp_rank={self.profiler.rank} "
+                        f"step={self.step_id} kind={self.kind} field={name}\n"
+                        f"diagnostics={json.dumps(detail, sort_keys=True)}"
+                    ) from error
+            completed[name] = values[pair]
         self._elapsed_cache = values
         self.resolved_by_thread_id = threading.get_ident()
         self.resolution_host_ms = (time.perf_counter_ns() - begin) / 1e6

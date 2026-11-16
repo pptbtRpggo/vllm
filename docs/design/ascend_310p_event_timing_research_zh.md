@@ -140,3 +140,23 @@ elapsed_ms = start.elapsed_time(end)
 后续实现已改成 RPC 结束时同步目标 stream，并在记录线程读取和释放 Event，
 后台只写数值快照（队列最多 8 条）。这是一条待真实 310P 验证的保守采集路径，
 不是已经确认负值根因或已经实机修复的结论；不对每层进行同步。
+
+## 8. 同步采集路径的实机反馈与后续诊断
+
+用户随后报告同一路径在 pp3 的 `profiling.py:254 elapsed` 中抛出
+`rtEventElapsedTime ... event timestamp invalid`，不再只是返回负值。
+这确认异常发生在本项目读取设备 Event 耗时的调用，而不是离线 DP 的非负检查；
+也说明上述同步路径没有解决实机问题。该行是所有配对共用的读取函数，
+仅凭此行和 pp3 仍无法区分总区间、某个 decoder layer、final norm 或起止偏移。
+LM head 已取消独立打点，不能因故障仍在最后 stage 就再次认定是 head 的独立计时。
+
+[CANN 9.1 错误码](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_1345.html)
+将 `ACL_ERROR_RT_EVENT_TIMESTAMP_INVALID` 定义为 107006，建议检查 Event 是否创建。
+这是通用排查提示，并非证明本项目没有创建 Event；当前 Python 源码确实每次 mark
+创建启用计时的 Event、record 后保留引用，读取循环结束前不清空列表。
+底层资源、实际 wheel 和 runtime 行为仍不能由 Python 引用关系单独证明正确。
+
+本次只补充失败配对的可读错误：rank、step、execute/sample、测量字段、
+两侧 marker/原生句柄、已完成的读数和原始异常链。失败后不再查询、重录或重试，
+不发布失败记录；同步方式、计时来源及数值门限不变。
+相关回归使用主动注入异常的 CPU Event fixture，只验证诊断行为，不冒充真实 NPU 复现。

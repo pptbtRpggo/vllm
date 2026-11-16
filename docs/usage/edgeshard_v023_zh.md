@@ -116,6 +116,9 @@ SHA、读取内存证据，并完成服务收尾后，才写 `profile_manifest.j
 后台队列只保留数值快照，最多 8 条待写记录，不调用 NPU Event API。
 raw 和完成回执中的 `event_resolution=recording_thread_stream_synchronized`
 用于区别旧后台读取版本。负值、非有限值或明显越界会在采集时直接拒绝并保存诊断。
+如果底层 `elapsed_time()` 本身报错，日志会另打印 `PP Event read failed`，
+包含 `pp_rank / step / kind / field`，并保留失败 Event 配对、已读取数值及原始异常。
+只需提供这一行就能确定失败的测量字段；这项错误信息补充不代表修复了底层时间戳问题。
 错误原值不会用绝对值或大负值归零代替；守恒计算原先的 0.01 ms 浮点容差不变，
 并额外保存 `raw_non_layer_compute_ms` / `raw_runner_overhead_ms`。
 

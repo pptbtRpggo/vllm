@@ -83,7 +83,13 @@ def schedule():
 
 
 def event_backend(
-    *, invalid_norm=None, invalid_offset=None, entered=None, release=None
+    *,
+    invalid_norm=None,
+    invalid_offset=None,
+    entered=None,
+    release=None,
+    read_error=None,
+    failed_pair=None,
 ):
     """CPU Event double enforcing the device API ordering/thread contract."""
     state = NS(clock=0, synced=False, readers=[], syncs=[], references=[])
@@ -105,6 +111,7 @@ def event_backend(
 
         def record(self, stream):
             self.value = state.clock
+            self.npu_event = 1000 + self.value
             self.owner = threading.get_ident()
             state.clock += 1
             state.synced = False
@@ -118,6 +125,8 @@ def event_backend(
             if threading.get_ident() != self.owner:
                 raise RuntimeError("event read outside recording thread")
             state.readers.append(threading.get_ident())
+            if (self.value, other.value) == failed_pair:
+                raise read_error
             if self.value == 7 and other.value == 8 and invalid_norm is not None:
                 return invalid_norm
             if self.value == 0 and other.value == 7 and invalid_offset is not None:
@@ -191,6 +200,33 @@ class ProfilingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"final_norm_ms.start.*-179.43"):
             self.prof.execute(step, lambda: self.model(torch.ones(1, 2)))
         self.assertFalse(self.rows())
+
+    def test_event_api_failure_identifies_pair_without_retrying_or_publishing(self):
+        self.addCleanup(lambda: self.prof.close(raise_errors=False))
+        native_error = RuntimeError("rtEventElapsedTime: event timestamp invalid")
+        self.prof.backend, state = event_backend(
+            read_error=native_error, failed_pair=(3, 4)
+        )
+        step = self.prof.begin(schedule(), self.runner, 10)
+        with self.assertRaisesRegex(RuntimeError, "PP Event read failed") as caught:
+            self.prof.execute(step, lambda: self.model(torch.ones(1, 2)))
+        self.assertIs(caught.exception.__cause__, native_error)
+        detail = json.loads(str(caught.exception).split("\ndiagnostics=", 1)[1])
+        self.assertEqual(detail["field"], "layer_compute_ms[0]")
+        self.assertEqual(detail["event_pair_indices"], [3, 4])
+        self.assertEqual(detail["event_pair_handles"], [1003, 1004])
+        self.assertEqual(detail["pp_rank"], 0)
+        self.assertEqual(detail["step"], 10)
+        self.assertEqual(detail["kind"], "execute")
+        self.assertTrue(detail["stream_synchronized"])
+        self.assertEqual(detail["completed_values_ms"]["total_ms"], 9)
+        self.assertEqual(len(state.readers), 5)
+        self.assertFalse(self.rows())
+        failure = json.loads(
+            (Path(self.directory.name) / "pp_profile_failure_pp0_tp0.json").read_text()
+        )
+        self.assertIn("event timestamp invalid", failure["error"])
+        self.assertIn("field=layer_compute_ms[0]", failure["error"])
 
     def test_negative_or_nonfinite_endpoint_is_rejected_at_capture(self):
         self.addCleanup(lambda: self.prof.close(raise_errors=False))
