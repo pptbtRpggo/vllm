@@ -78,8 +78,10 @@ class ProfileCLITests(unittest.TestCase):
                 args.objective,
                 args.pipeline_parallel_size,
                 args.tensor_parallel_size,
+                args.output_len,
+                args.workload_kind,
             ),
-            ("layer-measured", "latency", 4, 1),
+            ("layer-measured", "latency", 4, 1, 1, "prefill"),
         )
 
     def test_changed_parallelism_async_and_missing_trace_are_rejected(self):

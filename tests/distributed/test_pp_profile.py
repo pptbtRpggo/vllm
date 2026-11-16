@@ -435,6 +435,12 @@ class ProfileControllerTests(unittest.TestCase):
         )
         self.assertEqual(len(plan.partitions), 4)
         self.assertEqual(sum(plan.partitions), 8)
+        receipt = json.loads(
+            (self.directory / "recommendation_receipt.json").read_text()
+        )
+        saved_plan = json.loads((self.directory / "pp_partition_plan.json").read_text())
+        self.assertEqual(receipt["workload"], "prefill")
+        self.assertEqual(saved_plan["workload"], "prefill")
         recommended = json.loads(
             (self.directory / "recommended_hetero_plan.json").read_text()
         )

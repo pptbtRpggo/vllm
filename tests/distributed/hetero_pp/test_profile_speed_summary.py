@@ -22,13 +22,14 @@ SCRIPT = (
 def write_trace(directory, *, defect=None):
     directory.mkdir()
     rows: list[list[dict]] = [[] for _ in range(4)]
-    # One warmup, then speeds 8 / 2 / 4 Gbps; weighted speed is 4 Gbps.
+    # Prefill speeds 8 / 2 Gbps; ignore warmup, decode and mixed steps.
     for step, (payload, duration, ctx, gen) in enumerate(
         [
             (1_000_000, 100_000, 4, 0),
             (1_000_000, 1_000_000, 4, 0),
             (500_000, 2_000_000, 0, 4),
             (500_000, 1_000_000, 2, 2),
+            (500_000, 2_000_000, 4, 0),
         ]
     ):
         for rank in range(4):
@@ -152,30 +153,31 @@ def run_summary(directory):
     )
 
 
-def test_speed_summary_excludes_warmup_and_distinguishes_weighted_mean(tmp_path):
+def test_prefill_speed_summary_excludes_other_phases_and_distinguishes_means(tmp_path):
     directory = tmp_path / "trace with spaces"
     write_trace(directory)
     result = run_summary(directory)
     assert result.returncode == 0, result.stderr
     with (directory / "communication_speed_summary.csv").open() as stream:
         rows = list(csv.DictReader(stream))
-    assert len(rows) == 12  # Three links, all/prefill/decode/mixed.
-    for row in (r for r in rows if r["phase"] == "all"):
-        assert int(row["samples"]) == 3
-        assert float(row["mean_gbps"]) == pytest.approx(14 / 3)
+    assert len(rows) == 3
+    assert {r["phase"] for r in rows} == {"prefill"}
+    for row in rows:
+        assert int(row["samples"]) == 2
+        assert float(row["mean_gbps"]) == pytest.approx(5)
         assert float(row["aggregate_gbps"]) == pytest.approx(4)
         for key, expected in {
-            "p10_gbps": 2.4,
-            "p50_gbps": 4,
-            "p90_gbps": 7.2,
-            "p95_gbps": 7.6,
-            "p99_gbps": 7.92,
+            "p10_gbps": 2.6,
+            "p50_gbps": 5,
+            "p90_gbps": 7.4,
+            "p95_gbps": 7.7,
+            "p99_gbps": 7.94,
         }.items():
             assert float(row[key]) == pytest.approx(expected)
     with (directory / "communication_speed_samples.csv").open() as stream:
         samples = list(csv.DictReader(stream))
-    assert len(samples) == 9
-    assert {row["phase"] for row in samples} == {"prefill", "decode", "mixed"}
+    assert len(samples) == 6
+    assert {row["phase"] for row in samples} == {"prefill"}
     assert "stage1->2" in result.stdout
 
 
@@ -215,25 +217,25 @@ def test_timing_table_uses_device_compute_and_sender_ack_windows(tmp_path):
     assert result.returncode == 0, result.stderr
     with (directory / "stage_and_link_timing_summary.csv").open() as stream:
         rows = list(csv.DictReader(stream))
-    assert len(rows) == 28  # Four stages + three links, four phase groups.
+    assert len(rows) == 7  # Four stages + three links, prefill only.
+    assert {r["phase"] for r in rows} == {"prefill"}
     lookup = {(r["item"], r["phase"]): r for r in rows}
     for rank in range(4):
-        row = lookup[(f"stage{rank}", "all")]
+        row = lookup[(f"stage{rank}", "prefill")]
         assert row["kind"] == "compute"
-        assert int(row["samples"]) == 3
-        assert float(row["mean_ms"]) == pytest.approx(20 * (rank + 1))
-        assert float(row["p90_ms"]) == pytest.approx(28 * (rank + 1))
-        assert float(lookup[(f"stage{rank}", "decode")]["mean_ms"]) == 20 * (rank + 1)
+        assert int(row["samples"]) == 2
+        assert float(row["mean_ms"]) == pytest.approx(25 * (rank + 1))
+        assert float(row["p90_ms"]) == pytest.approx(37 * (rank + 1))
     for rank in range(3):
-        row = lookup[(f"stage{rank}->{rank + 1}", "all")]
+        row = lookup[(f"stage{rank}->{rank + 1}", "prefill")]
         assert row["kind"] == "handoff"
-        assert float(row["mean_ms"]) == pytest.approx(4 / 3)
-        assert float(row["p50_ms"]) == 1
-        assert float(row["p90_ms"]) == pytest.approx(1.8)
-        assert float(row["p95_ms"]) == pytest.approx(1.9)
-        assert float(row["p99_ms"]) == pytest.approx(1.98)
+        assert float(row["mean_ms"]) == 1.5
+        assert float(row["p50_ms"]) == 1.5
+        assert float(row["p90_ms"]) == pytest.approx(1.9)
+        assert float(row["p95_ms"]) == pytest.approx(1.95)
+        assert float(row["p99_ms"]) == pytest.approx(1.99)
     with (directory / "stage_compute_samples.csv").open() as stream:
-        assert len(list(csv.DictReader(stream))) == 12
+        assert len(list(csv.DictReader(stream))) == 8
     for label in ("stage0", "stage1", "stage2", "stage3", "计算与交接耗时"):
         assert label in result.stdout
 
@@ -300,10 +302,12 @@ def test_profile_automatically_summarizes_only_after_success(tmp_path, collect_e
     assert "--comm-timing ack" in captured[0]
     assert "--gpu-memory-utilization 0.7" in captured[0]
     assert "--max-num-seqs 8" in captured[0]
+    assert "--output-len 1 " in captured[0]
     summaries = list((tmp_path / "shared").glob("*/communication_speed_summary.csv"))
     if collect_exit:
         assert len(captured) == 1 and not summaries
     else:
         assert len(captured) == 2 and len(summaries) == 1
         assert "--skip-run" in captured[1]
+        assert "--objective latency --workload prefill" in captured[1]
         assert "stage1->2" in result.stdout

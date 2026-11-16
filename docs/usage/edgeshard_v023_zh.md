@@ -62,7 +62,7 @@ test ! -e "$TRACE"
 "$PY" -m vllm.entrypoints.cli.main pp-profile "$MODEL" \
   --hetero-plan "$PLAN" --trace-dir "$TRACE" --collect-only \
   --compute-model layer-measured --comm-timing ack \
-  --input-len 64 --output-len 16 --num-prompts 4 \
+  --input-len 64 --output-len 1 --num-prompts 4 \
   --num-iters-warmup 1 --num-iters 2 --seed 7 \
   --dtype float16 --enforce-eager --no-async-scheduling \
   --max-model-len 512 --max-num-batched-tokens 256 --max-num-seqs 4 \
@@ -78,7 +78,9 @@ test ! -e "$TRACE"
 
 这个例子中，每次 `generate()` 输入四条合成 token prompt：一轮 warmup，
 两轮正式采集。warmup 与正式 prompt 不同，正式迭代之间的 prompt 也不同。
-输出固定 16 token、`ignore_eos=True`、greedy；这不是完整 GSM8K 题目或模型质量评测。
+每请求只输出首个 token（`max_tokens=1`、`ignore_eos=True`、greedy），
+到首 token 即结束，不做后续 decode。统计和切分推荐均只使用纯 prefill 样本，
+不混入 decode 或 mixed step；这不是完整 GSM8K 题目或模型质量评测。
 `--num-prompts 4` 是采集负载的批量参数，不是原研究实验每点 128 请求的那套协议。
 
 采集参数由 head 显式传给 Ray actors；不能只指望已启动的 Ray daemon
@@ -228,43 +230,32 @@ raw 中 `device_id` / `profile_device_id` 是全局 profiling 身份 `0/1/2/3`�
 用于把设备成本与 stage 绑定；`local_device_id` 才是节点内逻辑卡号，
 可能为 `0/1/0/1`。两者都不是可随意替换的物理 PCI 卡号。
 
-## 4. 离线规划：同一份 raw，可以看两个目标
+## 4. 离线规划：只用 prefill 成本推荐层数
 
 `--skip-run` 不加载模型、不占 NPU，只校验既有证据并做 DP。
 它拒绝没有本分支 manifest 的旧 trace，也拒绝 session、源码、topology、
 config、transport 或 raw SHA 不匹配的数据。
 
-下面为两个目标各复制一份小型采集证据，避免它们的推荐文件和派生回执互相覆盖。
+下面复制一份小型采集证据，保留原采集目录，单独生成 prefill latency 推荐。
 这不产生新测量，不重复运行 warmup 或请求。
 
 ```bash
 export LATENCY=/shared/path/edgeshard_analysis_latency_run001
-export BOTTLENECK=/shared/path/edgeshard_analysis_bottleneck_run001
 test ! -e "$LATENCY"
-test ! -e "$BOTTLENECK"
 cp -a "$TRACE" "$LATENCY"
-cp -a "$TRACE" "$BOTTLENECK"
 
 "$PY" -m vllm.entrypoints.cli.main pp-profile \
   --hetero-plan "$PLAN" --trace-dir "$LATENCY" \
-  --skip-run --objective latency --workload all \
+  --skip-run --objective latency --workload prefill \
   --output-json "$LATENCY/latency_plan.json"
-
-"$PY" -m vllm.entrypoints.cli.main pp-profile \
-  --hetero-plan "$PLAN" --trace-dir "$BOTTLENECK" \
-  --skip-run --objective throughput --workload all \
-  --output-json "$BOTTLENECK/bottleneck_plan.json"
 ```
 
-两个目标的含义：
+本次只考虑首 token：`prefill + latency` 最小化 prefill 的各 stage 代表性计算成本之和，
+加相邻 hop 的 prefill 实测交接成本。首 token 所需的末 stage 工作仍计入总成本。
+规划 JSON 和 `recommendation_receipt.json` 会记录 `workload=prefill`。
+该模型不包含完整 HTTP、排队、动态调度和请求到达过程，不能直接等同于用户端实测 TTFT。
 
-- **`latency`，默认目标**：最小化各 stage 代表性计算成本之和，加相邻 hop 的实测通信成本。
-  它不包含完整 HTTP、排队、动态调度和请求到达过程，不是用户端 E2E 的预测器。
-- **`throughput`**：比较最慢 stage 的 `recv + compute + send` 占用成本。
-  这是有足够在途工作时的 stage 瓶颈候选模型；当前执行器只有一个在执行的
-  scheduler batch，不能把它称作本执行器实测吞吐最优，也不能据此宣称性能提升。
-
-默认 `microbatch` 汇总让每个观测到的 step 等权。
+默认 `microbatch` 汇总让每个入选的非预热 prefill step 等权。
 设备上的“代表层耗时”来自本机已加载层的均值；把它用于其他同结构层是模型近似，
 不是所有层都在所有卡上实测过。换负载、batch/context 分布或执行模式，要重新评估代表性。
 

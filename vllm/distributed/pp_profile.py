@@ -669,12 +669,15 @@ def _collect(*, directory, topology, args, llm_factory, workload, memory):
     return manifest, memory
 
 
-def write_profile_result(plan, dump_dir, output_json=None):
+def write_profile_result(plan, dump_dir, output_json=None, *, workload_kind=None):
     path = (
         Path(output_json) if output_json else Path(dump_dir) / "pp_partition_plan.json"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    _write(path, plan.to_dict())
+    content = plan.to_dict()
+    if workload_kind is not None:
+        content["workload"] = workload_kind
+    _write(path, content)
     return path
 
 
@@ -688,13 +691,13 @@ def profile_pp_partition(
     workload=None,
     num_prompts=16,
     input_len=256,
-    output_len=32,
+    output_len=1,
     num_iters=3,
     num_iters_warmup=1,
     seed=0,
     vocab_size=32000,
     objective="latency",
-    workload_kind="all",
+    workload_kind="prefill",
     warmup_steps=0,
     num_layers=None,
     min_pp_size=4,
@@ -807,7 +810,7 @@ def profile_pp_partition(
         device_selection=False,
         layer_aggregation=layer_aggregation,
     )
-    write_profile_result(plan, directory, output_json)
+    write_profile_result(plan, directory, output_json, workload_kind=workload_kind)
     recommendation = copy.deepcopy(topology)
     for stage, count in zip(recommendation["stages"], plan.partitions):
         stage["layers"] = count
@@ -826,6 +829,7 @@ def profile_pp_partition(
             ),
             "plan_content_sha256": _digest(plan.to_dict()),
             "objective": objective,
+            "workload": workload_kind,
             "trace_off_validation_required": True,
             "measured_performance_improvement": False,
         },
@@ -938,7 +942,7 @@ def add_cli_args(parser):
         ),
     )
     parser.add_argument("--input-len", type=int, default=256)
-    parser.add_argument("--output-len", type=int, default=32)
+    parser.add_argument("--output-len", type=int, default=1)
     parser.add_argument("--num-prompts", type=int, default=16)
     parser.add_argument("--num-iters", type=int, default=3)
     parser.add_argument("--num-iters-warmup", type=int, default=1)
@@ -956,7 +960,11 @@ def add_cli_args(parser):
         "--workload",
         dest="workload_kind",
         choices=("all", "prefill", "decode", "mixed"),
-        default="all",
+        default="prefill",
+        help=(
+            "Cost samples used for planning; "
+            "defaults to prefill for first-token latency."
+        ),
     )
     parser.add_argument(
         "--compute-model", choices=("layer-measured",), default="layer-measured"

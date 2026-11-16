@@ -80,6 +80,8 @@ for rank in range(3):
         if any(type(n) is not int or n < 0 for n in (ctx, gen)) or ctx + gen == 0:
             raise ValueError("缺少有效的 prefill/decode token 计数")
         phase = "mixed" if ctx and gen else "prefill" if ctx else "decode"
+        if phase != "prefill":
+            continue
         payload, elapsed = sender["send_bytes"], timing["send_ack_ms"]
         handoff_samples.append(dict(
             item=f"stage{rank}->{rank + 1}", kind="handoff", phase=phase,
@@ -116,6 +118,8 @@ for rank, rows in enumerate(by_rank):
             raise ValueError(f"stage{rank} step{step} 设备计算区间不守恒")
         ctx, gen = record["num_ctx_tokens"], record["num_generation_tokens"]
         phase = "mixed" if ctx and gen else "prefill" if ctx else "decode"
+        if phase != "prefill":
+            continue
         compute_samples.append(dict(
             item=f"stage{rank}", kind="compute", phase=phase, step=step,
             elapsed_ms=elapsed, execute_device_ms=execute, sample_device_ms=sample,
@@ -124,10 +128,10 @@ for rank, rows in enumerate(by_rank):
 timing_summary = []
 items = [f"stage{rank}" for rank in range(4)] + [
     f"stage{rank}->{rank + 1}" for rank in range(3)]
-for phase in ("all", "prefill", "decode", "mixed"):
+for phase in ("prefill",):
     for item in items:
         group = [s for s in compute_samples + handoff_samples
-                 if s["item"] == item and (phase == "all" or s["phase"] == phase)]
+                 if s["item"] == item and s["phase"] == phase]
         if not group:
             continue
         durations = sorted(s["elapsed_ms"] for s in group)
@@ -144,9 +148,9 @@ for rank in range(3):
     link = f"stage{rank}->{rank + 1}"
     link_samples = [s for s in samples if s["link"] == link]
     if not link_samples:
-        raise ValueError(f"{link} 没有非预热、正 payload 的有效交接样本")
-    for phase in ("all", "prefill", "decode", "mixed"):
-        group = [s for s in link_samples if phase == "all" or s["phase"] == phase]
+        raise ValueError(f"{link} 没有非预热、正 payload 的 prefill 交接样本")
+    for phase in ("prefill",):
+        group = [s for s in link_samples if s["phase"] == phase]
         if not group:
             continue
         speeds = sorted(s["speed_gbps"] for s in group)
@@ -172,7 +176,7 @@ for name, rows in (("communication_speed_samples.csv", samples),
         writer.writeheader()
         writer.writerows(rows)
 
-print("\n计算与交接耗时（ms；每个调度 step/链路交接一个样本，预热排除）")
+print("\nPrefill 计算与交接耗时（ms；每个 step/链路交接一个样本，预热排除）")
 print(f"{'Item':<12} {'Type':<8} {'Phase':<8} {'N':>5} "
       f"{'Mean':>9} {'P50':>9} {'P90':>9} {'P95':>9} {'P99':>9}")
 print("-" * 90)
@@ -198,7 +202,7 @@ for row in summary:
     print(f"{row['link']:<12} {row['phase']:<8} {row['samples']:5d} {numbers}")
 print("均值=逐交接速率算术平均；汇总速率=总字节/各交接耗时之和，不是墙钟吞吐。")
 print("分位数按速率排序后线性插值；P10 表示慢侧，P90/P99 表示快侧。")
-print("all 混合不同 payload；阶段行按真实 token 计数区分，mixed 为混合 step。")
+print("仅统计纯 prefill step；decode 和 mixed 不参与本表或 TTFT 切分推荐。")
 print("采集轮次少时分位数仅为描述性统计，不代表稳定链路性能。")
 print(f"统计表：{directory / 'communication_speed_summary.csv'}")
 print(f"逐交接：{directory / 'communication_speed_samples.csv'}")
@@ -217,8 +221,8 @@ PY 是当前能运行异构 vLLM 的 Python 路径；默认当前虚拟环境或
 Ray 必须已连接，两边使用匹配的项目代码与环境，四张卡供本次采集使用。
 TRACE_ROOT 为本地结果根目录；采集结束后自动通过已有 Ray 回收 peer 原始记录。
 
-流程：4 条合成输入，1 轮预热 + 2 轮采集，打印耗时和通信速率表，再离线 DP 推荐层数。
-统计排除预热，按四 stage/三条链路及 prefill/decode/mixed 分组，保存汇总与逐步 CSV。
+流程：4 条合成输入，1 轮预热 + 2 轮采集，每请求只输出首个 token，不做后续 decode。
+只统计 prefill 的四 stage/三链路成本并做 latency DP，排除预热，保存汇总与逐步 CSV。
 使用 ACK 测通信，默认固定 64 个 KV blocks；这是小规模流程验证，不是 GSM8K 压测。
 统一 --profile 入口会传入上下文、token budget、max seq、显存比例及 KV block 配置。
 不启动/停止 Ray，不安装依赖，不自动切换服务到推荐配置。
@@ -246,12 +250,12 @@ mkdir -p -- "$TRACE_ROOT"
 TRACE=$(mktemp -d "$TRACE_ROOT/edgeshard_$(date +%Y%m%d_%H%M%S)_XXXXXX")
 echo "本轮结果：$TRACE"
 echo "日志：$TRACE.log"
-echo '1/3 采集计算、通信和内存成本（请勿同时运行其他占卡任务）'
+echo '1/3 采集 prefill 至首 token 的成本（每请求输出 1 token；请勿同时运行其他占卡任务）'
 # 日志放在 trace 目录外，保证 collector 启动前目录为空。
 "$PY" -m vllm.entrypoints.cli.main pp-profile "$MODEL" \
   --hetero-plan "$PLAN" --trace-dir "$TRACE" --collect-only \
   --compute-model layer-measured --comm-timing ack \
-  --input-len 64 --output-len 16 --num-prompts 4 \
+  --input-len 64 --output-len 1 --num-prompts 4 \
   --num-iters-warmup 1 --num-iters 2 --seed 7 \
   --dtype float16 --enforce-eager --no-async-scheduling \
   --max-model-len "${PROFILE_MAX_MODEL_LEN:-512}" \
@@ -262,13 +266,13 @@ echo '1/3 采集计算、通信和内存成本（请勿同时运行其他占卡�
   --gpu-memory-utilization "${PROFILE_GPU_MEMORY_UTILIZATION:-0.5}" \
   --enable-chunked-prefill --no-enable-prefix-caching 2>&1 | tee "$TRACE.log"
 
-echo '2/3 打印各 stage 计算、链路交接耗时及有效速率表（不占 NPU）'
+echo '2/3 打印 prefill 的 stage 计算、链路交接耗时及有效速率表（不占 NPU）'
 profile_statistics "$TRACE" 2>&1 | tee -a "$TRACE.log"
 
-echo '3/3 离线 DP 推荐层数（不占 NPU）'
+echo '3/3 仅以 prefill latency 做离线 DP 推荐（不占 NPU）'
 "$PY" -m vllm.entrypoints.cli.main pp-profile \
   --hetero-plan "$PLAN" --trace-dir "$TRACE" \
-  --skip-run --objective latency --workload all \
+  --skip-run --objective latency --workload prefill \
   --output-json "$TRACE/latency_plan.json" 2>&1 | tee -a "$TRACE.log"
 
 echo "采集与规划完成：$TRACE"

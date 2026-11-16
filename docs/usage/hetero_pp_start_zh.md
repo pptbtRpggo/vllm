@@ -95,6 +95,8 @@ bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
 结束自己上一轮的服务容器后再开始，不要并行占用同四张卡。
 
 脚本自动连接 Ray、采集、回收 peer 记录、打印计算/交接耗时和速率表并生成 DP 推荐。
+本次 profiling 每请求只输出首个 token，随后结束，不继续 decode；
+打印表和 DP 都只使用 prefill 样本，以 `latency` 目标推荐层数。
 两边先写本地文件，master 在采集结束后通过已有 Ray RPC 收回 peer 原始 JSONL 和
 完成回执并校验 SHA，再统计和运行 DP；不需要 SSH/SCP、密钥或共享存储。
 每 rank 原始文件导出上限 64 MiB，超过会报错并保留原件，不截断数据。
