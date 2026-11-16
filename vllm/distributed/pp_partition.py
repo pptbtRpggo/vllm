@@ -68,6 +68,8 @@ class RankCost:
     t_final_norm_ms: float | None = None
     phase_summary: tuple[dict[str, Any], ...] = ()
     layer_aggregation: str = "microbatch"
+    # Unseparated head work is already in t_fixed_ms; this device must stay last.
+    head_in_fixed_cost: bool = False
 
 
 @dataclass(frozen=True)
@@ -169,6 +171,7 @@ class PPPartitionPlan:
                     "shape_fits": list(cost.shape_fits),
                     "t_embedding_ms": cost.t_embedding_ms,
                     "t_head_ms": cost.t_head_ms,
+                    "head_in_fixed_cost": cost.head_in_fixed_cost,
                     "t_final_norm_ms": cost.t_final_norm_ms,
                     "phase_summary": list(cost.phase_summary),
                     "layer_aggregation": cost.layer_aggregation
@@ -334,14 +337,22 @@ def _compute_ms(
     if cost.compute_model == "layer-measured":
         if total_layers is None:
             total_layers = sum(c.n_layers for c in costs)
+        is_last = start_layer + n_layers == total_layers
+        if cost.head_in_fixed_cost:
+            if cost.t_head_ms is not None:
+                raise ValueError("head cost cannot be both separate and fixed")
+            if not is_last:
+                return _INF
         if start_layer == 0:
             if cost.t_embedding_ms is None:
                 return _INF
             compute += cost.t_embedding_ms
-        if start_layer + n_layers == total_layers:
-            if cost.t_head_ms is None or cost.t_final_norm_ms is None:
+        if is_last:
+            if cost.t_final_norm_ms is None or (
+                cost.t_head_ms is None and not cost.head_in_fixed_cost
+            ):
                 return _INF
-            compute += cost.t_head_ms + cost.t_final_norm_ms
+            compute += (cost.t_head_ms or 0.0) + cost.t_final_norm_ms
     return compute
 
 
@@ -646,10 +657,15 @@ def format_plan(plan: PPPartitionPlan) -> str:
     if plan.compute_model == "layer-measured":
         lines.append(
             "DP uses one representative layer mean per device, explicit endpoint "
-            "times and runner overhead. "
+            "times where available and fixed stage work. "
             f"Aggregation: {plan.rank_costs[0].layer_aggregation}; "
             "serving performance still requires validation."
         )
+        if any(c.head_in_fixed_cost for c in plan.rank_costs):
+            lines.append(
+                "LM head is not timed separately; its work is retained in the "
+                "last device's fixed cost. That device cannot become a middle stage."
+            )
     if plan.compute_model == "shape-affine":
         lines.append(
             "Shape-weighted mean resource demand; not finite-workload E2E throughput. "

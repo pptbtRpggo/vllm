@@ -104,6 +104,14 @@ def _validate_layer_record(row, pp_size):
         raise ValueError("trace PP size does not match its ranks")
     if row.get("tp_size") != 1 or row.get("tp_rank") != 0:
         raise ValueError("layer-measured currently requires TP=1")
+    head_timing = row.get("lm_head_timing", "separate")
+    if head_timing not in ("separate", "included_in_stage_residual"):
+        raise ValueError("unknown head timing mode")
+    if (
+        head_timing == "included_in_stage_residual"
+        and row.get("lm_head_ms") is not None
+    ):
+        raise ValueError("unseparated head timing cannot also have lm_head_ms")
     scale = row.get("compute_scale", 1.0)
     if type(scale) not in (int, float) or not math.isfinite(scale) or scale <= 0:
         raise ValueError("invalid compute scale in layer trace")
@@ -171,6 +179,15 @@ def measured_layer_rank_costs(
         rows = [r for group in groups.values() for r in group]
         for row in rows:
             _validate_layer_record(row, len(ranks))
+        head_modes = {r.get("lm_head_timing", "separate") for r in rows}
+        if len(head_modes) != 1:
+            raise ValueError(f"profiles mix head timing modes for device {rank}")
+        last_roles = {r["pp_rank"] == len(ranks) - 1 for r in rows}
+        head_in_fixed = (
+            head_modes == {"included_in_stage_residual"} and True in last_roles
+        )
+        if head_in_fixed and last_roles != {True}:
+            raise ValueError("unseparated head cost cannot mix last and middle roles")
         # These rows have already been grouped by stable device identity, not
         # stage rank. Reordered runs may use different roles/links, but must
         # describe the same compute environment on each device.
@@ -234,6 +251,7 @@ def measured_layer_rank_costs(
                 profiled_pp_size=len(ranks),
                 phase_summary=summary,
                 layer_aggregation=layer_aggregation,
+                head_in_fixed_cost=head_in_fixed,
             )
         )
     return costs

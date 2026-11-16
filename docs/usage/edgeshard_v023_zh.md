@@ -101,6 +101,14 @@ test ! -e "$TRACE"
 SHA、读取内存证据，并完成服务收尾后，才写 `profile_manifest.json` 的完整回执。
 发生错误时保留原目录诊断，不能把失败目录清空后当同一轮重试成功。
 
+当前采集不再给 `logits_processor`（输出 head）安装独立计时 hook。
+`lm_head_ms` 为 `null`，`lm_head_timing=included_in_stage_residual`；
+它不是零耗时，仍包含在 `execute + sample` 的 stage 总耗时以及未拆分开销中。
+规划器将末 stage 的这笔开销保留在 `t_fixed_ms`，并标记
+`head_in_fixed_cost=true`，只调整 decoder 层数，不把该设备改作中间 stage。
+旧的独立 head 计时记录仍可单独分析，但不能与新口径混合拟合。
+逐层、stage 总区间和通信的校验继续保留；取消 head 拆分并不证明设备计时故障已修复。
+
 ### 2.1 单文件脚本与通信速率统计
 
 如果尚未启动容器和 Ray，优先按

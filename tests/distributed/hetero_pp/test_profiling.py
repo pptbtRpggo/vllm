@@ -118,7 +118,7 @@ class ProfilingTests(unittest.TestCase):
         row = self.rows()[0]
         self.assertEqual(set(row["layer_compute_ms"]), {"0", "1"})
         self.assertTrue(row["sample_called"])
-        self.assertIsNotNone(row["lm_head_ms"])
+        self.assertIsNone(row["lm_head_ms"])
         self.assertAlmostEqual(
             row["compute_wall_ms"], row["execute_device_ms"] + row["sample_device_ms"]
         )
@@ -142,6 +142,31 @@ class ProfilingTests(unittest.TestCase):
         self.assertFalse(row["sample_called"])
         self.assertEqual(row["sample_device_ms"], 0)
         self.assertIsNone(row["lm_head_ms"])
+
+    def test_head_is_unhooked_but_its_work_remains_in_stage_total(self):
+        clock, hooks = [0], []
+        head = self.model.logits_processor
+
+        def forward(x):
+            hooks.append((len(head._forward_pre_hooks), len(head._forward_hooks)))
+            clock[0] += 100_000_000
+            return x
+
+        with (
+            patch.object(self.mod.time, "perf_counter_ns", lambda: clock[0]),
+            patch.object(head, "forward", side_effect=forward),
+        ):
+            step = self.prof.begin(schedule(), self.runner, 0)
+            x = self.prof.execute(step, lambda: self.model(torch.ones(1, 2)))
+            self.prof.sample(lambda: head(x))
+            self.prof.flush()
+        row = self.rows()[0]
+        self.assertEqual(hooks, [(0, 0)])
+        self.assertIsNone(row["lm_head_ms"])
+        self.assertEqual(row["lm_head_timing"], "included_in_stage_residual")
+        self.assertEqual(row["sample_device_ms"], 100)
+        self.assertEqual(row["compute_wall_ms"], 100)
+        self.assertEqual(row["runner_overhead_ms"], 100)
 
     def test_warmup_and_layer_records_are_snapshotted_before_next_step(self):
         self.prof.is_warmup = True

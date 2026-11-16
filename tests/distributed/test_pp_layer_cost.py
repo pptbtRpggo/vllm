@@ -134,6 +134,57 @@ def test_missing_endpoint_is_unavailable_not_free():
         partition_layers(costs, allow_unchecked_memory=True)
 
 
+def bundled_head_trace():
+    records = layer_trace()
+    for rows in records.values():
+        for row in rows:
+            row["lm_head_timing"] = "included_in_stage_residual"
+            row["runner_overhead_ms"] += row["lm_head_ms"] or 0
+            row["lm_head_ms"] = None
+    return records
+
+
+def test_unseparated_head_is_retained_in_last_stage_cost_and_export():
+    costs = aggregate([bundled_head_trace()])
+    assert costs[1].t_head_ms is None
+    assert costs[1].t_fixed_ms == 8.5  # Head 8 ms plus original 0.5 ms.
+    plan = partition_layers(costs, allow_unchecked_memory=True)
+    assert plan.partitions == [7, 1]
+    payload = plan.to_dict()
+    assert payload["predicted_stage_compute_ms"] == [18.5, 14.5]
+    assert payload["rank_costs"][1]["head_in_fixed_cost"] is True
+
+
+def test_unseparated_head_cost_cannot_be_used_as_a_middle_stage():
+    import math
+
+    from vllm.distributed.pp_partition import _compute_ms
+
+    costs = aggregate([bundled_head_trace()])
+    assert math.isinf(_compute_ms(costs, 1, 2, start_layer=2, total_layers=8))
+
+
+def test_mixed_head_timing_modes_are_rejected():
+    with pytest.raises(ValueError, match="head timing"):
+        aggregate([layer_trace(), bundled_head_trace()])
+
+
+def test_head_in_residual_cannot_also_claim_a_separate_measurement():
+    records = bundled_head_trace()
+    records[1][0]["lm_head_ms"] = 0
+    with pytest.raises(ValueError, match="cannot also have lm_head_ms"):
+        aggregate([records])
+
+
+def test_unseparated_head_cannot_mix_last_and_middle_roles_on_one_device():
+    primary, rotated = bundled_head_trace(), bundled_head_trace()
+    for rank, rows in rotated.items():
+        for row in rows:
+            row["profile_device_id"] = 1 - rank
+    with pytest.raises(ValueError, match="head.*role"):
+        aggregate([primary, rotated])
+
+
 def test_offline_planner_layer_mode(tmp_path):
     for rank, rows in layer_trace().items():
         write_trace(tmp_path / f"pp_stage_pp{rank}_tp0.jsonl", rows)

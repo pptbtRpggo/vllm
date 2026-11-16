@@ -391,8 +391,10 @@ class StageProfiler:
         candidates = {
             "embedding": getattr(inner, "embed_tokens", None),
             "final_norm": getattr(inner, "norm", None),
-            "lm_head": getattr(model, "logits_processor", None),
         }
+        # Do not install LogitsProcessor hooks. Its work is still enclosed by
+        # execute/sample and retained in the stage residual, never treated as free.
+        self.lm_head_timing = "included_in_stage_residual"
         self.endpoints = {
             k: m
             for k, m in candidates.items()
@@ -427,6 +429,7 @@ class StageProfiler:
             "local_device_id": self.identity.get("device_id"),
             "timing_source": "device_events_and_host_perf_counter",
             "compute_interval_kind": "sum_of_execute_and_sample_device_intervals",
+            "lm_head_timing": self.lm_head_timing,
             "communication_scope": (
                 "ready_to_remote_npu_ready_plus_done_return"
                 if self.comm_timing == "ack"
@@ -513,6 +516,7 @@ class StageProfiler:
             "transport": "cpu_gloo",
             "timing_source": "device_events_and_host_perf_counter",
             "compute_interval_kind": "sum_of_execute_and_sample_device_intervals",
+            "lm_head_timing": self.lm_head_timing,
             "profile_provenance_sha256": self.provenance_sha,
             "comm_delay_in_window": False,
             "comm_timing": self.comm_timing,
