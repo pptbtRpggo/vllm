@@ -137,6 +137,9 @@ bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
 
 IP、模型路径、设备和内存参数沿用本机已跑通配置；这里的 `53/54` 是示例。
 head 自动采集、回收 peer trace、打印表格和输出 DP。peer 不重复运行采集脚本。
+统一启动入口的普通服务已改为沿用 vLLM 的容量/组批默认值；`--profile` 仍独立
+保留上下文 512、token budget 256、序列数 4、显存比例 0.8 的原采集配置，均可
+显式覆盖。验证推荐方案时，普通服务须显式对齐本轮采集配置。
 已有容器且 Ray 已连好、推理服务已退出：只在 head 容器中运行：
 
 ```bash

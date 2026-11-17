@@ -50,6 +50,7 @@ usage() {
   --max-model-len N / --max-num-batched-tokens N / --max-num-seqs N
   --gpu-memory-utilization N / --cann-env PATH / --python PATH
                        可选，转发给容器内入口；路径是容器内路径
+                       普通服务容量/组批参数省略时使用 vLLM 默认，不预设 512/256/4
   --chat-template codellama-instruct / PATH
                        内置 CodeLlama-Instruct 模板或容器内文件路径；省略沿用 tokenizer
   --dry-run            只显示命令，不启动 Docker，不初始化 NPU

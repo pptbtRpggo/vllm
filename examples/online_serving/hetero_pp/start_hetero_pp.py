@@ -68,10 +68,16 @@ def argument_parser():
     parser.add_argument(
         "--startup-timeout", type=float, default=1200, help="每项启动/等节点上限秒数"
     )
-    parser.add_argument("--max-model-len", type=int, default=512)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=256)
-    parser.add_argument("--max-num-seqs", type=int, default=4)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument(
+        "--max-model-len", type=int, help="可选，普通服务沿用 vLLM 默认"
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens", type=int, help="可选，普通服务沿用 vLLM 默认"
+    )
+    parser.add_argument("--max-num-seqs", type=int, help="可选，普通服务沿用 vLLM 默认")
+    parser.add_argument(
+        "--gpu-memory-utilization", type=float, help="可选，普通服务沿用 vLLM 默认"
+    )
     parser.add_argument("--block-size", type=int, help="可选，显式 KV block token 数")
     parser.add_argument(
         "--num-gpu-blocks-override", type=int, help="可选，固定 KV block 数"
@@ -146,9 +152,12 @@ def validate_options(args):
         or not 30 <= args.startup_timeout <= 1800
     ):
         raise ValueError("startup-timeout 需在 30..1800 秒")
-    if min(args.max_model_len, args.max_num_batched_tokens, args.max_num_seqs) < 1:
+    capacities = (args.max_model_len, args.max_num_batched_tokens, args.max_num_seqs)
+    if any(value is not None and value < 1 for value in capacities):
         raise ValueError("上下文、token budget、并发上限必须为正整数")
-    if not 0 < args.gpu_memory_utilization < 1:
+    if args.gpu_memory_utilization is not None and not (
+        0 < args.gpu_memory_utilization < 1
+    ):
         raise ValueError("gpu-memory-utilization 需在 0 和 1 之间")
     args.model = args.model.expanduser().resolve(strict=True)
     config = json.loads((args.model / "config.json").read_text())
@@ -248,21 +257,22 @@ def make_launch(args, node_ip, python, environment):
             "float16",
             "--enforce-eager",
             "--no-async-scheduling",
-            "--max-model-len",
-            str(args.max_model_len),
-            "--max-num-batched-tokens",
-            str(args.max_num_batched_tokens),
-            "--max-num-seqs",
-            str(args.max_num_seqs),
-            "--gpu-memory-utilization",
-            str(args.gpu_memory_utilization),
-            "--enable-chunked-prefill",
-            "--no-enable-prefix-caching",
             "--host",
             "127.0.0.1",
             "--port",
             str(args.api_port),
         ]
+        # Omitted options must reach vLLM as omitted, so model/platform defaults
+        # remain authoritative instead of duplicating them in this launcher.
+        for name in (
+            "max_model_len",
+            "max_num_batched_tokens",
+            "max_num_seqs",
+            "gpu_memory_utilization",
+        ):
+            value = getattr(args, name)
+            if value is not None:
+                serve += ["--" + name.replace("_", "-"), str(value)]
         template = resolve_chat_template(args.chat_template)
         if template:
             serve += ["--chat-template", template]
@@ -280,10 +290,23 @@ def make_launch(args, node_ip, python, environment):
         profile_environment = {
             "MODEL": str(args.model),
             "TRACE_ROOT": str(args.trace_root),
-            "PROFILE_MAX_MODEL_LEN": str(args.max_model_len),
-            "PROFILE_MAX_NUM_BATCHED_TOKENS": str(args.max_num_batched_tokens),
-            "PROFILE_MAX_NUM_SEQS": str(args.max_num_seqs),
-            "PROFILE_GPU_MEMORY_UTILIZATION": str(args.gpu_memory_utilization),
+            # Profiling retains its existing bounded collection protocol.
+            "PROFILE_MAX_MODEL_LEN": str(
+                args.max_model_len if args.max_model_len is not None else 512
+            ),
+            "PROFILE_MAX_NUM_BATCHED_TOKENS": str(
+                args.max_num_batched_tokens
+                if args.max_num_batched_tokens is not None
+                else 256
+            ),
+            "PROFILE_MAX_NUM_SEQS": str(
+                args.max_num_seqs if args.max_num_seqs is not None else 4
+            ),
+            "PROFILE_GPU_MEMORY_UTILIZATION": str(
+                args.gpu_memory_utilization
+                if args.gpu_memory_utilization is not None
+                else 0.8
+            ),
             "PROFILE_BLOCK_SIZE": str(args.block_size or 128),
             "PROFILE_NUM_GPU_BLOCKS": str(args.num_gpu_blocks_override or 64),
             "PROFILE_COMPUTE_TIMING": args.profile_compute_timing,

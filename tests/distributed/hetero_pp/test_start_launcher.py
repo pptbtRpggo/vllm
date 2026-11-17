@@ -60,6 +60,114 @@ def invoke(model, *extra, environment=None):
     )
 
 
+def test_service_uses_vllm_capacity_and_batch_defaults(model):
+    result = invoke(model)
+    assert result.returncode == 0, result.stderr
+    command = json.loads(result.stdout)["serve_command"]
+    for flag in (
+        "--max-model-len",
+        "--max-num-batched-tokens",
+        "--max-num-seqs",
+        "--gpu-memory-utilization",
+        "--enable-chunked-prefill",
+        "--no-enable-prefix-caching",
+    ):
+        assert flag not in command
+    assert "--enforce-eager" in command
+    assert "--no-async-scheduling" in command
+
+
+def test_service_forwards_explicit_capacity_and_batch_overrides(model):
+    arguments = (
+        "--max-model-len",
+        "2048",
+        "--max-num-batched-tokens",
+        "1024",
+        "--max-num-seqs",
+        "64",
+        "--gpu-memory-utilization",
+        "0.95",
+    )
+    result = invoke(model, *arguments)
+    assert result.returncode == 0, result.stderr
+    command = json.loads(result.stdout)["serve_command"]
+    for flag, value in zip(arguments[::2], arguments[1::2]):
+        assert command.count(flag) == 1
+        assert command[command.index(flag) + 1] == value
+
+
+def test_profile_keeps_its_bounded_capacity_and_batch_defaults(model):
+    result = invoke(model, "--profile")
+    assert result.returncode == 0, result.stderr
+    settings = json.loads(result.stdout)["profile_environment"]
+    assert settings["PROFILE_MAX_MODEL_LEN"] == "512"
+    assert settings["PROFILE_MAX_NUM_BATCHED_TOKENS"] == "256"
+    assert settings["PROFILE_MAX_NUM_SEQS"] == "4"
+    assert settings["PROFILE_GPU_MEMORY_UTILIZATION"] == "0.8"
+
+
+def test_profile_forwards_explicit_capacity_overrides(model):
+    result = invoke(
+        model,
+        "--profile",
+        "--max-model-len",
+        "1024",
+        "--max-num-batched-tokens",
+        "512",
+        "--max-num-seqs",
+        "8",
+        "--gpu-memory-utilization",
+        "0.95",
+    )
+    assert result.returncode == 0, result.stderr
+    settings = json.loads(result.stdout)["profile_environment"]
+    assert settings["PROFILE_MAX_MODEL_LEN"] == "1024"
+    assert settings["PROFILE_MAX_NUM_BATCHED_TOKENS"] == "512"
+    assert settings["PROFILE_MAX_NUM_SEQS"] == "8"
+    assert settings["PROFILE_GPU_MEMORY_UTILIZATION"] == "0.95"
+
+
+@pytest.mark.parametrize(
+    "extra,context", [((), None), (("--max-model-len", "2048"), "2048")]
+)
+def test_direct_serve_script_uses_vllm_defaults_and_forwards_overrides(
+    model, tmp_path, extra, context
+):
+    python = tmp_path / "python"
+    python.write_text(
+        f"#!{sys.executable}\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n"
+    )
+    python.chmod(0o700)
+    plan = tmp_path / "plan.json"
+    plan.write_text("{}")
+    result = subprocess.run(
+        ["bash", str(DIRECTORY / "serve.sh"), *extra],
+        env=dict(
+            os.environ,
+            PATH=f"{tmp_path}:{os.environ['PATH']}",
+            MODEL=str(model),
+            PLAN=str(plan),
+        ),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    command = json.loads(result.stdout)
+    if context is None:
+        assert "--max-model-len" not in command
+    else:
+        assert command.count("--max-model-len") == 1
+        assert command[command.index("--max-model-len") + 1] == context
+    for flag in (
+        "--max-num-batched-tokens",
+        "--max-num-seqs",
+        "--enable-chunked-prefill",
+        "--no-enable-prefix-caching",
+    ):
+        assert flag not in command
+
+
 @pytest.mark.parametrize("ip,role", [("192.0.2.10", "head"), ("192.0.2.20", "worker")])
 def test_same_script_plans_both_roles_without_starting_ray_or_loading_npu(
     model, ip, role
@@ -101,6 +209,10 @@ def test_same_script_plans_both_roles_without_starting_ray_or_loading_npu(
         ("--ray-port", "8000"),
         ("--startup-timeout", "nan"),
         ("--max-num-seqs", "0"),
+        ("--max-num-batched-tokens", "0"),
+        ("--max-model-len", "0"),
+        ("--gpu-memory-utilization", "1"),
+        ("--gpu-memory-utilization", "nan"),
     ],
 )
 def test_invalid_configuration_is_rejected_before_launch(model, extra):

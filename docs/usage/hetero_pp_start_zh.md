@@ -210,11 +210,28 @@ embedding 和输出 head 仍在首末 stage，也会占用显存和计算时间�
 | `--ray-port 16379` | 两边相同；其他 Ray 和 Gloo 动态端口也需互通 |
 | `--api-port 8000` | API 仅监听 910B 容器/宿主机的 `127.0.0.1` |
 | `--startup-timeout 1200` | 每项启动、等待节点、模型健康检查的上限秒数 |
-| `--max-model-len 512` | 第一轮功能验证的上下文上限 |
-| `--max-num-batched-tokens 256` | 每轮 scheduler token budget |
-| `--max-num-seqs 4` | 同时调度的请求数上限 |
-| `--gpu-memory-utilization 0.8` | 各卡显存使用比例配置 |
+| `--max-model-len N` | 普通服务省略时由 vLLM 根据模型配置推导上下文上限 |
+| `--max-num-batched-tokens N` | 普通服务省略时由 vLLM 选择 scheduler token budget |
+| `--max-num-seqs N` | 普通服务省略时由 vLLM 选择同时处理的序列数上限 |
+| `--gpu-memory-utilization N` | 普通服务省略时使用当前 vLLM 的显存比例默认值 |
 | `--output /可写路径/新目录` | 日志目录；已存在时拒绝覆盖 |
+
+普通服务不再预设 `512/256/4/0.8`，也不再强制开启 chunked prefill 或关闭
+prefix caching；由所用 vLLM 版本、模型和设备选择默认值。显式传入上述容量参数
+仍覆盖默认值。Docker 入口只转发这些参数，不额外定义一套容量默认值。
+已有 Ray 集群使用 `serve.sh` 时也沿用 vLLM 默认，并可在脚本后追加 vLLM 参数。
+FP16、eager、同步调度、PP4/TP1 是当前 CPU/Gloo 后端的支持条件，仍明确传入。
+
+`--profile` 是独立的小规模采集模式，省略容量参数时仍使用上下文 512、token
+budget 256、序列上限 4、显存比例 0.8，并保持 chunked prefill 开启、prefix
+caching 关闭。若要按采集配置验证推荐分层的性能，启动普通服务时应显式传入相同
+配置，不应把采用不同默认配置的新测量与原采集直接等同。
+
+默认值位置：本项目的参数转发在 `examples/online_serving/hetero_pp/start_hetero_pp.py`
+和 `serve.sh`；vLLM 自身的默认值来源为 `vllm/config/model.py`（上下文推导）、
+`vllm/engine/arg_utils.py`（模型/设备/入口相关的 batch 默认选择）以及
+`vllm/config/cache.py`（显存比例）。`vllm/config/scheduler.py` 中的字段缺省值
+还会被引擎配置阶段调整，不能仅凭该文件的常量判断 API 服务最终配置。
 
 第一次使用不需要手工启动 Ray，也不要再传 `--nnodes` 或
 `--distributed-executor-backend`。已有 Ray 实例或端口被占用时会退出，

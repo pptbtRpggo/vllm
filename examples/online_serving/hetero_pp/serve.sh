@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Experimental first bring-up only. Start the two-node Ray cluster separately.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Start the two-node Ray cluster separately; optional vLLM flags follow this script.
 set -euo pipefail
 : "${MODEL:?Set MODEL to a matching local checkpoint path on both nodes}"
 : "${PLAN:?Set PLAN to your edited pipeline JSON file}"
@@ -11,6 +13,4 @@ export VLLM_USE_V2_MODEL_RUNNER=0
 python -m vllm.distributed.hetero_pp.serve --model "$MODEL" \
   --pipeline-parallel-size 4 --tensor-parallel-size 1 \
   --dtype float16 --enforce-eager --no-async-scheduling \
-  --max-model-len 512 --max-num-batched-tokens 256 --max-num-seqs 4 \
-  --enable-chunked-prefill --no-enable-prefix-caching \
-  --host 127.0.0.1 --port 8000
+  --host 127.0.0.1 --port 8000 "$@"
