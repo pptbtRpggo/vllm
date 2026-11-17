@@ -10,6 +10,7 @@ exist; this executor does not launch Ray daemons or alter node environments.
 import json
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from typing import Any
@@ -200,23 +201,46 @@ class HeteroPPExecutor(Executor):
     def check_health(self):
         self.collective_rpc("check_health")
 
+    def _exit_owned(self, deadline):
+        if not self.workers:
+            return
+        refs = [w.__ray_terminate__.remote() for w in self.workers]
+        ready, pending = self.ray.wait(
+            refs,
+            num_returns=len(refs),
+            timeout=max(0, deadline - time.monotonic()),
+        )
+        if pending:
+            raise TimeoutError("heterogeneous PP actors did not exit in time")
+        for ref in ready:
+            # exit_actor intentionally ends its RPC with ActorDiedError.
+            # Unlike ray.kill, it runs Python/CANN exit handlers.
+            with suppress(self.ray.exceptions.ActorDiedError):
+                self.ray.get(ref, timeout=0)
+
     def shutdown(self):
         with self._shutdown_lock:
             if self._shutting_down or self._shutdown_complete:
                 return
             self._shutting_down = True
+            exited = False
+            deadline = time.monotonic() + min(self.timeout_s, 20)
             try:
                 if not self._failed:
                     # generate() may return while a final bookkeeping step is
                     # still in flight. Drain accepted RPCs before group teardown.
                     self._pool.submit(lambda: None).result(
-                        timeout=min(self.timeout_s, 20)
+                        timeout=max(0, deadline - time.monotonic())
                     )
                     if self._failed:
                         raise RuntimeError("pending PP RPC failed during shutdown")
                     refs = [w.shutdown.remote() for w in self.workers]
-                    self.ray.get(refs, timeout=min(self.timeout_s, 20))
+                    self.ray.get(refs, timeout=max(0, deadline - time.monotonic()))
+                    self._exit_owned(deadline)
+                    exited = True
             finally:
-                self._kill_owned()
+                if not exited:
+                    self._kill_owned()
+                self._failed = True
                 self._pool.shutdown(wait=False, cancel_futures=True)
                 self._shutdown_complete = True

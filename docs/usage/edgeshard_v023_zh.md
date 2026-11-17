@@ -230,6 +230,22 @@ PY=/path/to/matched/venv/bin/python \
   bash examples/online_serving/hetero_pp/profile_edgeshard.sh --stats-only "$TRACE"
 ```
 
+### 2.2 退出阶段的 TBE 子进程提示
+
+如果出现 `TBE Subprocess ... main process disappeared` 或 CANN
+`repository_manager/utils/common.py` 的 `ProcessLookupError`，随后
+`MPClient` 完成清理并进入第 2/3 步打印 prefill 统计，说明本轮采集已正常返回，
+这段提示发生在进程退出阶段；不需要仅因该提示重跑已完成的采集。
+只有最终打印推荐配置，才能同时确认第 3/3 步离线规划也完成。
+先用采集时的版本完成本轮统计/DP，再更新代码；离线规划会核对源码 SHA，
+更新后分析旧 trace 应使用对应的采集版本，不修改旧 manifest 绕过校验。
+
+执行器正常结束时先排空已提交的模型调用、完成四个 worker 的清理，再请求 Ray
+actor 正常退出，让 Python/CANN 的退出回调执行。整个关闭流程共用最多 20 秒的
+等待期限；已有异常或退出超时仍强制清理本执行器拥有的 actor，并保留原异常。
+不会停止整个 Ray 集群，也不修改 CANN 文件或过滤原始错误日志。
+若采集中途退出、未进入统计，应查看 TBE 提示之前的首个 worker/EngineCore 异常。
+
 ## 3. 测到的“计算”和“通信”分别是什么
 
 `layer-measured` 用实际模块事件测每层 decoder、首端 embedding、末端 norm
