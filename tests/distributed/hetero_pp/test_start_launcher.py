@@ -62,6 +62,157 @@ def invoke(model, *extra, environment=None):
     )
 
 
+@pytest.mark.parametrize("ip,rank", [("192.0.2.10", "0"), ("192.0.2.20", "1")])
+def test_hccl_starts_native_mp_on_each_node_without_ray(model, ip, rank):
+    result = invoke(
+        model,
+        "--transport",
+        "hccl",
+        "--node-ip",
+        ip,
+        "--interface",
+        "eth1",
+        "--master-port",
+        "29601",
+        "--layers",
+        "18,18,6,6",
+        "--max-num-batched-tokens",
+        "1024",
+        "--chat-template",
+        "codellama-instruct",
+    )
+    assert result.returncode == 0, result.stderr
+    launch = json.loads(result.stdout)
+    assert launch["transport"] == "hccl"
+    assert launch["ray_command"] is None
+    assert launch["profile_command"] is None
+    command = launch["serve_command"]
+    assert command[1:5] == [
+        "-m",
+        "vllm.entrypoints.cli.main",
+        "serve",
+        str(model),
+    ]
+    for flag, value in (
+        ("--distributed-executor-backend", "mp"),
+        ("--tensor-parallel-size", "1"),
+        ("--pipeline-parallel-size", "4"),
+        ("--nnodes", "2"),
+        ("--node-rank", rank),
+        ("--master-addr", "192.0.2.10"),
+        ("--master-port", "29601"),
+        ("--max-num-batched-tokens", "1024"),
+    ):
+        assert command[command.index(flag) + 1] == value
+    assert ("--headless" in command) is (rank == "1")
+    assert ("--chat-template" in command) is (rank == "0")
+    assert "--no-async-scheduling" not in command
+    assert "--max-model-len" not in command
+    env = launch["environment"]
+    assert env["VLLM_PP_LAYER_PARTITION"] == "18,18,6,6"
+    assert env["HCCL_IF_IP"] == ip
+    assert env["TP_SOCKET_IFNAME"] == env["GLOO_SOCKET_IFNAME"] == "eth1"
+    assert "VLLM_HETERO_PP_PLAN" not in env
+    assert [stage["soc"] for stage in launch["plan"]["stages"]] == ["910B"] * 4
+
+
+@pytest.mark.parametrize(
+    "extra,message",
+    [
+        (("--peer-soc", "310p"), "910B"),
+        (("--head-soc", "310p", "--peer-soc", "310p"), "910B"),
+        (("--profile",), "profile"),
+        (("--master-port", "8000"), "端口"),
+        (("--master-port", "65536"), "端口"),
+    ],
+)
+def test_hccl_rejects_unsupported_topology_profile_and_ports(model, extra, message):
+    result = invoke(model, "--transport", "hccl", *extra)
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not result.stdout.strip().startswith("{")
+
+
+def test_hccl_uses_balanced_layers_and_native_capacity_defaults(model):
+    result = invoke(model, "--transport", "hccl")
+    assert result.returncode == 0, result.stderr
+    launch = json.loads(result.stdout)
+    assert launch["environment"]["VLLM_PP_LAYER_PARTITION"] == "12,12,12,12"
+    for flag in (
+        "--max-num-batched-tokens",
+        "--max-num-seqs",
+        "--gpu-memory-utilization",
+        "--no-enable-prefix-caching",
+    ):
+        assert flag not in launch["serve_command"]
+
+
+@pytest.mark.parametrize("ip", ["192.0.2.10", "192.0.2.20"])
+def test_hccl_service_removes_inherited_gloo_profile_and_ray_state(
+    launcher,
+    model,
+    tmp_path,
+    monkeypatch,
+    ip,
+):
+    args = launcher.argument_parser().parse_args(
+        [
+            "--head",
+            "192.0.2.10",
+            "--peer",
+            "192.0.2.20",
+            "--model",
+            str(model),
+            "--transport",
+            "hccl",
+            "--interface",
+            "eth1",
+        ]
+    )
+    inherited = dict(
+        os.environ,
+        RAY_ADDRESS="old:1234",
+        VLLM_HETERO_PP_PLAN="old",
+        VLLM_PP_STAGE_TRACE="old",
+        VLLM_PP_TRACE_SESSION="old",
+        VLLM_PP_COMPUTE_MODEL="old",
+        VLLM_PP_COMPUTE_TIMING="old",
+        VLLM_USE_V2_MODEL_RUNNER="0",
+    )
+    launch = launcher.make_launch(args, ip, sys.executable, inherited)
+    calls = []
+
+    def serve(command, env, log, timeout, port, **kwargs):
+        calls.append(command)
+        for name in (
+            "RAY_ADDRESS",
+            "VLLM_HETERO_PP_PLAN",
+            "VLLM_PP_STAGE_TRACE",
+            "VLLM_PP_TRACE_SESSION",
+            "VLLM_PP_COMPUTE_MODEL",
+            "VLLM_PP_COMPUTE_TIMING",
+            "VLLM_USE_V2_MODEL_RUNNER",
+        ):
+            assert name not in env
+        assert env["VLLM_PP_LAYER_PARTITION"] == "12,12,12,12"
+        assert kwargs["headless"] is (ip == "192.0.2.20")
+        assert kwargs["health_host"] == (
+            "192.0.2.10" if ip.endswith("20") else "127.0.0.1"
+        )
+        return 7
+
+    monkeypatch.setattr(launcher, "serve_foreground", serve)
+    monkeypatch.setattr(launcher, "capture", lambda *a: pytest.fail("Ray launched"))
+    assert (
+        launcher.start_services(args, launch, inherited, tmp_path, sys.executable) == 7
+    )
+    assert len(calls) == 1
+    assert not (tmp_path / "ray_started.json").exists()
+    receipt = json.loads((tmp_path / "server_exit.json").read_text())
+    assert receipt["transport"] == "hccl"
+    assert receipt["model_inference_validated"] is False
+
+
 @pytest.mark.parametrize(
     "head,peer", [("910b", "910b"), ("310p", "910b"), ("310p", "310p")]
 )
@@ -661,8 +812,9 @@ def test_api_startup_timeout_stops_only_the_child(launcher, tmp_path):
     assert not (tmp_path / "api_ready.json").exists()
 
 
+@pytest.mark.parametrize("headless", [False, True])
 def test_real_health_response_is_not_reported_as_inference_validation(
-    launcher, tmp_path
+    launcher, tmp_path, headless
 ):
     with socket.socket() as selection:
         selection.bind(("127.0.0.1", 0))
@@ -686,9 +838,12 @@ time.sleep(0.1)
         tmp_path / "api.log",
         5,
         port,
+        health_host="127.0.0.1",
+        headless=headless,
     )
     assert rc == 0
-    receipt = json.loads((tmp_path / "api_ready.json").read_text())
+    filename = "head_api_ready.json" if headless else "api_ready.json"
+    receipt = json.loads((tmp_path / filename).read_text())
     assert receipt["health_http_status"] == 200
     assert receipt["model_inference_validated"] is False
     assert not (tmp_path / "complete.json").exists()

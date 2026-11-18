@@ -9,7 +9,7 @@ set -euo pipefail
 IP_PREFIX="${IP_PREFIX:-141.147.135}"
 head="${HEAD_IP:-${HEAD_LAST:-}}"
 peer="${PEER_IP:-${PEER_LAST:-}}"
-head_soc=910b peer_soc=310p
+head_soc=910b peer_soc="" transport=gloo
 model="${HOST_MODEL_DIR:-}"
 log_dir="${HOST_LOG_DIR:-${HOME:?需要 HOME 或 HOST_LOG_DIR}/vllm_hetero_pp_logs}"
 image_910b="${IMAGE_910B:-quay.io/ascend/vllm-ascend:v0.23.0-openeuler}"
@@ -17,6 +17,7 @@ image_310p="${IMAGE_310P:-quay.io/ascend/vllm-ascend:v0.23.0-310p-openeuler}"
 image="${IMAGE:-}"
 devices="${HOST_NPU_DEVICES:-0,1}"
 ray_port="${RAY_PORT:-16379}" api_port="${SERVICE_PORT:-8000}"
+master_port="${MASTER_PORT:-29501}"
 layers="${PP_LAYERS:-}"
 interface="" dry_run=false debug_shell=false profile=false trace_root=""
 forward=()
@@ -28,10 +29,11 @@ usage() {
 --head / --peer 可填 IP 最后一个数字；默认前缀 141.147.135，也可填完整 IPv4。
 先在 head 运行，等待时在 peer 运行；两边可使用不同宿主机模型路径。
 选项：
-  --head VALUE         Ray/API 主端 IP 或末段；也可设置 HEAD_LAST / HEAD_IP
+  --head VALUE         主端 IP 或末段；也可设置 HEAD_LAST / HEAD_IP
   --peer VALUE         另一个节点 IP 或末段；也可设置 PEER_LAST / PEER_IP
   --head-soc 910b|310p  head 两张卡型号，默认 910b；两边填相同配置
-  --peer-soc 910b|310p  peer 两张卡型号，默认 310p；两边填相同配置
+  --peer-soc 910b|310p  peer 型号：gloo 默认 310p，hccl 默认 910b
+  --transport gloo|hccl 默认 gloo + Ray；hccl 为原生 mp，仅支持两边 910B
   --model DIR          本机完整模型目录，挂载到容器 /workspace/model
   --log-dir DIR        宿主机可读日志根目录，默认 $HOME/vllm_hetero_pp_logs
   --devices 0,1        宿主机两张卡设备文件编号，只影响 Docker 映射
@@ -39,9 +41,10 @@ usage() {
   --image IMAGE        覆盖本机镜像；也可分别设置 IMAGE_910B / IMAGE_310P
   --name NAME          本机容器名，默认 hetero-pp-head / hetero-pp-worker
   --ray-port PORT      默认 16379，两端一致；其他 Ray/Gloo 端口仍动态分配
-  --api-port PORT      默认 8000，API 仅在 head 的 127.0.0.1 上监听
+  --master-port PORT   HCCL/mp 主端端口，默认 29501，两边一致；不启动 Ray
+  --api-port PORT      默认 8000；gloo 在 head 回环监听，hccl 在所有网卡监听
   --layers A,B,C,D     原 910B→310P 默认 18,18,6,6；其他组合按模型总层数均分
-  --profile           两边启动并连接 Ray，head 自动采集/打印统计/生成 DP，不启动 API
+  --profile           仅 gloo：连接 Ray，head 采集/打印统计/生成 DP，不启动 API
   --trace-root DIR    可选，本机结果目录；不需要共享，默认随本轮日志保存
                        peer 记录由 master 通过现有 Ray 连接自动收回并校验
   --profile-timeout N profiling 全流程上限秒数，默认 3600
@@ -71,11 +74,12 @@ while (($#)); do
     --dry-run) dry_run=true; shift ;;
     --shell) debug_shell=true; shift ;;
     --profile) profile=true; shift ;;
-    --head|--peer|--head-soc|--peer-soc|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--api-port|--layers|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python|--chat-template|--trace-root|--profile-timeout|--profile-compute-timing|--block-size|--num-gpu-blocks-override)
+    --head|--peer|--head-soc|--peer-soc|--transport|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--master-port|--api-port|--layers|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python|--chat-template|--trace-root|--profile-timeout|--profile-compute-timing|--block-size|--num-gpu-blocks-override)
       (($# >= 2)) && [[ -n "$2" && "$2" != --* ]] || die "$1 缺少参数"
       case "$1" in
         --head) head="$2" ;; --peer) peer="$2" ;; --model) model="$2" ;;
         --head-soc) head_soc="$2" ;; --peer-soc) peer_soc="$2" ;;
+        --transport) transport="$2" ;; --master-port) master_port="$2" ;;
         --log-dir) log_dir="$2" ;;
         --devices) devices="$2" ;; --interface) interface="$2" ;;
         --image) image="$2" ;; --name) name="$2" ;;
@@ -96,7 +100,15 @@ normalize_soc() {
   esac
 }
 head_soc="$(normalize_soc "$head_soc")"
+[[ "$transport" == gloo || "$transport" == hccl ]] || die '--transport 只能是 gloo 或 hccl'
+if [[ -z "$peer_soc" ]]; then
+  if [[ "$transport" == hccl ]]; then peer_soc=910b; else peer_soc=310p; fi
+fi
 peer_soc="$(normalize_soc "$peer_soc")"
+if [[ "$transport" == hccl ]]; then
+  [[ "$head_soc" == 910b && "$peer_soc" == 910b ]] || die 'HCCL 只支持两边 910B；异构请用 gloo'
+  "$profile" && die 'HCCL 不支持当前 --profile；采集请用 gloo'
+fi
 
 if "$profile"; then
   "$debug_shell" && die '--profile 和 --shell 不能同时使用'
@@ -128,12 +140,14 @@ head="$(expand_ip "$head")" peer="$(expand_ip "$peer")"
 [[ "$devices" =~ ^(0|[1-9][0-9]*),(0|[1-9][0-9]*)$ ]] || die "devices 需为两个设备号，例如 0,1"
 first="${devices%,*}" second="${devices#*,}"
 [[ "$first" != "$second" ]] || die "两张卡设备号不能相同"
-for port in "$ray_port" "$api_port"; do
+coordination_port="$ray_port"
+if [[ "$transport" == hccl ]]; then coordination_port="$master_port"; fi
+for port in "$coordination_port" "$api_port"; do
   if ! [[ "$port" =~ ^[1-9][0-9]{3,4}$ ]] || ((port < 1024 || port > 65535)); then
     die "端口需在 1024..65535"
   fi
 done
-[[ "$ray_port" != "$api_port" ]] || die "Ray 和 API 不能使用同一端口"
+[[ "$coordination_port" != "$api_port" ]] || die "主端通信和 API 不能使用同一端口"
 if [[ -n "$layers" ]]; then
   [[ "$layers" =~ ^[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]*$ ]] || die "layers 需要四个正整数"
 fi
@@ -215,12 +229,15 @@ for path in /usr/local/dcmi /usr/local/Ascend/driver/lib64 \
 done
 command+=(--mount "type=bind,src=$repo,dst=/work/vllm" -w /work/vllm
   -e "GLOO_SOCKET_IFNAME=$interface" -e "VLLM_HOST_IP=$local_ip")
+if [[ "$transport" == hccl ]]; then
+  command+=(-e "HCCL_IF_IP=$local_ip" -e "TP_SOCKET_IFNAME=$interface")
+fi
 if "$debug_shell"; then
   command+=(--entrypoint /bin/bash "$image")
 else
 command+=(--mount "type=bind,src=$run_dir,dst=/work/hetero_logs"
   --mount "type=bind,src=$model,dst=/workspace/model,readonly"
-  -e "HETERO_PP_ROLE=$role")
+  -e "HETERO_PP_ROLE=$role" -e "HETERO_PP_TRANSPORT=$transport")
 if "$profile" && [[ -n "$trace_root" ]]; then
   command+=(--mount "type=bind,src=$trace_root,dst=/work/hetero_profiles"
     -e HETERO_PP_MODE=profile)
@@ -231,7 +248,7 @@ fi
 command+=("$image" /bin/bash -c '
 set -u
 umask 022
-if [[ "$HETERO_PP_ROLE" == head ]]; then
+if [[ "$HETERO_PP_ROLE" == head || "$HETERO_PP_TRANSPORT" == hccl ]]; then
   exec bash /work/vllm/examples/online_serving/hetero_pp/start_hetero_pp.sh "$@"
 fi
 bash /work/vllm/examples/online_serving/hetero_pp/start_hetero_pp.sh "$@"
@@ -242,6 +259,7 @@ trap "exit 0" INT TERM HUP
 while true; do sleep 5 & wait $!; done
 ' hetero-pp --head "$head" --peer "$peer" --model /workspace/model
   --head-soc "$head_soc" --peer-soc "$peer_soc"
+  --transport "$transport" --master-port "$master_port"
   --node-ip "$local_ip" --interface "$interface"
   --ray-port "$ray_port" --api-port "$api_port" --output /work/hetero_logs/start)
 if [[ -n "$layers" ]]; then command+=(--layers "$layers"); fi
@@ -259,14 +277,18 @@ if "$dry_run"; then
   exit 0
 fi
 command -v docker >/dev/null || die "找不到 docker 命令"
-echo "本机角色=$role，型号=$local_soc，IP=$local_ip，网卡=$interface，镜像=$image" >&2
+echo "本机角色=$role，型号=$local_soc，传输=$transport，IP=$local_ip，网卡=$interface，镜像=$image" >&2
 if "$debug_shell"; then
   echo "只进 Bash：跳过镜像入口/自动环境初始化、NPU 预检、Ray 和模型启动；不挂载模型或实验日志。" >&2
   echo "调试容器禁用 seccomp 过滤；退出后保留，可用 docker start -ai $name 再次进入。" >&2
   echo "另开终端进入：docker exec -it $name /bin/bash" >&2
 else
 echo "选择镜像依据节点型号配置；容器内将实际校验两张 NPU 型号及初始化。" >&2
-echo "Ray端口=$ray_port，API端口=$api_port；不删除已有容器、不重新设置 NPU 可见性。" >&2
+if [[ "$transport" == hccl ]]; then
+  echo "原生 HCCL/mp，主端端口=$master_port，API端口=$api_port；需跨机 HCCL 网络可用。" >&2
+else
+  echo "Ray端口=$ray_port，API端口=$api_port；不删除已有容器、不重新设置 NPU 可见性。" >&2
+fi
 echo "宿主机本轮日志：$run_dir/start；目录和日志文件将允许宿主机用户读取。" >&2
 fi
 exec "${command[@]}"

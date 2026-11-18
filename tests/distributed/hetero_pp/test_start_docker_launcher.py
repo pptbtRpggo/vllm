@@ -64,6 +64,112 @@ def invoke(environment, *arguments):
     )
 
 
+@pytest.mark.parametrize("local", ["141.147.135.53", "141.147.135.54"])
+def test_hccl_docker_selects_910b_and_forwards_native_network_and_port(
+    environment,
+    local,
+):
+    environment["TEST_LOCAL_IP"] = local
+    result = invoke(
+        environment, "--transport", "hccl", "--master-port", "29601", "--dry-run"
+    )
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout)
+    assert "quay.io/ascend/vllm-ascend:v0.23.0-openeuler" in command
+    assert "seccomp=unconfined" not in command
+    assert f"HCCL_IF_IP={local}" in command
+    assert "TP_SOCKET_IFNAME=enp3s0" in command
+    assert command[command.index("--transport") + 1] == "hccl"
+    assert command[command.index("--master-port") + 1] == "29601"
+    assert "HETERO_PP_TRANSPORT=hccl" in command
+    model = Path(environment["TEST_MODEL"])
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "num_hidden_layers": 48,
+            }
+        )
+    )
+    inner = command[command.index("hetero-pp") + 1 :]
+    inner[inner.index("--model") + 1] = str(model)
+    result = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT.with_name("start_hetero_pp.sh")),
+            "--python",
+            sys.executable,
+            "--dry-run",
+            *inner,
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    launch = json.loads(result.stdout)
+    assert launch["ray_command"] is None
+    native = launch["serve_command"]
+    assert native[native.index("--master-port") + 1] == "29601"
+    assert native[native.index("--node-rank") + 1] == (
+        "0" if local.endswith("53") else "1"
+    )
+
+
+@pytest.mark.parametrize(
+    "extra", [("--peer-soc", "310p"), ("--profile",), ("--master-port", "8000")]
+)
+def test_hccl_host_rejects_invalid_configuration_before_docker(environment, extra):
+    result = invoke(environment, "--transport", "hccl", "--dry-run", *extra)
+    assert result.returncode != 0
+    assert not result.stdout.startswith("docker run")
+
+
+@pytest.mark.parametrize("status", [0, 7])
+def test_hccl_worker_container_exits_with_owned_native_service(
+    environment,
+    tmp_path,
+    status,
+):
+    environment["TEST_LOCAL_IP"] = "141.147.135.54"
+    preview = invoke(environment, "--transport", "hccl", "--dry-run")
+    assert preview.returncode == 0, preview.stderr
+    fake_bash = tmp_path / "bash"
+    fake_bash.write_text(f"#!/bin/sh\necho 'native worker exited'\nexit {status}\n")
+    fake_bash.chmod(0o700)
+    docker = tmp_path / "docker"
+    docker.write_text(
+        "#!/bin/bash\n"
+        "while (($#)); do\n"
+        '  if [[ "$1" == -e ]]; then export "$2"; shift 2; continue; fi\n'
+        '  if [[ "$1" == *v0.23.0-openeuler ]]; then shift; exec "$@"; fi\n'
+        "  shift\ndone\nexit 99\n"
+    )
+    docker.chmod(0o700)
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            str(SCRIPT),
+            "--head",
+            "53",
+            "--peer",
+            "54",
+            "--model",
+            environment["TEST_MODEL"],
+            "--transport",
+            "hccl",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=3,
+    )
+    assert result.returncode == status
+    assert "native worker exited" in result.stdout
+    assert "peer Ray" not in result.stdout
+
+
 def test_host_sync_profile_mode_is_forwarded_into_container(environment):
     result = invoke(
         environment, "--dry-run", "--profile", "--profile-compute-timing", "host-sync"

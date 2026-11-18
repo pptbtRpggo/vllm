@@ -40,10 +40,16 @@ from check_cpu_gloo import (
 
 def argument_parser():
     parser = argparse.ArgumentParser(
-        description="两机各两卡 CPU/Gloo PP：head 启动模型，peer 加入 Ray"
+        description="两机各两卡 PP：CPU/Gloo + Ray 或原生 HCCL + mp"
     )
-    parser.add_argument("--head", required=True, help="Ray/API 主端 IPv4；两边填一样")
+    parser.add_argument("--head", required=True, help="主端 IPv4；两边填一样")
     parser.add_argument("--peer", required=True, help="另一个节点 IPv4；两边填一样")
+    parser.add_argument(
+        "--transport",
+        choices=("gloo", "hccl"),
+        default="gloo",
+        help="默认 gloo；hccl 使用原生双机 mp，目前限两端 910B，不启用 Ray",
+    )
     parser.add_argument(
         "--head-soc",
         type=str.lower,
@@ -55,8 +61,8 @@ def argument_parser():
         "--peer-soc",
         type=str.lower,
         choices=("910b", "310p"),
-        default="310p",
-        help="peer 两张卡的型号，默认 310p",
+        default=None,
+        help="peer 两张卡的型号；gloo 默认 310p，hccl 默认 910b",
     )
     parser.add_argument(
         "--model", required=True, type=Path, help="两端同路径的本地完整模型"
@@ -78,6 +84,12 @@ def argument_parser():
         "--node-ip", help="可选，明确本机 IP；dry-run 时可用于预览任一角色"
     )
     parser.add_argument("--ray-port", type=int, default=16379)
+    parser.add_argument(
+        "--master-port",
+        type=int,
+        default=29501,
+        help="HCCL/mp 主端端口，默认 29501；两边一致",
+    )
     parser.add_argument("--api-port", type=int, default=8000)
     parser.add_argument(
         "--startup-timeout", type=float, default=1200, help="每项启动/等节点上限秒数"
@@ -126,6 +138,13 @@ def argument_parser():
 
 
 def validate_options(args):
+    if args.peer_soc is None:
+        args.peer_soc = "910b" if args.transport == "hccl" else "310p"
+    if args.transport == "hccl":
+        if (args.head_soc, args.peer_soc) != ("910b", "910b"):
+            raise ValueError("HCCL 模式当前只支持两端各两张 910B；异构请用 gloo")
+        if args.profile:
+            raise ValueError("HCCL 模式不支持当前 EdgeShard --profile；采集请用 gloo")
     if not args.profile and args.profile_compute_timing != "event":
         raise ValueError("--profile-compute-timing 仅用于 --profile")
     if args.profile:
@@ -155,12 +174,13 @@ def validate_options(args):
         raise ValueError("head 和 peer 不能相同")
     if args.node_ip and args.node_ip not in (args.head, args.peer):
         raise ValueError("本机 IP 必须是 head 或 peer")
+    coordination_port = args.master_port if args.transport == "hccl" else args.ray_port
     if (
-        not 1024 <= args.ray_port <= 65535
+        not 1024 <= coordination_port <= 65535
         or not 1024 <= args.api_port <= 65535
-        or args.ray_port == args.api_port
+        or coordination_port == args.api_port
     ):
-        raise ValueError("Ray/API 端口需不同且在 1024..65535")
+        raise ValueError("主端通信/API 端口需不同且在 1024..65535")
     if (
         not math.isfinite(args.startup_timeout)
         or not 30 <= args.startup_timeout <= 1800
@@ -237,6 +257,8 @@ def make_launch(args, node_ip, python, environment):
         plan["validation_mode"] = (
             "910b_only" if args.head_soc == args.peer_soc == "910b" else "explicit"
         )
+    if args.transport == "hccl":
+        return make_native_launch(args, node_ip, python, environment, plan, role)
     updates = {
         "VLLM_HOST_IP": node_ip,
         "VLLM_USE_V2_MODEL_RUNNER": "0",
@@ -339,6 +361,7 @@ def make_launch(args, node_ip, python, environment):
             "PROFILE_COMPUTE_TIMING": args.profile_compute_timing,
         }
     return dict(
+        transport="gloo",
         role=role,
         plan=plan,
         environment=updates,
@@ -346,6 +369,85 @@ def make_launch(args, node_ip, python, environment):
         serve_command=serve,
         profile_command=profile_command,
         profile_environment=profile_environment,
+    )
+
+
+def make_native_launch(args, node_ip, python, environment, plan, role):
+    """Use the upstream MP executor and Ascend worker, without custom PP hooks."""
+    updates = {
+        "VLLM_HOST_IP": node_ip,
+        "HCCL_IF_IP": node_ip,
+        "VLLM_PP_LAYER_PARTITION": args.layers,
+    }
+    interface = args.interface or environment.get("GLOO_SOCKET_IFNAME")
+    if interface:
+        updates.update(GLOO_SOCKET_IFNAME=interface, TP_SOCKET_IFNAME=interface)
+    if "ASCEND_RT_VISIBLE_DEVICES" in environment:
+        updates["ASCEND_RT_VISIBLE_DEVICES"] = environment["ASCEND_RT_VISIBLE_DEVICES"]
+    command = [
+        python,
+        "-m",
+        "vllm.entrypoints.cli.main",
+        "serve",
+        str(args.model),
+        "--served-model-name",
+        "hetero-model",
+        "--distributed-executor-backend",
+        "mp",
+        "--tensor-parallel-size",
+        "1",
+        "--pipeline-parallel-size",
+        "4",
+        "--nnodes",
+        "2",
+        "--node-rank",
+        "0" if role == "head" else "1",
+        "--master-addr",
+        args.head,
+        "--master-port",
+        str(args.master_port),
+        "--dtype",
+        "float16",
+        "--enforce-eager",
+    ]
+    if role == "head":
+        # The peer checks this API for a bounded startup, then remains attached
+        # to its own headless worker process. Health is not inference validation.
+        command += ["--host", "0.0.0.0", "--port", str(args.api_port)]
+        template = resolve_chat_template(args.chat_template)
+        if template:
+            command += ["--chat-template", template]
+    else:
+        command.append("--headless")
+    for name in (
+        "max_model_len",
+        "max_num_batched_tokens",
+        "max_num_seqs",
+        "gpu_memory_utilization",
+        "block_size",
+        "num_gpu_blocks_override",
+    ):
+        value = getattr(args, name)
+        if value is not None:
+            command += ["--" + name.replace("_", "-"), str(value)]
+    return dict(
+        transport="hccl",
+        role=role,
+        plan=plan,
+        environment=updates,
+        unset_environment=[
+            "VLLM_HETERO_PP_PLAN",
+            "VLLM_PP_STAGE_TRACE",
+            "VLLM_PP_TRACE_SESSION",
+            "VLLM_PP_COMPUTE_MODEL",
+            "VLLM_PP_COMPUTE_TIMING",
+            "RAY_ADDRESS",
+            "VLLM_USE_V2_MODEL_RUNNER",
+        ],
+        ray_command=None,
+        serve_command=command,
+        profile_command=None,
+        profile_environment={},
     )
 
 
@@ -380,8 +482,17 @@ def profile_foreground(command, environment, log, timeout):
             raise
 
 
-def serve_foreground(command, environment, log, startup_timeout, api_port):
-    """Stream the API log and forward interrupts only to the owned process tree."""
+def serve_foreground(
+    command,
+    environment,
+    log,
+    startup_timeout,
+    api_port,
+    *,
+    health_host="127.0.0.1",
+    headless=False,
+):
+    """Supervise a local server/worker until exit, bounding API readiness waits."""
     with log.open("w") as writer, log.open() as reader:
         process = subprocess.Popen(
             command,
@@ -402,7 +513,7 @@ def serve_foreground(command, environment, log, startup_timeout, api_port):
                 if not ready and time.monotonic() >= next_check:
                     try:
                         with http.open(
-                            f"http://127.0.0.1:{api_port}/health", timeout=1
+                            f"http://{health_host}:{api_port}/health", timeout=1
                         ) as response:
                             ready = response.status == 200
                     except (OSError, urllib.error.URLError):
@@ -410,23 +521,25 @@ def serve_foreground(command, environment, log, startup_timeout, api_port):
                     next_check = time.monotonic() + 1
                     if ready:
                         write_json(
-                            log.parent / "api_ready.json",
+                            log.parent
+                            / ("head_api_ready.json" if headless else "api_ready.json"),
                             {
                                 "health_http_status": 200,
                                 "model_inference_validated": False,
                             },
                         )
                         print(
-                            "API 已就绪；请发送请求核对结果。"
-                            "Ctrl+C 停止 API，Ray 会保留。",
+                            "head API 已就绪；本端原生 worker 持续运行。"
+                            if headless
+                            else "API 已就绪；请发请求核对结果。Ctrl+C 停止本端服务。",
                             flush=True,
                         )
                 if not ready and time.monotonic() >= deadline:
-                    raise TimeoutError("模型 API 启动超时；见 api.log")
+                    raise TimeoutError(f"模型 API 启动超时；见 {log.name}")
                 time.sleep(0.2)
             print(reader.read(), end="", flush=True)
             if process.returncode == 0 and not ready:
-                raise RuntimeError("API 未就绪即退出；见 api.log")
+                raise RuntimeError(f"API 未就绪即退出；见 {log.name}")
             return process.returncode
         except BaseException:
             if process.poll() is None:
@@ -439,8 +552,35 @@ def serve_foreground(command, environment, log, startup_timeout, api_port):
 
 
 def start_services(args, launch, environment, output, python):
-    """Join Ray before serving; an existing or failed Ray startup is never ignored."""
+    """Start native MP or join Ray before serving, preserving startup failures."""
+    environment = dict(environment)
+    for name in launch.get("unset_environment", []):
+        environment.pop(name, None)
     environment = dict(environment, **launch["environment"])
+    if launch["transport"] == "hccl":
+        headless = launch["role"] == "worker"
+        log = output / ("worker.log" if headless else "api.log")
+        print(f"启动原生 HCCL/mp，角色={launch['role']}；日志 {log}", flush=True)
+        rc = serve_foreground(
+            launch["serve_command"],
+            environment,
+            log,
+            args.startup_timeout,
+            args.api_port,
+            health_host=args.head if headless else "127.0.0.1",
+            headless=headless,
+        )
+        write_json(
+            output / "server_exit.json",
+            {
+                "returncode": rc,
+                "transport": "hccl",
+                "role": launch["role"],
+                "model_inference_validated": False,
+                "ray_started": False,
+            },
+        )
+        return rc if rc >= 0 else 128 - rc
     rc, text = capture(launch["ray_command"], environment, args.startup_timeout)
     (output / "ray_start.log").write_text(text)
     if rc:
@@ -557,7 +697,8 @@ def main(argv=None):
         else:
             interfaces = ipv4_interfaces()
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
-                route.connect((args.head, args.ray_port))
+                port = args.master_port if args.transport == "hccl" else args.ray_port
+                route.connect((args.head, port))
                 route_ip = args.node_ip or route.getsockname()[0]
             network = select_network(
                 args.head,
@@ -600,9 +741,11 @@ def main(argv=None):
     print(f"本机日志目录：{output}", flush=True)
     try:
         if node_ip == args.head:
-            ports = [(node_ip, args.ray_port)]
+            port = args.master_port if args.transport == "hccl" else args.ray_port
+            ports = [(node_ip, port)]
             if not args.profile:
-                ports.append(("127.0.0.1", args.api_port))
+                host = "0.0.0.0" if args.transport == "hccl" else "127.0.0.1"
+                ports.append((host, args.api_port))
             for address, port in ports:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as check:
                     check.bind((address, port))
@@ -632,7 +775,7 @@ def main(argv=None):
             output / "failure.json", {"type": type(error).__name__, "error": str(error)}
         )
         print(
-            f"启动未完成：{error}\nRay 若已启动会保留，不清理其他任务。日志：{output}",
+            f"启动未完成：{error}\n仅管理本轮子进程，已有 Ray 不变。日志：{output}",
             file=sys.stderr,
         )
         return 130 if isinstance(error, KeyboardInterrupt) else 1

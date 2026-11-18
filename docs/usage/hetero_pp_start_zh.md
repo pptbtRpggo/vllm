@@ -1,13 +1,62 @@
 # 两边运行同一脚本，启动可配置型号的四卡 PP
 
 入口：`examples/online_serving/hetero_pp/start_hetero_pp.sh`。
-这是现有异构 PP 后端的启动脚本，不自动安装依赖或重建镜像。
+通过 `--transport gloo|hccl` 选择通信路径，默认仍为原来的 CPU/Gloo。
+不自动安装依赖或重建镜像。
 普通服务模式不发测试请求；显式 `--profile` 模式执行内部采集负载。
 通信检查通过之后，仍需用真实模型完成下面的验证。
 
+## 选择 Gloo 或原生 HCCL
+
+| 选项 | 执行入口 | stage 间张量通信 | 当前范围 |
+| --- | --- | --- | --- |
+| `--transport gloo`（默认） | 自定义 PP 执行器＋Ray | NPU→CPU→Gloo→CPU→NPU | 下述四种型号组合；支持现有 profiling |
+| `--transport hccl` | 原生 `vllm serve`＋双机 `mp` | Ascend 原生 HCCL 设备通信组 | 仅 910B＋910B；不支持现有 `--profile` |
+
+两台 910B、每台两张卡时，两边宿主机运行同一命令，只改各自的模型目录：
+
+```bash
+bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
+  --head 53 --peer 54 --transport hccl \
+  --model /本机完整模型目录 --layers 12,12,12,12 \
+  --master-port 29501 --chat-template codellama-instruct
+```
+
+这里默认 IP 前缀仍是 `141.147.135`，也可填写完整 IPv4。先在 head 执行，
+等待时再在 peer 执行，两个终端都保持运行。已经进入容器时，把脚本名换成
+`start_hetero_pp.sh`，并填写完整 IP 和容器内模型路径。
+`hccl` 模式默认两端型号均为 910B；仍会初始化并核对本机两张卡。
+
+- head 原生进程使用 `--nnodes 2 --node-rank 0`；peer 使用
+  `--nnodes 2 --node-rank 1 --headless`。两边均为 TP1/PP4，自动设置同一份
+  `VLLM_PP_LAYER_PARTITION`；`--layers` 的层数之和必须等于模型层数。
+- 不启动或加入 Ray，不使用自定义 Gloo PP worker。两边自动设置各自的
+  `HCCL_IF_IP`、`VLLM_HOST_IP` 和主机通信网卡；清除继承的自定义 PP/profiling
+  激活变量。`--ray-port` 在此模式不使用，`--master-port` 两边必须相同。
+- head API 在 `0.0.0.0:8000` 监听，供 peer 检查启动健康状态。peer 不提供
+  API，会持续等待自己的原生 worker；健康检查不代表模型请求验证通过。
+  普通 Gloo 模式仍只监听 head 的 `127.0.0.1`。
+- **必须已有可用的跨机 HCCL 网络。** 主机 ping、Ray 或 Gloo 成功不代表
+  NPU 网络已经连通。`--interface` 选择主机网卡，不配置 NPU 网口 IP、路由
+  或物理网络。原生分布式通信可能还使用动态端口，不能只开放 master 端口。
+- 当前 `hccl` 拒绝 310P/异构组合及 `--profile`，不会静默退回 Gloo。
+  如果比较同一 910B 拓扑的 Gloo，在两边改为 `--transport gloo`，并显式写
+  `--head-soc 910b --peer-soc 910b`。两种模式同时改变执行器和张量传输路径，
+  结果差异不能全部归因于 HCCL 与 Gloo 的网络耗时。
+
+用 `--dry-run` 可预览 Docker 命令；容器内 `--dry-run --node-ip 本机IP`
+可查看 `launch.json` 格式的原生命令计划，不导入 Torch/Ray。
+真实运行日志仍在本机本轮目录的 `start` 下：head 为 `api.log`，peer 为
+`worker.log`，`launch.json` 保存实际命令、通信设置及需要清除的环境变量。
+停止时两边各自 Ctrl+C，脚本只管理本轮子进程，不执行全局 Ray stop。
+
+参考：[vLLM v0.23 原生双机 MP](https://docs.vllm.ai/en/v0.23.0/serving/parallelism_scaling/#running-vllm-with-multiprocessing)、
+[Ascend 跨机通信准备](https://docs.vllm.ai/projects/ascend/en/v0.23.0/tutorials/features/ray.html#verify-multi-node-communication-environment)。
+
 ## 两端型号与 stage 顺序
 
-`head` 只表示 Ray/API 主端，负责 stage 0/1；`peer` 负责 stage 2/3。
+本节及后续原有 Ray/profiling 操作针对默认 `gloo` 模式。
+`head` 表示 Ray/API 主端，负责 stage 0/1；`peer` 负责 stage 2/3。
 两端都可以是 910B 或 310P，不再把主从角色与设备型号绑定。
 两边命令使用相同的 `--head-soc`、`--peer-soc` 和 `--layers`：
 
@@ -252,13 +301,15 @@ embedding 和输出 head 仍在首末 stage，也会占用显存和计算时间�
 | 参数 | 默认 / 用途 |
 | --- | --- |
 | `--head-soc 910b` | head 型号，支持 `910b` / `310p`，默认 `910b` |
-| `--peer-soc 310p` | peer 型号，支持 `910b` / `310p`，默认 `310p` |
+| `--peer-soc 310p` | peer 型号；Gloo 默认 `310p`，HCCL 默认 `910b` |
+| `--transport gloo` | Gloo＋Ray；`hccl` 选择原生 HCCL＋mp，仅支持双端 910B |
 | `--python /path/to/python` | 指定已有 NPU 环境，未指定时复用通信脚本的环境探测 |
 | `--cann-env /path/to/set_env.sh` | 显式加载本机 SDK 环境 |
 | `--chat-template codellama-instruct` | 使用项目内 CodeLlama-34B-Instruct 对话模板；也支持容器内模板文件路径，省略则沿用 tokenizer |
 | `--interface eth0` | 默认自动选择到对端的网卡；各端可不同 |
 | `--ray-port 16379` | 两边相同；其他 Ray 和 Gloo 动态端口也需互通 |
-| `--api-port 8000` | API 仅监听 head 容器/宿主机的 `127.0.0.1` |
+| `--master-port 29501` | 仅 HCCL/mp，两边相同，不使用 Ray 端口 |
+| `--api-port 8000` | Gloo 在 head 回环监听；HCCL 在 head 所有网卡监听 |
 | `--startup-timeout 1200` | 每项启动、等待节点、模型健康检查的上限秒数 |
 | `--max-model-len N` | 普通服务省略时由 vLLM 根据模型配置推导上下文上限 |
 | `--max-num-batched-tokens N` | 普通服务省略时由 vLLM 选择 scheduler token budget |
