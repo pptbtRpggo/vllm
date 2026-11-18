@@ -43,13 +43,13 @@ class PipelinePlan:
             raise ValueError("stage layers must sum to model hidden layers")
         mode = value.get("validation_mode", "mixed")
         expected = ["910B", "910B", "310P", "310P"] if mode == "mixed" else ["910B"] * 4
-        if mode not in ("mixed", "910b_only"):
+        if mode not in ("mixed", "910b_only", "explicit"):
             raise ValueError("unknown validation_mode")
         if not (
             stages[0].node_ip == stages[1].node_ip
             and stages[2].node_ip == stages[3].node_ip
             and stages[0].node_ip != stages[2].node_ip
-            and [s.soc for s in stages] == expected
+            and (mode == "explicit" or [s.soc for s in stages] == expected)
         ):
             raise ValueError(
                 "two stages per node and SoC layout must match validation_mode"

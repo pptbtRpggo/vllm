@@ -1,13 +1,59 @@
-# 两边运行同一脚本，启动 910B/310P 四卡 PP
+# 两边运行同一脚本，启动可配置型号的四卡 PP
 
 入口：`examples/online_serving/hetero_pp/start_hetero_pp.sh`。
 这是现有异构 PP 后端的启动脚本，不自动安装依赖或重建镜像。
 普通服务模式不发测试请求；显式 `--profile` 模式执行内部采集负载。
 通信检查通过之后，仍需用真实模型完成下面的验证。
 
+## 两端型号与 stage 顺序
+
+`head` 只表示 Ray/API 主端，负责 stage 0/1；`peer` 负责 stage 2/3。
+两端都可以是 910B 或 310P，不再把主从角色与设备型号绑定。
+两边命令使用相同的 `--head-soc`、`--peer-soc` 和 `--layers`：
+
+| head / stage 0、1 | peer / stage 2、3 | 两边都加的参数 |
+| --- | --- | --- |
+| 910B | 310P | 默认；可显式写 `--head-soc 910b --peer-soc 310p` |
+| 910B | 910B | `--head-soc 910b --peer-soc 910b` |
+| 310P | 910B | `--head-soc 310p --peer-soc 910b` |
+| 310P | 310P | `--head-soc 310p --peer-soc 310p` |
+
+例如，两台 910B 服务器，各两张卡，运行 48 层 CodeLlama34B：
+
+```bash
+bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
+  --head 53 --peer 54 --head-soc 910b --peer-soc 910b \
+  --model /本机完整模型目录 --layers 12,12,12,12 \
+  --chat-template codellama-instruct
+```
+
+前两个 stage 改为 310P、后两个为 910B 时，两边改用：
+
+```bash
+bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
+  --head 53 --peer 54 --head-soc 310p --peer-soc 910b \
+  --model /本机完整模型目录 --layers 6,6,18,18 \
+  --chat-template codellama-instruct
+```
+
+以上 IP、路径和层数均可修改；层数示例不是最优分层或显存容量保证。
+已在容器内时改用 `start_hetero_pp.sh`，保留同样的型号和层数参数，模型路径
+填写容器内路径。先启动 head，再启动 peer，API 只在 head 上监听。
+普通服务和 `--profile` 都支持同一套型号配置，通信始终使用 CPU/Gloo。
+
+省略 `--layers` 时，原来的 910B→310P 命令仍使用 `18,18,6,6`；其余组合
+按模型实际层数均分四个 stage，余数从前面的 stage 开始分配。例如 48 层为
+`12,12,12,12`，32 层为 `8,8,8,8`。显式传入层数时始终按指定值部署。
+
+型号配置决定默认镜像和每个 stage 的 worker，真实启动还会核对本机设备。
+不是把 910B 假装成 310P；型号不符会在启动 Ray 前拒绝。旧 `mixed` 和
+`910b_only` JSON 方案保留原检查，新顺序使用 `validation_mode: "explicit"`，
+仍要求两机各两卡、四个 stage、合法型号以及正确的模型总层数。
+
 ## 宿主机自动选择镜像并启动容器
 
-不想手工启动 Docker 时，两边在宿主机的项目根目录使用：
+不想手工启动 Docker 时，两边在宿主机的项目根目录使用。
+以下以默认 910B→310P 组合为例；其他组合加上前述型号参数：
 
 ```bash
 bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
@@ -23,7 +69,8 @@ bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
 也可以在脚本开头或环境中填写 `HEAD_LAST`、`PEER_LAST`、`HOST_MODEL_DIR`，
 之后直接运行脚本。空的 `RAY_PORT` / `SERVICE_PORT` 使用默认值 16379 / 8000。
 
-宿主机入口按本机拥有哪个 IP 判断角色，再选择镜像：
+宿主机入口按本机拥有哪个 IP 判断角色，再按对应的 SoC 参数选择镜像。
+默认仍为：
 
 | 角色 | 默认镜像 |
 | --- | --- |
@@ -35,7 +82,7 @@ bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
 需要换镜像时，可以使用
 `--image 镜像名`，或分别设置环境变量 `IMAGE_910B` / `IMAGE_310P`。
 
-选镜像依据是用户填写的 IP 角色，不是宿主机硬件探测结果。实际型号、卡数
+选镜像依据是用户填写的节点型号，不是宿主机硬件探测结果。实际型号、卡数
 和两张卡的初始化由容器内 TorchNPU 检查，角色与实际型号不符时拒绝启动。
 全流程不要求宿主机有 `npu-smi`、TorchNPU 或 CANN 用户态环境。
 
@@ -74,7 +121,7 @@ $HOME/vllm_hetero_pp_logs/hetero_pp_worker_时间_标识/start/
 或设置 `HOST_LOG_DIR`。现有目录不会被批量 chmod，必须对当前账号可写、可进入。
 下面手动容器内入口的日志默认值不变；已有受限日志需要目录拥有者处理。
 
-310P 加入 Ray 后保持容器前台运行。测试结束时两边分别 Ctrl+C，或由容器拥有者
+peer 加入 Ray 后保持容器前台运行。测试结束时两边分别 Ctrl+C，或由容器拥有者
 停止本次容器；容器退出自动删除，宿主机日志保留。已有同名容器时 Docker 会拒绝，
 脚本不会先强制删除。没有使用 `--init`，不要求宿主机提供 `docker-init`。
 
@@ -182,13 +229,14 @@ bash examples/online_serving/hetero_pp/start_hetero_pp.sh \
   --layers 18,18,6,6
 ```
 
-`--head` 填 910B 机器，`--peer` 填 310P 机器。脚本根据本机 IP 自动识别角色。
-先在 910B 端执行，看到“等待两端各两张 NPU”后，在 310P 端运行相同命令：
+以上为默认 910B→310P 示例。脚本根据本机 IP 自动识别角色，具体型号由
+`--head-soc` / `--peer-soc` 指定。先在 head 端执行，看到“等待两端各两张 NPU”后，
+在 peer 端运行相同命令：
 
-1. 910B 端启动 Ray head，然后等待 310P 加入。
-2. 310P 端加入 Ray 后返回 shell，Ray 进程继续运行；不要退出或删除容器。
-3. 910B 端自动创建四个模型 worker、加载对应层并启动 API。
-4. 显示“API 已就绪”之后，在 910B 端另开一个 shell 发请求。
+1. head 端启动 Ray head，然后等待 peer 加入。
+2. peer 端加入 Ray 后返回 shell，Ray 进程继续运行；不要退出或删除容器。
+3. head 端自动创建四个模型 worker、加载对应层并启动 API。
+4. 显示“API 已就绪”之后，在 head 端另开一个 shell 发请求。
 
 `18,18,6,6` 对应 48 层模型，仅为初始分层，不是实测最优方案，也不保证
 任意 310P 板卡显存都能容纳。层数之和须等于模型 `num_hidden_layers`。
@@ -203,12 +251,14 @@ embedding 和输出 head 仍在首末 stage，也会占用显存和计算时间�
 
 | 参数 | 默认 / 用途 |
 | --- | --- |
+| `--head-soc 910b` | head 型号，支持 `910b` / `310p`，默认 `910b` |
+| `--peer-soc 310p` | peer 型号，支持 `910b` / `310p`，默认 `310p` |
 | `--python /path/to/python` | 指定已有 NPU 环境，未指定时复用通信脚本的环境探测 |
 | `--cann-env /path/to/set_env.sh` | 显式加载本机 SDK 环境 |
 | `--chat-template codellama-instruct` | 使用项目内 CodeLlama-34B-Instruct 对话模板；也支持容器内模板文件路径，省略则沿用 tokenizer |
 | `--interface eth0` | 默认自动选择到对端的网卡；各端可不同 |
 | `--ray-port 16379` | 两边相同；其他 Ray 和 Gloo 动态端口也需互通 |
-| `--api-port 8000` | API 仅监听 910B 容器/宿主机的 `127.0.0.1` |
+| `--api-port 8000` | API 仅监听 head 容器/宿主机的 `127.0.0.1` |
 | `--startup-timeout 1200` | 每项启动、等待节点、模型健康检查的上限秒数 |
 | `--max-model-len N` | 普通服务省略时由 vLLM 根据模型配置推导上下文上限 |
 | `--max-num-batched-tokens N` | 普通服务省略时由 vLLM 选择 scheduler token budget |

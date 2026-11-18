@@ -56,7 +56,7 @@ class PipelineActor:
         os.environ["VLLM_PP_LAYER_PARTITION"] = plan.partition
         os.environ["VLLM_HOST_IP"] = stage.node_ip
         # Keep each node's own CANN/plugin library environment. Do not copy the
-        # 910B head environment or its wheel to the 310P host.
+        # head environment or its wheel to a peer with a different SoC.
         from vllm.plugins import load_general_plugins
 
         load_general_plugins()

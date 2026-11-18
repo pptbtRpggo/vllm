@@ -9,10 +9,15 @@ vLLM-Ascend workers; each host needs a compatible build for its own SoC.
 ## Supported first implementation
 
 One scheduler and model, four consecutive PP stages, TP=DP=PCP=DCP=1.
-Ranks 0/1 live on one 910B host and ranks 2/3 on one 310P host. Each actor owns
+Ranks 0/1 live on the head host and ranks 2/3 on the peer host. Each actor owns
 one Ray `NPU` resource and uses logical device 0 in its isolated device view.
 An explicit `validation_mode: "910b_only"` plan permits four 910B stages on
 two nodes for bring-up. It does not validate the 310P worker or mixed-SoC math.
+The default `mixed` plan retains the 910B/910B/310P/310P layout. New
+`validation_mode: "explicit"` plans admit either supported SoC at each stage,
+including 310P-first and all-310P layouts, while retaining the two-node/four-stage
+constraint and actual local worker/device checks. Both launchers accept
+`--head-soc` and `--peer-soc`; each selects the two stages on that node.
 Actual device allocations are sorted per node before ranks are assigned; loaded
 layer ranges are checked against the plan. Layer counts must be positive and
 sum to the checkpoint's transformer layers. Embedding and output head remain

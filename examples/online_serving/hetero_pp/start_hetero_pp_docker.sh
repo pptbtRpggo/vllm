@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Host entrypoint. IP roles select images; TorchNPU validates actual SoCs inside.
+# Host entrypoint. Declared node SoCs select images; TorchNPU verifies them inside.
 if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
 set -euo pipefail
 
@@ -9,6 +9,7 @@ set -euo pipefail
 IP_PREFIX="${IP_PREFIX:-141.147.135}"
 head="${HEAD_IP:-${HEAD_LAST:-}}"
 peer="${PEER_IP:-${PEER_LAST:-}}"
+head_soc=910b peer_soc=310p
 model="${HOST_MODEL_DIR:-}"
 log_dir="${HOST_LOG_DIR:-${HOME:?需要 HOME 或 HOST_LOG_DIR}/vllm_hetero_pp_logs}"
 image_910b="${IMAGE_910B:-quay.io/ascend/vllm-ascend:v0.23.0-openeuler}"
@@ -16,7 +17,7 @@ image_310p="${IMAGE_310P:-quay.io/ascend/vllm-ascend:v0.23.0-310p-openeuler}"
 image="${IMAGE:-}"
 devices="${HOST_NPU_DEVICES:-0,1}"
 ray_port="${RAY_PORT:-16379}" api_port="${SERVICE_PORT:-8000}"
-layers="${PP_LAYERS:-18,18,6,6}"
+layers="${PP_LAYERS:-}"
 interface="" dry_run=false debug_shell=false profile=false trace_root=""
 forward=()
 
@@ -25,10 +26,12 @@ usage() {
 两边宿主机使用同一命令（不依赖宿主机 npu-smi / TorchNPU）：
   bash start_hetero_pp_docker.sh --head 53 --peer 54 --model /host/model
 --head / --peer 可填 IP 最后一个数字；默认前缀 141.147.135，也可填完整 IPv4。
-先在 910B 运行，等待时在 310P 运行；两边可使用不同宿主机模型路径。
+先在 head 运行，等待时在 peer 运行；两边可使用不同宿主机模型路径。
 选项：
-  --head VALUE         910B IP 或末段；也可设置 HEAD_LAST / HEAD_IP
-  --peer VALUE         310P IP 或末段；也可设置 PEER_LAST / PEER_IP
+  --head VALUE         Ray/API 主端 IP 或末段；也可设置 HEAD_LAST / HEAD_IP
+  --peer VALUE         另一个节点 IP 或末段；也可设置 PEER_LAST / PEER_IP
+  --head-soc 910b|310p  head 两张卡型号，默认 910b；两边填相同配置
+  --peer-soc 910b|310p  peer 两张卡型号，默认 310p；两边填相同配置
   --model DIR          本机完整模型目录，挂载到容器 /workspace/model
   --log-dir DIR        宿主机可读日志根目录，默认 $HOME/vllm_hetero_pp_logs
   --devices 0,1        宿主机两张卡设备文件编号，只影响 Docker 映射
@@ -36,8 +39,8 @@ usage() {
   --image IMAGE        覆盖本机镜像；也可分别设置 IMAGE_910B / IMAGE_310P
   --name NAME          本机容器名，默认 hetero-pp-head / hetero-pp-worker
   --ray-port PORT      默认 16379，两端一致；其他 Ray/Gloo 端口仍动态分配
-  --api-port PORT      默认 8000，API 仅在 910B 的 127.0.0.1 上监听
-  --layers A,B,C,D     默认 18,18,6,6；总和须等于模型层数
+  --api-port PORT      默认 8000，API 仅在 head 的 127.0.0.1 上监听
+  --layers A,B,C,D     原 910B→310P 默认 18,18,6,6；其他组合按模型总层数均分
   --profile           两边启动并连接 Ray，head 自动采集/打印统计/生成 DP，不启动 API
   --trace-root DIR    可选，本机结果目录；不需要共享，默认随本轮日志保存
                        peer 记录由 master 通过现有 Ray 连接自动收回并校验
@@ -55,7 +58,7 @@ usage() {
                        内置 CodeLlama-Instruct 模板或容器内文件路径；省略沿用 tokenizer
   --dry-run            只显示命令，不启动 Docker，不初始化 NPU
   --shell              只进 Bash，不启动服务/预检，不创建实验日志目录
-                       无需 --model；仍用 --head/--peer 选择本机镜像/网卡
+                       无需 --model；型号参数选择镜像，IP 参数选择角色/网卡
                        两种角色都禁用 seccomp 过滤，覆盖镜像 ENTRYPOINT
                        退出保留容器，可用 docker start -ai 容器名再次进入
 EOF
@@ -68,10 +71,11 @@ while (($#)); do
     --dry-run) dry_run=true; shift ;;
     --shell) debug_shell=true; shift ;;
     --profile) profile=true; shift ;;
-    --head|--peer|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--api-port|--layers|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python|--chat-template|--trace-root|--profile-timeout|--profile-compute-timing|--block-size|--num-gpu-blocks-override)
+    --head|--peer|--head-soc|--peer-soc|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--api-port|--layers|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python|--chat-template|--trace-root|--profile-timeout|--profile-compute-timing|--block-size|--num-gpu-blocks-override)
       (($# >= 2)) && [[ -n "$2" && "$2" != --* ]] || die "$1 缺少参数"
       case "$1" in
         --head) head="$2" ;; --peer) peer="$2" ;; --model) model="$2" ;;
+        --head-soc) head_soc="$2" ;; --peer-soc) peer_soc="$2" ;;
         --log-dir) log_dir="$2" ;;
         --devices) devices="$2" ;; --interface) interface="$2" ;;
         --image) image="$2" ;; --name) name="$2" ;;
@@ -83,6 +87,16 @@ while (($#)); do
     *) die "未知参数：$1；使用 --help 查看" ;;
   esac
 done
+
+normalize_soc() {
+  case "$1" in
+    910b|910B) echo 910b ;;
+    310p|310P) echo 310p ;;
+    *) die '--head-soc / --peer-soc 只能是 910b 或 310p' ;;
+  esac
+}
+head_soc="$(normalize_soc "$head_soc")"
+peer_soc="$(normalize_soc "$peer_soc")"
 
 if "$profile"; then
   "$debug_shell" && die '--profile 和 --shell 不能同时使用'
@@ -120,7 +134,9 @@ for port in "$ray_port" "$api_port"; do
   fi
 done
 [[ "$ray_port" != "$api_port" ]] || die "Ray 和 API 不能使用同一端口"
-[[ "$layers" =~ ^[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]*$ ]] || die "layers 需要四个正整数"
+if [[ -n "$layers" ]]; then
+  [[ "$layers" =~ ^[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]*$ ]] || die "layers 需要四个正整数"
+fi
 if ! "$debug_shell"; then
   [[ -d "$model" ]] || die "模型目录不存在：$model"
   model="$(cd -- "$model" && pwd -P)"
@@ -139,13 +155,16 @@ while read -r _ nic family cidr _; do
   if [[ "$address" == "$peer" ]]; then owns_peer=true; fi
 done <<< "$addresses"
 if "$owns_head" && ! "$owns_peer"; then
-  role=head local_ip="$head" target="$peer"
-  image="${image:-$image_910b}"
+  role=head local_ip="$head" target="$peer" local_soc="$head_soc"
 elif "$owns_peer" && ! "$owns_head"; then
-  role=worker local_ip="$peer" target="$head"
-  image="${image:-$image_310p}"
+  role=worker local_ip="$peer" target="$head" local_soc="$peer_soc"
 else
   die "本机必须且只能拥有 head/peer 中一个 IP；不猜测设备型号"
+fi
+if [[ "$local_soc" == 910b ]]; then
+  image="${image:-$image_910b}"
+else
+  image="${image:-$image_310p}"
 fi
 [[ -n "$image" && "$image" != -* ]] || die "无效镜像名"
 if [[ -z "$interface" ]]; then
@@ -182,7 +201,7 @@ else
 fi
 name="${name:-hetero-pp-$role}"
 command=(docker run --rm --name "$name" --net=host --shm-size=1g)
-if [[ "$role" == worker ]]; then command+=(--security-opt seccomp=unconfined); fi
+if [[ "$local_soc" == 310p ]]; then command+=(--security-opt seccomp=unconfined); fi
 if [[ -t 0 && -t 1 ]]; then command+=(-it); fi
 fi
 for device in "davinci$first" "davinci$second" davinci_manager hisi_hdc; do
@@ -218,12 +237,14 @@ fi
 bash /work/vllm/examples/online_serving/hetero_pp/start_hetero_pp.sh "$@"
 status=$?
 if ((status != 0)); then exit "$status"; fi
-echo "310P Ray 已加入；保持此容器运行。head 完成本轮服务/采集后 Ctrl+C 停止本容器。"
+echo "peer Ray 已加入；保持此容器运行。head 完成本轮服务/采集后 Ctrl+C 停止本容器。"
 trap "exit 0" INT TERM HUP
 while true; do sleep 5 & wait $!; done
 ' hetero-pp --head "$head" --peer "$peer" --model /workspace/model
-  --node-ip "$local_ip" --interface "$interface" --layers "$layers"
+  --head-soc "$head_soc" --peer-soc "$peer_soc"
+  --node-ip "$local_ip" --interface "$interface"
   --ray-port "$ray_port" --api-port "$api_port" --output /work/hetero_logs/start)
+if [[ -n "$layers" ]]; then command+=(--layers "$layers"); fi
 if "$profile"; then
   profile_root=/work/hetero_logs/profiles
   if [[ -n "$trace_root" ]]; then profile_root=/work/hetero_profiles; fi
@@ -238,13 +259,13 @@ if "$dry_run"; then
   exit 0
 fi
 command -v docker >/dev/null || die "找不到 docker 命令"
-echo "本机角色=$role，IP=$local_ip，网卡=$interface，镜像=$image" >&2
+echo "本机角色=$role，型号=$local_soc，IP=$local_ip，网卡=$interface，镜像=$image" >&2
 if "$debug_shell"; then
   echo "只进 Bash：跳过镜像入口/自动环境初始化、NPU 预检、Ray 和模型启动；不挂载模型或实验日志。" >&2
   echo "调试容器禁用 seccomp 过滤；退出后保留，可用 docker start -ai $name 再次进入。" >&2
   echo "另开终端进入：docker exec -it $name /bin/bash" >&2
 else
-echo "选择镜像依据 IP 角色；容器内将实际校验两张 NPU 型号及初始化。" >&2
+echo "选择镜像依据节点型号配置；容器内将实际校验两张 NPU 型号及初始化。" >&2
 echo "Ray端口=$ray_port，API端口=$api_port；不删除已有容器、不重新设置 NPU 可见性。" >&2
 echo "宿主机本轮日志：$run_dir/start；目录和日志文件将允许宿主机用户读取。" >&2
 fi

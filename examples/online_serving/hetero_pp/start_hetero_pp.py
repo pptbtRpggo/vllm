@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Start the existing mixed-Ascend PP service from the same CLI on both nodes.
+"""Start configurable two-node Ascend PP from the same CLI on both nodes.
 
 Run inside each already working container. No Docker, package installation,
 device remapping or global Ray stop is performed. Explicit profile mode runs
@@ -40,15 +40,29 @@ from check_cpu_gloo import (
 
 def argument_parser():
     parser = argparse.ArgumentParser(
-        description="两机各两卡异构 PP：910B 自动启动模型，310P 加入 Ray"
+        description="两机各两卡 CPU/Gloo PP：head 启动模型，peer 加入 Ray"
     )
-    parser.add_argument("--head", required=True, help="910B 端 IPv4；两边填一样")
-    parser.add_argument("--peer", required=True, help="310P 端 IPv4；两边填一样")
+    parser.add_argument("--head", required=True, help="Ray/API 主端 IPv4；两边填一样")
+    parser.add_argument("--peer", required=True, help="另一个节点 IPv4；两边填一样")
+    parser.add_argument(
+        "--head-soc",
+        type=str.lower,
+        choices=("910b", "310p"),
+        default="910b",
+        help="head 两张卡的型号，默认 910b",
+    )
+    parser.add_argument(
+        "--peer-soc",
+        type=str.lower,
+        choices=("910b", "310p"),
+        default="310p",
+        help="peer 两张卡的型号，默认 310p",
+    )
     parser.add_argument(
         "--model", required=True, type=Path, help="两端同路径的本地完整模型"
     )
     parser.add_argument(
-        "--layers", default="18,18,6,6", help="四 stage 层数，总和须等于模型层数"
+        "--layers", help="四 stage 层数；原 910B→310P 默认 18,18,6,6，其他组合均分"
     )
     parser.add_argument("--python", help="已有 NPU Python，默认沿用环境探测")
     parser.add_argument("--cann-env", help="可选，本机已有 CANN set_env.sh")
@@ -163,12 +177,21 @@ def validate_options(args):
     config = json.loads((args.model / "config.json").read_text())
     if config.get("architectures") not in (["LlamaForCausalLM"], ["Qwen2ForCausalLM"]):
         raise ValueError("当前入口只支持 LlamaForCausalLM/Qwen2ForCausalLM")
+    total = config.get("num_hidden_layers")
+    if type(total) is not int or total < 4:
+        raise ValueError("模型 num_hidden_layers 必须是至少 4 的整数")
+    if args.layers is None:
+        if (args.head_soc, args.peer_soc) == ("910b", "310p"):
+            args.layers = "18,18,6,6"
+        else:
+            base, remainder = divmod(total, 4)
+            args.layers = ",".join(str(base + (rank < remainder)) for rank in range(4))
     counts = args.layers.split(",")
     if len(counts) != 4 or not all(
         s.isascii() and s.isdigit() and int(s) > 0 for s in counts
     ):
         raise ValueError("layers 需为四个正整数，例如 18,18,6,6")
-    if sum(map(int, counts)) != config.get("num_hidden_layers"):
+    if sum(map(int, counts)) != total:
         raise ValueError("四个 stage 层数之和必须等于模型 num_hidden_layers")
 
 
@@ -205,11 +228,15 @@ def make_launch(args, node_ip, python, environment):
             {"node_ip": ip, "soc": soc, "layers": int(count)}
             for ip, soc, count in zip(
                 (args.head, args.head, args.peer, args.peer),
-                ("910B", "910B", "310P", "310P"),
+                (args.head_soc.upper(),) * 2 + (args.peer_soc.upper(),) * 2,
                 args.layers.split(","),
             )
         ],
     }
+    if (args.head_soc, args.peer_soc) != ("910b", "310p"):
+        plan["validation_mode"] = (
+            "910b_only" if args.head_soc == args.peer_soc == "910b" else "explicit"
+        )
     updates = {
         "VLLM_HOST_IP": node_ip,
         "VLLM_USE_V2_MODEL_RUNNER": "0",
@@ -430,11 +457,11 @@ def start_services(args, launch, environment, output, python):
     )
     if launch["role"] == "worker":
         print(
-            "310P 已加入 Ray；本端不启动 API/采集，请在 910B 端查看日志。", flush=True
+            "peer 已加入 Ray；本端不启动 API/采集，请在 head 端查看日志。", flush=True
         )
         print("Ray 保持运行；这不是模型推理通过回执。", flush=True)
         return 0
-    print("910B Ray 已启动，等待两端各两张 NPU……", flush=True)
+    print("head Ray 已启动，等待两端各两张 NPU……", flush=True)
     code = """
 import json, sys, time
 import ray
@@ -584,10 +611,11 @@ def main(argv=None):
             output,
             time.monotonic() + args.startup_timeout,
         )
-        expected = "910B" if node_ip == args.head else "310P"
+        expected = (args.head_soc if node_ip == args.head else args.peer_soc).upper()
         if inventory["soc"] != expected:
             raise ValueError(
-                f"本机应为 {expected}，实际是 {inventory['soc']}；核对 head/peer"
+                f"本机应为 {expected}，实际是 {inventory['soc']}；"
+                "核对 IP 和 --head-soc/--peer-soc"
             )
         env["GLOO_SOCKET_IFNAME"] = network["interface"]
         launch = make_launch(args, node_ip, python, env)

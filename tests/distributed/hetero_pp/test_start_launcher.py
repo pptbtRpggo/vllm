@@ -8,7 +8,9 @@ import os
 import socket
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -58,6 +60,117 @@ def invoke(model, *extra, environment=None):
         timeout=10,
         env=environment,
     )
+
+
+@pytest.mark.parametrize(
+    "head,peer", [("910b", "910b"), ("310p", "910b"), ("310p", "310p")]
+)
+@pytest.mark.parametrize("ip", ["192.0.2.10", "192.0.2.20"])
+@pytest.mark.parametrize("profile", [False, True])
+def test_configured_socs_reach_service_and_profile_plans(
+    model, head, peer, ip, profile
+):
+    extra = ("--profile",) if profile else ()
+    result = invoke(
+        model, "--head-soc", head, "--peer-soc", peer, "--node-ip", ip, *extra
+    )
+    assert result.returncode == 0, result.stderr
+    launch = json.loads(result.stdout)
+    names = {"910b": "910B", "310p": "310P"}
+    assert [s["soc"] for s in launch["plan"]["stages"]] == [names[head]] * 2 + [
+        names[peer]
+    ] * 2
+    assert [s["layers"] for s in launch["plan"]["stages"]] == [12] * 4
+    assert launch["plan"]["validation_mode"] == (
+        "910b_only" if head == peer == "910b" else "explicit"
+    )
+    assert launch["environment"]["VLLM_HETERO_PP_PLAN"] == json.dumps(launch["plan"])
+    if ip == "192.0.2.10":
+        assert (launch["serve_command"] is not None) is not profile
+        assert (launch["profile_command"] is not None) is profile
+    else:
+        assert launch["serve_command"] is None
+        assert launch["profile_command"] is None
+
+
+@pytest.mark.parametrize("total,counts", [(32, [8] * 4), (50, [13, 13, 12, 12])])
+def test_homogeneous_default_partition_uses_model_layer_count(model, total, counts):
+    (model / "config.json").write_text(
+        json.dumps({"architectures": ["LlamaForCausalLM"], "num_hidden_layers": total})
+    )
+    result = invoke(model, "--peer-soc", "910b")
+    assert result.returncode == 0, result.stderr
+    assert [s["layers"] for s in json.loads(result.stdout)["plan"]["stages"]] == counts
+
+
+def test_reverse_soc_order_preserves_explicit_uneven_layers(model):
+    result = invoke(
+        model, "--head-soc", "310p", "--peer-soc", "910b", "--layers", "6,6,18,18"
+    )
+    assert result.returncode == 0, result.stderr
+    assert [s["layers"] for s in json.loads(result.stdout)["plan"]["stages"]] == [
+        6,
+        6,
+        18,
+        18,
+    ]
+
+
+@pytest.mark.parametrize(
+    "declared,actual,accepted",
+    [
+        ("910b", "910B", True),
+        ("910b", "310P", False),
+        ("310p", "310P", True),
+        ("310p", "910B", False),
+    ],
+)
+@pytest.mark.parametrize("role", ["head", "worker"])
+def test_main_checks_configured_local_soc_before_starting_ray(
+    launcher, model, tmp_path, monkeypatch, declared, actual, accepted, role
+):
+    ip = "192.0.2.10" if role == "head" else "192.0.2.20"
+    network = {"node_ip": ip, "interface": "eth0"}
+    monkeypatch.setattr(launcher, "ipv4_interfaces", lambda: [])
+    monkeypatch.setattr(launcher, "select_network", lambda *a, **kw: network)
+    route = SimpleNamespace(connect=lambda *a: None, bind=lambda *a: None)
+    monkeypatch.setattr(launcher.socket, "socket", lambda *a: nullcontext(route))
+    monkeypatch.setattr(
+        launcher, "discover_runtime", lambda *a: (sys.executable, {}, {"soc": actual})
+    )
+    calls = []
+
+    def start_services(args, launch, *rest):
+        calls.append(launch)
+        return 0
+
+    monkeypatch.setattr(launcher, "start_services", start_services)
+    output = tmp_path / "launch"
+    rc = launcher.main(
+        [
+            "--head",
+            "192.0.2.10",
+            "--peer",
+            "192.0.2.20",
+            "--node-ip",
+            ip,
+            "--model",
+            str(model),
+            "--head-soc" if role == "head" else "--peer-soc",
+            declared,
+            "--layers",
+            "12,12,12,12",
+            "--output",
+            str(output),
+        ]
+    )
+    assert rc == (0 if accepted else 1)
+    assert bool(calls) is accepted
+    if accepted:
+        assert calls[0]["plan"]["stages"][0 if role == "head" else 2]["soc"] == actual
+    else:
+        assert (output / "failure.json").exists()
+        assert not (output / "ray_started.json").exists()
 
 
 def test_service_uses_vllm_capacity_and_batch_defaults(model):
@@ -204,6 +317,8 @@ def test_same_script_plans_both_roles_without_starting_ray_or_loading_npu(
         ("--layers", "18,18,6"),
         ("--layers", "18,18,6,0"),
         ("--layers", "18,18,6,5"),
+        ("--head-soc", "guess"),
+        ("--peer-soc", "guess"),
         ("--head", "192.0.2.20"),
         ("--node-ip", "192.0.2.99"),
         ("--ray-port", "8000"),

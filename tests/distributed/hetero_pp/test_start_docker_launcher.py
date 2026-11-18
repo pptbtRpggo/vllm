@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Execute the host launcher against network/Docker boundaries, without NPUs."""
 
+import json
 import os
 import shlex
 import signal
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -105,6 +107,71 @@ def test_local_ip_selects_image_and_nic_without_npu_smi(environment, local, soc)
     )
 
 
+@pytest.mark.parametrize(
+    "head,peer", [("910b", "910b"), ("310p", "910b"), ("310p", "310p")]
+)
+@pytest.mark.parametrize("local", ["141.147.135.53", "141.147.135.54"])
+@pytest.mark.parametrize("profile", [False, True])
+def test_configured_docker_socs_reach_real_inner_launcher(
+    environment, head, peer, local, profile
+):
+    environment["TEST_LOCAL_IP"] = local
+    model = Path(environment["TEST_MODEL"])
+    (model / "config.json").write_text(
+        json.dumps({"architectures": ["LlamaForCausalLM"], "num_hidden_layers": 48})
+    )
+    extra = ("--profile",) if profile else ()
+    result = invoke(
+        environment, "--head-soc", head, "--peer-soc", peer, "--dry-run", *extra
+    )
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout)
+    local_soc = head if local.endswith("53") else peer
+    image = (
+        "quay.io/ascend/vllm-ascend:v0.23.0-openeuler"
+        if local_soc == "910b"
+        else "quay.io/ascend/vllm-ascend:v0.23.0-310p-openeuler"
+    )
+    assert image in command
+    assert ("seccomp=unconfined" in command) is (local_soc == "310p")
+    inner = command[command.index("hetero-pp") + 1 :]
+    inner[inner.index("--model") + 1] = str(model)
+    result = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT.with_name("start_hetero_pp.sh")),
+            "--python",
+            sys.executable,
+            "--dry-run",
+            *inner,
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    launch = json.loads(result.stdout)
+    names = {"910b": "910B", "310p": "310P"}
+    assert [s["soc"] for s in launch["plan"]["stages"]] == [names[head]] * 2 + [
+        names[peer]
+    ] * 2
+    assert [s["layers"] for s in launch["plan"]["stages"]] == [12] * 4
+    assert launch["role"] == ("head" if local.endswith("53") else "worker")
+
+
+def test_homogeneous_worker_respects_custom_image_and_layers(environment):
+    environment["TEST_LOCAL_IP"] = "141.147.135.54"
+    environment["IMAGE_910B"] = "admin/910b:tested"
+    result = invoke(
+        environment, "--peer-soc", "910b", "--layers", "18,18,6,6", "--dry-run"
+    )
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout)
+    assert "admin/910b:tested" in command
+    assert command[command.index("--layers") + 1] == "18,18,6,6"
+
+
 def test_image_ports_and_noncontiguous_host_devices_can_be_overridden(environment):
     result = invoke(
         environment,
@@ -139,6 +206,8 @@ def test_image_ports_and_noncontiguous_host_devices_can_be_overridden(environmen
         ("--ray-port", "8000"),
         ("--api-port", "65536"),
         ("--layers", "18,18,6"),
+        ("--head-soc", "guess"),
+        ("--peer-soc", "guess"),
     ],
 )
 def test_invalid_configuration_never_generates_launch(environment, arguments):
