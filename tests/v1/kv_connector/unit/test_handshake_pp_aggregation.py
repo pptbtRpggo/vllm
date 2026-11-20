@@ -29,7 +29,7 @@ class _FakeExecutor:
         self,
         vllm_config: Any,
     ) -> None:
-        del vllm_config
+        self.max_concurrent_batches = vllm_config.max_concurrent_batches
         self.handshake_metadata = self.handshake_metadata_src
         self.handshake_calls = 0
         _FakeExecutor.last_instance = self

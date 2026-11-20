@@ -114,6 +114,11 @@ def argument_parser():
         help="连接 Ray 后采集并生成 DP 推荐，不启动 API",
     )
     parser.add_argument(
+        "--verify-overlap",
+        action="store_true",
+        help="Gloo 在线验证；head 自动发请求并检查 Stage 0/1 NPU kernel 重叠",
+    )
+    parser.add_argument(
         "--trace-root", type=Path, help="可选，profiling 本地结果根目录，无需共享存储"
     )
     parser.add_argument(
@@ -138,6 +143,14 @@ def argument_parser():
 
 
 def validate_options(args):
+    if args.verify_overlap and (args.profile or args.transport != "gloo"):
+        raise ValueError("--verify-overlap 仅用于 Gloo 在线验证")
+    if (
+        args.verify_overlap
+        and args.max_model_len is not None
+        and args.max_model_len < 392
+    ):
+        raise ValueError("--verify-overlap 需要至少 392 token 的模型上下文")
     if args.peer_soc is None:
         args.peer_soc = "910b" if args.transport == "hccl" else "310p"
     if args.transport == "hccl":
@@ -239,7 +252,7 @@ def resolve_chat_template(value):
     return str(path.resolve())
 
 
-def make_launch(args, node_ip, python, environment):
+def make_launch(args, node_ip, python, environment, output=None):
     validate_options(args)
     role = "head" if node_ip == args.head else "worker"
     plan = {
@@ -313,13 +326,33 @@ def make_launch(args, node_ip, python, environment):
         ]
         # Omitted options must reach vLLM as omitted, so model/platform defaults
         # remain authoritative instead of duplicating them in this launcher.
-        for name in (
-            "max_model_len",
-            "max_num_batched_tokens",
-            "max_num_seqs",
-            "gpu_memory_utilization",
-        ):
-            value = getattr(args, name)
+        options = {
+            name: getattr(args, name)
+            for name in (
+                "max_model_len",
+                "max_num_batched_tokens",
+                "max_num_seqs",
+                "gpu_memory_utilization",
+            )
+        }
+        if args.verify_overlap:
+            updates["VLLM_HETERO_PP_VERIFY_OVERLAP"] = "1"
+            options.update(max_num_batched_tokens=128, max_num_seqs=4)
+            trace_root = (output or args.output or ROOT / "output/preview").absolute()
+            serve += [
+                "--enable-chunked-prefill",
+                "--no-enable-prefix-caching",
+                "--profiler-config",
+                json.dumps(
+                    {
+                        "profiler": "torch",
+                        "torch_profiler_dir": str(trace_root / "overlap_traces"),
+                        "torch_profiler_with_stack": False,
+                        "ignore_frontend": True,
+                    }
+                ),
+            ]
+        for name, value in options.items():
             if value is not None:
                 serve += ["--" + name.replace("_", "-"), str(value)]
         template = resolve_chat_template(args.chat_template)
@@ -482,6 +515,26 @@ def profile_foreground(command, environment, log, timeout):
             raise
 
 
+def run_overlap_verifier(python, environment, output, port):
+    verifier = Path(__file__).with_name("verify_overlap.py")
+    receipt = output / "overlap_verification.json"
+    print("开始采集 Stage 0/1 的 NPU 批次重叠……", flush=True)
+    try:
+        result, text = capture(
+            [python, str(verifier), "--port", str(port), "--output", str(output)],
+            environment,
+            600,
+        )
+    except subprocess.TimeoutExpired:
+        result, text = 2, "重叠验证超过 600 秒\n"
+    if not receipt.exists():
+        result = 2
+        write_json(receipt, {"status": "inconclusive", "reason": text.strip()})
+    (output / "overlap_verification.log").write_text(text)
+    print(text, end="", flush=True)
+    return result
+
+
 def serve_foreground(
     command,
     environment,
@@ -491,6 +544,7 @@ def serve_foreground(
     *,
     health_host="127.0.0.1",
     headless=False,
+    verify_overlap=False,
 ):
     """Supervise a local server/worker until exit, bounding API readiness waits."""
     with log.open("w") as writer, log.open() as reader:
@@ -534,6 +588,24 @@ def serve_foreground(
                             else "API 已就绪；请发请求核对结果。Ctrl+C 停止本端服务。",
                             flush=True,
                         )
+                        if verify_overlap:
+                            result = run_overlap_verifier(
+                                command[0], environment, log.parent, api_port
+                            )
+                            if process.poll() is not None:
+                                raise RuntimeError("重叠验证期间 API 异常退出")
+                            os.killpg(process.pid, signal.SIGINT)
+                            api_rc = process.wait(timeout=30)
+                            print(reader.read(), end="", flush=True)
+                            write_json(
+                                log.parent / "server_exit.json",
+                                {
+                                    "returncode": api_rc,
+                                    "overlap_verification_returncode": result,
+                                    "ray_left_running": True,
+                                },
+                            )
+                            return result
                 if not ready and time.monotonic() >= deadline:
                     raise TimeoutError(f"模型 API 启动超时；见 {log.name}")
                 time.sleep(0.2)
@@ -554,6 +626,7 @@ def serve_foreground(
 def start_services(args, launch, environment, output, python):
     """Start native MP or join Ray before serving, preserving startup failures."""
     environment = dict(environment)
+    environment.pop("VLLM_HETERO_PP_VERIFY_OVERLAP", None)
     for name in launch.get("unset_environment", []):
         environment.pop(name, None)
     environment = dict(environment, **launch["environment"])
@@ -674,15 +747,17 @@ finally:
         output / "api.log",
         args.startup_timeout,
         args.api_port,
+        **({"verify_overlap": True} if args.verify_overlap else {}),
     )
-    write_json(
-        output / "server_exit.json",
-        {
-            "returncode": rc,
-            "model_inference_validated": False,
-            "ray_left_running": True,
-        },
-    )
+    if not args.verify_overlap:
+        write_json(
+            output / "server_exit.json",
+            {
+                "returncode": rc,
+                "model_inference_validated": False,
+                "ray_left_running": True,
+            },
+        )
     return rc if rc >= 0 else 128 - rc
 
 
@@ -761,7 +836,7 @@ def main(argv=None):
                 "核对 IP 和 --head-soc/--peer-soc"
             )
         env["GLOO_SOCKET_IFNAME"] = network["interface"]
-        launch = make_launch(args, node_ip, python, env)
+        launch = make_launch(args, node_ip, python, env, output)
         write_json(output / "local_preflight.json", dict(inventory, network=network))
         write_json(output / "plan.json", launch["plan"])
         write_json(output / "launch.json", launch)

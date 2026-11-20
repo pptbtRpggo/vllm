@@ -13,6 +13,10 @@
 | `--transport gloo`（默认） | 自定义 PP 执行器＋Ray | NPU→CPU→Gloo→CPU→NPU | 下述四种型号组合；支持现有 profiling |
 | `--transport hccl` | 原生 `vllm serve`＋双机 `mp` | Ascend 原生 HCCL 设备通信组 | 仅 910B＋910B；不支持现有 `--profile` |
 
+Gloo 在线服务默认使用 vLLM 的 PP 批队列。四个 stage 可同时容纳四个调度批次，
+完成一批后继续提交就绪批次。批内请求和 token 数仍由 vLLM 调度器决定。
+`--profile` 用于 EdgeShard 单批逐层采集。
+
 两台 910B、每台两张卡时，两边宿主机运行同一命令，只改各自的模型目录：
 
 ```bash
@@ -374,11 +378,67 @@ curl --fail http://127.0.0.1:8000/v1/completions \
 跨 SoC 的数值分歧需要分析，不能仅凭文字看起来正常就认定正确。
 本启动脚本不会生成模型正确性 `complete.json` 或自动声明通过。
 
-当前执行器一次只执行一个 scheduler batch，不保证四个 stage 持续重叠工作。
-先验收完整推理功能，再评估 TTFT、TPOT、吞吐及 CPU staging 开销。
-
 两端保存 NPU 利用率/显存、带 role 的请求及重复输出的短摘要诊断，见
 [监控与停止原因诊断](hetero_pp_monitor_zh.md)。
+
+## 在 NPU 上验证批次重叠
+
+普通 Gloo 服务的 `api.log` 应打印 `Heterogeneous PP max in-flight batches=4`。
+该行确认批队列已启用。实际重叠可用同一启动脚本自动采集和检查。
+
+在两台机器上都给原 `start_hetero_pp_docker.sh` 命令追加 `--verify-overlap`，
+其余 IP、模型和分层参数照常填写。容器内的 `start_hetero_pp.sh` 也支持该开关。
+先启动 head，再启动 peer。head 就绪后会预热、采集并检查输出 token IDs，最后
+停止本轮 API。peer 的 Ray 容器仍按启动提示手动停止。开关只用于 Gloo 在线
+验证，使用 128 token 的单批预算和四条 384 token 输入，与 EdgeShard 的
+`--profile` 分开运行。
+
+在 head 本轮 `start/overlap_verification.json` 查看结果，原始时间线保存在
+`start/overlap_traces/`。
+
+| 状态 | 条件 |
+| --- | --- |
+| `passed` | Stage 0 的较新批次和 Stage 1 的较早批次有实际 NPU 计算 kernel 重叠，回执记录两个批次及重叠微秒数 |
+| `not_observed` | 本轮可配对的 kernel 中未观测到重叠 |
+| `inconclusive` | 请求、trace、批次关联或时间轴检查证据不足，回执记录原因 |
+
+自动比较限于同一台主机上的 Stage 0 和 Stage 1。四卡均参与模型推理。
+
+### 手工采集时间线
+
+按[手动启动指南](hetero_pp_cpu_gloo_zh.md)在两端启动 Ray。启动 Ray 前在两端
+设 `export VLLM_CUSTOM_SCOPES_FOR_PROFILING=1`，让 worker 可以记录 `forward`
+区间。两端容器都准备可写的 `/tmp/pp-npu-trace`，随后只在 head 启动下面的
+在线服务。`MODEL` 指向已有模型，`PLAN` 指向手动指南中的四阶段 JSON。
+
+```bash
+bash examples/online_serving/hetero_pp/serve.sh \
+  --served-model-name hetero-model \
+  --max-num-batched-tokens 128 --enable-chunked-prefill \
+  --no-enable-prefix-caching \
+  --profiler-config '{"profiler":"torch","torch_profiler_dir":"/tmp/pp-npu-trace","torch_profiler_with_stack":false,"ignore_frontend":true}'
+```
+
+先发一轮预热。正式采集时在 head 的另一个 shell 运行下面的命令。此处以
+CodeLlama 为例，四条输入各 384 token，超过单批 128 token 的预算。
+
+```bash
+tokens=$(printf ',42%.0s' {1..383})
+curl -fsS -X POST http://127.0.0.1:8000/start_profile
+curl -fsS http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"hetero-model\",\"prompt\":[[41${tokens}],[42${tokens}],[43${tokens}],[44${tokens}]],\"temperature\":0,\"max_tokens\":8,\"ignore_eos\":true,\"return_token_ids\":true}" \
+  -o pp_overlap_response.json
+curl -fsS -X POST http://127.0.0.1:8000/stop_profile
+```
+
+从两边容器取 `/tmp/pp-npu-trace` 下的 worker trace，查看 `trace_view.json`
+中的 `forward` 和关联 NPU kernel。先在同一主机的 Stage 0 和 Stage 1 上，
+按采集窗口内的非空 forward 顺序定位相同批次。验收时看 **Stage 0 的后一批
+计算 kernel 是否与 Stage 1 的前一批计算 kernel 在同一时间窗口重叠**。
+两个分别从零开始的时间轴不能直接对齐，比较时保留采集原始时间戳。要验证
+跨机的 Stage 1 和 Stage 2，还需核对两台机器的时钟偏差小于观察到的重叠。
+请求成功和 NPU 利用率可用于功能检查。TTFT、TPOT 和吞吐另在关闭采集时测量。
 
 ## 停止与再次启动
 

@@ -37,6 +37,24 @@ def test_profile_host_sync_reaches_the_real_profile_subprocess(model):
     assert plan["serve_command"] is None
 
 
+def test_overlap_verification_selects_head_profiler_and_small_batches(model):
+    result = invoke(model, "--verify-overlap")
+    assert result.returncode == 0, result.stderr
+    launch = json.loads(result.stdout)
+    command = launch["serve_command"]
+    assert launch["environment"]["VLLM_HETERO_PP_VERIFY_OVERLAP"] == "1"
+    assert command[command.index("--max-num-batched-tokens") + 1] == "128"
+    profiler = json.loads(command[command.index("--profiler-config") + 1])
+    assert profiler["profiler"] == "torch"
+
+
+@pytest.mark.parametrize("options", [["--profile"], ["--transport", "hccl"]])
+def test_overlap_verification_rejects_other_modes(model, options):
+    result = invoke(model, "--verify-overlap", *options)
+    assert result.returncode != 0
+    assert "--verify-overlap 仅用于" in result.stderr
+
+
 def invoke(model, *extra, environment=None):
     return subprocess.run(
         [
@@ -810,6 +828,54 @@ def test_api_startup_timeout_stops_only_the_child(launcher, tmp_path):
             1,
         )
     assert not (tmp_path / "api_ready.json").exists()
+
+
+def test_overlap_mode_runs_verifier_and_shuts_down_api(launcher, tmp_path):
+    with socket.socket() as selection:
+        selection.bind(("127.0.0.1", 0))
+        port = selection.getsockname()[1]
+    code = """
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def do_POST(self):
+        if self.path == '/v1/completions':
+            self.rfile.read(int(self.headers['Content-Length']))
+        self.send_response(200)
+        self.end_headers()
+        if self.path == '/v1/completions':
+            self.wfile.write(json.dumps(dict(
+                choices=[dict(index=i, token_ids=[i] * 8) for i in range(4)],
+                usage={'completion_tokens': 32},
+            )).encode())
+
+with HTTPServer(('127.0.0.1', int(sys.argv[1])), Handler) as server:
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print('verification API stopped', flush=True)
+"""
+    log = tmp_path / "api.log"
+    rc = launcher.serve_foreground(
+        [sys.executable, "-c", code, str(port)],
+        dict(os.environ),
+        log,
+        5,
+        port,
+        verify_overlap=True,
+    )
+    receipt = json.loads((tmp_path / "overlap_verification.json").read_text())
+    exit_receipt = json.loads((tmp_path / "server_exit.json").read_text())
+    assert rc == 2 and exit_receipt["returncode"] == 0
+    assert receipt["status"] == "inconclusive" and receipt["token_ids_matched"]
+    assert "POST /start_profile" in log.read_text()
+    assert "POST /stop_profile" in log.read_text()
+    assert "verification API stopped" in log.read_text()
 
 
 @pytest.mark.parametrize("headless", [False, True])

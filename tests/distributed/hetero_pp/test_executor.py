@@ -4,6 +4,7 @@
 
 import importlib.util
 import sys
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -20,7 +21,15 @@ class ExecutorTests(unittest.TestCase):
         )
         self.assertTrue(p.exists(), "Ray heterogeneous executor is not implemented")
         dep = ModuleType("vllm.v1.executor.abstract")
-        dep.__dict__["Executor"] = type("Executor", (), {})
+
+        class Executor:
+            vllm_config: NS
+
+            @property
+            def max_concurrent_batches(self):
+                return self.vllm_config.max_concurrent_batches
+
+        dep.__dict__["Executor"] = Executor
         with patch.dict(sys.modules, {"vllm.v1.executor.abstract": dep}):
             spec = importlib.util.spec_from_file_location("executor_test", p)
             assert spec is not None and spec.loader is not None
@@ -76,13 +85,16 @@ class ExecutorTests(unittest.TestCase):
         obj = object.__new__(mod.HeteroPPExecutor)
         obj.ray = Ray()
         obj.workers = [Actor(r) for r in range(4)]
+        obj.vllm_config = NS(max_concurrent_batches=len(obj.workers))
+        obj._profiling_enabled = False
         obj.timeout_s = 2
         obj._failed = False
+        obj._failure_lock = threading.Lock()
         obj._pool = ThreadPoolExecutor(max_workers=1)
-        import threading
-
+        obj._responses = ThreadPoolExecutor(max_workers=1)
         obj._shutdown_lock = threading.RLock()
         obj._shutting_down = obj._shutdown_complete = False
+        self.addCleanup(obj._responses.shutdown)
         self.addCleanup(obj._pool.shutdown)
         return obj, events
 
@@ -92,7 +104,9 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(
             events[:4], [("submit", 0), ("submit", 1), ("submit", 2), ("submit", 3)]
         )
-        self.assertEqual(events[4], ("get", 4, 2))
+        method, count, timeout = events[4]
+        self.assertEqual((method, count), ("get", 4))
+        self.assertTrue(0 < timeout <= 2)
 
     def test_middle_error_kills_only_owned_actors_and_refuses_more_work(self):
         obj, events = self.make(error=True)
@@ -111,6 +125,93 @@ class ExecutorTests(unittest.TestCase):
         obj, events = self.make()
         future = obj.execute_model("schedule", non_block=True)
         self.assertEqual(future.result(timeout=2), "last-output")
+
+    def test_serving_uses_native_pipeline_depth(self):
+        obj, _ = self.make()
+        self.assertEqual(obj.max_concurrent_batches, len(obj.workers))
+
+    def test_profiling_keeps_one_batch(self):
+        obj, _ = self.make()
+        obj._profiling_enabled = True
+        self.assertEqual(obj.max_concurrent_batches, 1)
+
+    def test_stage_zero_starts_b_while_stage_one_still_runs_a(self):
+        obj, _ = self.make()
+        in_a, release_a, started_b, sampled_a = (threading.Event() for _ in range(4))
+        stage_calls: list[list[tuple[str, str]]] = [[] for _ in obj.workers]
+
+        def run(rank, method, batch):
+            stage_calls[rank].append((method, batch))
+            if (rank, method, batch) == (1, "execute_model", "A"):
+                in_a.set()
+                self.assertTrue(release_a.wait(5))
+            if (rank, method, batch) == (0, "execute_model", "B"):
+                self.assertTrue(in_a.wait(5))
+                started_b.set()
+            if (rank, method, batch) == (3, "sample_tokens", "A"):
+                self.assertTrue(release_a.wait(5))
+                sampled_a.set()
+            return batch if method == "sample_tokens" and rank == 3 else None
+
+        actor_pools = [ThreadPoolExecutor(max_workers=1) for _ in obj.workers]
+        for worker, pool in zip(obj.workers, actor_pools, strict=True):
+            worker.call = NS(
+                remote=lambda method, args, kwargs, rank=worker.rank, pool=pool: (
+                    pool.submit(run, rank, method, args[0])
+                )
+            )
+        obj.ray.get = lambda refs, timeout: [ref.result(timeout) for ref in refs]
+        obj.timeout_s = 5
+        try:
+            forward_a = obj.execute_model("A", non_block=True)
+            sample_a = obj.sample_tokens("A", non_block=True)
+            self.assertTrue(in_a.wait(2))
+            forward_b = obj.execute_model("B", non_block=True)
+            sample_b = obj.sample_tokens("B", non_block=True)
+            self.assertTrue(started_b.wait(1), "Stage 0 is still waiting for batch A")
+            self.assertFalse(forward_a.done())
+            self.assertFalse(sampled_a.is_set())
+            release_a.set()
+            self.assertIsNone(forward_a.result(2))
+            self.assertIsNone(forward_b.result(2))
+            self.assertEqual(sample_a.result(2), "A")
+            self.assertEqual(sample_b.result(2), "B")
+            expected = [
+                ("execute_model", "A"),
+                ("sample_tokens", "A"),
+                ("execute_model", "B"),
+                ("sample_tokens", "B"),
+            ]
+            self.assertEqual(stage_calls, [expected] * 4)
+        finally:
+            release_a.set()
+            for pool in actor_pools:
+                pool.shutdown()
+
+    def test_stage_failure_fails_all_posted_batches(self):
+        obj, events = self.make()
+        collecting, fail = threading.Event(), threading.Event()
+
+        def gather(refs, timeout):
+            collecting.set()
+            self.assertTrue(fail.wait(2))
+            raise RuntimeError("stage1 failed")
+
+        obj.ray.get = gather
+        first = obj.execute_model("A", non_block=True)
+        try:
+            self.assertTrue(collecting.wait(2))
+            second = obj.execute_model("B", non_block=True)
+            self.assertEqual(events, [("submit", r) for r in range(4)] * 2)
+        finally:
+            fail.set()
+        with self.assertRaisesRegex(RuntimeError, "stage1 failed"):
+            first.result(2)
+        with self.assertRaisesRegex(RuntimeError, "executor has failed"):
+            second.result(2)
+        self.assertEqual(
+            [e for e in events if e[0] == "kill"], [("kill", rank) for rank in range(4)]
+        )
 
     def test_synchronous_rpc_cannot_overtake_pending_model_rpc(self):
         """All public calls must share one rank-consistent submission queue."""

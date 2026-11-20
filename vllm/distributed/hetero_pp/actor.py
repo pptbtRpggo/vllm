@@ -82,6 +82,9 @@ class PipelineActor:
         )
         self.wrapper.init_worker([kwargs])
         self.wrapper.init_device()
+        self.wrapper.worker._hetero_verify_overlap = (
+            os.environ.get("VLLM_HETERO_PP_VERIFY_OVERLAP") == "1"
+        )
         self.call("load_model", (), {})
         runner = self.wrapper.worker.model_runner
         model = runner.model

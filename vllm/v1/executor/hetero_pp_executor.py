@@ -22,6 +22,11 @@ class HeteroPPExecutor(Executor):
     uses_ray = True
     supports_pp = True
 
+    @property
+    def max_concurrent_batches(self) -> int:
+        # EdgeShard measures isolated steps. Serving uses vLLM's PP queue size.
+        return 1 if self._profiling_enabled else super().max_concurrent_batches
+
     def _init_executor(self):
         import ray
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -37,10 +42,14 @@ class HeteroPPExecutor(Executor):
         self.ray = ray
         self.workers = []
         self._failed = False
+        self._failure_lock = threading.Lock()
         self._shutdown_lock = threading.RLock()
         self._shutting_down = self._shutdown_complete = False
         self._pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="hetero-pp-rpc"
+        )
+        self._responses = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hetero-pp-results"
         )
         try:
             raw = os.environ.get("VLLM_HETERO_PP_PLAN")
@@ -51,6 +60,12 @@ class HeteroPPExecutor(Executor):
             layers = self.model_config.hf_text_config.num_hidden_layers
             self.plan = PipelinePlan.from_dict(json.loads(raw), layers)
             self.timeout_s = self.plan.timeout_s
+            profile_env = profile_actor_environment()
+            self._profiling_enabled = bool(profile_env["VLLM_PP_STAGE_TRACE"])
+            verify_overlap = os.environ.get("VLLM_HETERO_PP_VERIFY_OVERLAP") == "1"
+            if verify_overlap and self._profiling_enabled:
+                raise ValueError("PP overlap verification requires online PP mode")
+            profile_env["VLLM_HETERO_PP_VERIFY_OVERLAP"] = "1" if verify_overlap else ""
             os.environ["VLLM_PP_LAYER_PARTITION"] = self.plan.partition
             validate_runtime(self.vllm_config, len(self.plan.stages))
             architectures = self.model_config.hf_config.architectures
@@ -72,7 +87,7 @@ class HeteroPPExecutor(Executor):
             remote = ray.remote(
                 num_cpus=1,
                 resources={"NPU": 1},
-                runtime_env={"env_vars": profile_actor_environment()},
+                runtime_env={"env_vars": profile_env},
                 max_restarts=0,
                 max_task_retries=0,
             )(PipelineActor)
@@ -128,37 +143,62 @@ class HeteroPPExecutor(Executor):
             self.startup_reports = reports
             import logging
 
-            logging.getLogger(__name__).info(
-                "Heterogeneous PP startup reports: %s", json.dumps(reports)
+            logger = logging.getLogger(__name__)
+            logger.info("Heterogeneous PP startup reports: %s", json.dumps(reports))
+            logger.info(
+                "Heterogeneous PP max in-flight batches=%d", self.max_concurrent_batches
             )
         except BaseException:
             self._kill_owned()
             self._pool.shutdown(wait=False, cancel_futures=True)
+            self._responses.shutdown(wait=False, cancel_futures=True)
             raise
 
     def _kill_owned(self):
         import logging
-        import threading
         import traceback
 
+        with self._failure_lock:
+            if self._failed:
+                return
+            self._failed = True
         logging.getLogger(__name__).debug(
             "Owned actor termination thread=%s caller=%s",
             threading.get_ident(),
             "".join(traceback.format_stack(limit=5)),
         )
-        self._failed = True
         for worker in self.workers:
             with suppress(Exception):
                 self.ray.kill(worker, no_restart=True)
 
-    def _rpc(self, method, args, kwargs, timeout):
+    def _check_healthy(self):
         if self._failed:
             raise RuntimeError("heterogeneous PP executor has failed or shut down")
+
+    def _post_rpc(self, method, args, kwargs):
+        self._check_healthy()
         try:
-            refs = [w.call.remote(method, args, kwargs) for w in self.workers]
-            return self.ray.get(
-                refs, timeout=self.timeout_s if timeout is None else timeout
+            return [w.call.remote(method, args, kwargs) for w in self.workers]
+        except BaseException:
+            self._kill_owned()
+            raise
+
+    def _collect_rpc(self, refs, deadline):
+        self._check_healthy()
+        try:
+            return self.ray.get(refs, timeout=max(0, deadline - time.monotonic()))
+        except BaseException:
+            self._kill_owned()
+            raise
+
+    def _rpc(self, method, args, kwargs, timeout):
+        # Control RPCs (health, cache setup, etc.) retain their drain barrier.
+        deadline = time.monotonic() + (self.timeout_s if timeout is None else timeout)
+        try:
+            self._responses.submit(self._check_healthy).result(
+                timeout=max(0, deadline - time.monotonic())
             )
+            return self._collect_rpc(self._post_rpc(method, args, kwargs), deadline)
         except BaseException:
             self._kill_owned()
             raise
@@ -178,25 +218,29 @@ class HeteroPPExecutor(Executor):
         if self._shutting_down or self._shutdown_complete:
             raise RuntimeError("heterogeneous PP executor is shutting down")
 
-    def _last_output(self, method, value):
-        # Accepted pool work must still finish after shutdown closes admission.
-        return self._rpc(method, (value,), {}, None)[-1]
+    def _last_output(self, refs, deadline):
+        return self._collect_rpc(refs, deadline)[-1]
+
+    def _post_model_rpc(self, method, value):
+        # One submitter preserves FIFO on each actor. Waiting for any stage's
+        # result here would prevent an idle early stage from starting batch B.
+        deadline = time.monotonic() + self.timeout_s
+        refs = self._post_rpc(method, (value,), {})
+        return self._responses.submit(self._last_output, refs, deadline)
+
+    def _model_rpc(self, method, value, non_block):
+        with self._shutdown_lock:
+            self._check_accepting()
+            submission = self._pool.submit(self._post_model_rpc, method, value)
+        # Wait only until the RPCs are posted to the actor queues.
+        future = submission.result()
+        return future if non_block else future.result()
 
     def execute_model(self, scheduler_output, non_block=False):
-        with self._shutdown_lock:
-            self._check_accepting()
-            future = self._pool.submit(
-                self._last_output, "execute_model", scheduler_output
-            )
-        return future if non_block else future.result()
+        return self._model_rpc("execute_model", scheduler_output, non_block)
 
     def sample_tokens(self, grammar_output, non_block=False):
-        with self._shutdown_lock:
-            self._check_accepting()
-            future = self._pool.submit(
-                self._last_output, "sample_tokens", grammar_output
-            )
-        return future if non_block else future.result()
+        return self._model_rpc("sample_tokens", grammar_output, non_block)
 
     def check_health(self):
         self.collective_rpc("check_health")
@@ -223,24 +267,26 @@ class HeteroPPExecutor(Executor):
             if self._shutting_down or self._shutdown_complete:
                 return
             self._shutting_down = True
-            exited = False
-            deadline = time.monotonic() + min(self.timeout_s, 20)
-            try:
-                if not self._failed:
-                    # generate() may return while a final bookkeeping step is
-                    # still in flight. Drain accepted RPCs before group teardown.
-                    self._pool.submit(lambda: None).result(
+        exited = False
+        deadline = time.monotonic() + min(self.timeout_s, 20)
+        try:
+            if not self._failed:
+                # Close admission, drain posts, then drain responses before
+                # destroying the communication groups.
+                for pool in (self._pool, self._responses):
+                    pool.submit(lambda: None).result(
                         timeout=max(0, deadline - time.monotonic())
                     )
-                    if self._failed:
-                        raise RuntimeError("pending PP RPC failed during shutdown")
-                    refs = [w.shutdown.remote() for w in self.workers]
-                    self.ray.get(refs, timeout=max(0, deadline - time.monotonic()))
-                    self._exit_owned(deadline)
-                    exited = True
-            finally:
-                if not exited:
-                    self._kill_owned()
+                self._check_healthy()
+                refs = [w.shutdown.remote() for w in self.workers]
+                self.ray.get(refs, timeout=max(0, deadline - time.monotonic()))
+                self._exit_owned(deadline)
+                exited = True
+        finally:
+            if not exited:
+                self._kill_owned()
+            self._pool.shutdown(wait=False, cancel_futures=True)
+            self._responses.shutdown(wait=False, cancel_futures=True)
+            with self._shutdown_lock:
                 self._failed = True
-                self._pool.shutdown(wait=False, cancel_futures=True)
                 self._shutdown_complete = True

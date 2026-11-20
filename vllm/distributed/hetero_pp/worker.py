@@ -160,6 +160,26 @@ class StagingWorkerMixin:
 
         return run_stage(*args)
 
+    def profile(self, is_start=True, profile_prefix=None):
+        verify_overlap = getattr(self, "_hetero_verify_overlap", False)
+        # Keep both captures on the head's clock. Peer stages still run inference.
+        if verify_overlap and self.rank >= 2:
+            return None
+        result = super().profile(is_start, profile_prefix)  # type: ignore[misc]
+        if verify_overlap:
+            self._hetero_overlap_active = is_start
+        return result
+
+    def _execute_overlap_forward(self, scheduler_output, invoke):
+        if not getattr(self, "_hetero_overlap_active", False):
+            return invoke()
+        if not scheduler_output.total_num_scheduled_tokens:
+            return invoke()
+        from torch.profiler import record_function
+
+        with record_function(f"hetero_pp.forward.{self.rank}.{self._hetero_sequence}"):
+            return invoke()
+
     def execute_model(self, scheduler_output):
         from vllm.sequence import IntermediateTensors
 
@@ -174,7 +194,9 @@ class StagingWorkerMixin:
             inputs = None if values is None else IntermediateTensors(values)
             invoke = lambda: self.model_runner.execute_model(scheduler_output, inputs)
             output = (
-                profiler.execute(step, invoke) if profiler is not None else invoke()
+                profiler.execute(step, invoke)
+                if profiler is not None
+                else self._execute_overlap_forward(scheduler_output, invoke)
             )
             if (
                 self.rank < self.parallel_config.world_size - 1

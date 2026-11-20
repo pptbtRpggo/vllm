@@ -19,7 +19,7 @@ devices="${HOST_NPU_DEVICES:-0,1}"
 ray_port="${RAY_PORT:-16379}" api_port="${SERVICE_PORT:-8000}"
 master_port="${MASTER_PORT:-29501}"
 layers="${PP_LAYERS:-}"
-interface="" dry_run=false debug_shell=false profile=false trace_root=""
+interface="" dry_run=false debug_shell=false profile=false verify_overlap=false trace_root=""
 forward=()
 
 usage() {
@@ -45,6 +45,7 @@ usage() {
   --api-port PORT      默认 8000；gloo 在 head 回环监听，hccl 在所有网卡监听
   --layers A,B,C,D     原 910B→310P 默认 18,18,6,6；其他组合按模型总层数均分
   --profile           仅 gloo：连接 Ray，head 采集/打印统计/生成 DP，不启动 API
+  --verify-overlap    仅 Gloo 在线：head 自动验证 Stage 0/1 NPU 批次重叠
   --trace-root DIR    可选，本机结果目录；不需要共享，默认随本轮日志保存
                        peer 记录由 master 通过现有 Ray 连接自动收回并校验
   --profile-timeout N profiling 全流程上限秒数，默认 3600
@@ -74,6 +75,7 @@ while (($#)); do
     --dry-run) dry_run=true; shift ;;
     --shell) debug_shell=true; shift ;;
     --profile) profile=true; shift ;;
+    --verify-overlap) verify_overlap=true; shift ;;
     --head|--peer|--head-soc|--peer-soc|--transport|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--master-port|--api-port|--layers|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python|--chat-template|--trace-root|--profile-timeout|--profile-compute-timing|--block-size|--num-gpu-blocks-override)
       (($# >= 2)) && [[ -n "$2" && "$2" != --* ]] || die "$1 缺少参数"
       case "$1" in
@@ -105,6 +107,12 @@ if [[ -z "$peer_soc" ]]; then
   if [[ "$transport" == hccl ]]; then peer_soc=910b; else peer_soc=310p; fi
 fi
 peer_soc="$(normalize_soc "$peer_soc")"
+if "$verify_overlap"; then
+  if [[ "$transport" != gloo ]] || "$profile" || "$debug_shell"; then
+    die '--verify-overlap 仅用于 Gloo 在线验证'
+  fi
+  forward+=(--verify-overlap)
+fi
 if [[ "$transport" == hccl ]]; then
   [[ "$head_soc" == 910b && "$peer_soc" == 910b ]] || die 'HCCL 只支持两边 910B；异构请用 gloo'
   "$profile" && die 'HCCL 不支持当前 --profile；采集请用 gloo'

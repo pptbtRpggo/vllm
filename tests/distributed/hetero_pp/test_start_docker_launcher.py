@@ -65,6 +65,22 @@ def invoke(environment, *arguments):
 
 
 @pytest.mark.parametrize("local", ["141.147.135.53", "141.147.135.54"])
+def test_docker_forwards_overlap_flag_on_both_hosts(environment, local):
+    environment["TEST_LOCAL_IP"] = local
+    result = invoke(environment, "--verify-overlap", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    assert "--verify-overlap" in shlex.split(result.stdout)
+
+
+@pytest.mark.parametrize("option", ["--profile", "--shell", "--transport=hccl"])
+def test_docker_overlap_flag_rejects_incompatible_modes(environment, option):
+    options = option.split("=")
+    result = invoke(environment, "--verify-overlap", *options, "--dry-run")
+    assert result.returncode != 0
+    assert "--verify-overlap 仅用于" in result.stderr
+
+
+@pytest.mark.parametrize("local", ["141.147.135.53", "141.147.135.54"])
 def test_hccl_docker_selects_910b_and_forwards_native_network_and_port(
     environment,
     local,

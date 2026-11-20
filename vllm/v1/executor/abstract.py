@@ -44,6 +44,11 @@ class Executor(ABC):
     uses_ray: bool = False  # whether the executor uses Ray for orchestration.
     supports_pp: bool = False  # whether the executor supports PP
 
+    @property
+    def max_concurrent_batches(self) -> int:
+        """Maximum number of batches the engine may schedule ahead."""
+        return self.vllm_config.max_concurrent_batches
+
     @staticmethod
     def get_class(vllm_config: VllmConfig) -> type["Executor"]:
         executor_class: type[Executor]

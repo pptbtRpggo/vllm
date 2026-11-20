@@ -1201,6 +1201,7 @@ def test_engine_core_proc_instantiation_cuda_empty(monkeypatch: pytest.MonkeyPat
 
     def create_mock_executor(vllm_config):
         mock_executor = MagicMock()
+        mock_executor.max_concurrent_batches = vllm_config.max_concurrent_batches
 
         # Only implement the methods that are actually called during init
         from vllm.v1.kv_cache_interface import FullAttentionSpec
