@@ -140,6 +140,37 @@ head 自动采集、回收 peer trace、打印表格和输出 DP。peer 不重�
 统一启动入口的普通服务已改为沿用 vLLM 的容量/组批默认值；`--profile` 仍独立
 保留上下文 512、token budget 256、序列数 4、显存比例 0.8 的原采集配置，均可
 显式覆盖。验证推荐方案时，普通服务须显式对齐本轮采集配置。
+
+### 两机四张 910B，用 HCCL 对不同核心额度做 profile
+
+两个宿主机都执行以下命令，按本机实际情况填写模型路径和空闲卡。
+两边的 IP、端口、分层、核心额度和 profiling 容量参数保持一致。
+
+```bash
+bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
+  --head 53 --peer 55 --model /本机/模型目录 --devices 0,1 \
+  --transport hccl --layers 12,12,12,12 \
+  --npu-core-fractions 1,1,1/2,1/4 --profile
+```
+
+四个值依次对应 PP stage 0 到 3。用 `1,1,1,1` 跑全额对照，用
+`1,1,1/2,1/4` 跑混合额度。910B worker 通过 CANN 限制 Cube Core 和
+Vector Core，分数向下取整到整数核心。进程额度不改变显存容量。
+Gloo 和 HCCL 的普通服务也接受相同参数。
+
+head 运行采集、统计和 EdgeShard DP，peer 运行原生 `mp` headless
+worker。head 和 peer 可各用本机日志目录，head 通过 worker RPC 收集
+四个 rank 的记录。head 完成后，若 peer 容器仍在前台，按 Ctrl+C 结束本轮
+headless worker。
+
+结果在 head 日志下的 `profiles/edgeshard_*`。检查
+`profile_manifest.json` 的 `transport=native_hccl`、四个 rank 的
+`pp_tensor_backend=hccl`，以及 stage 2/3 的 `npu_core_limit` 读回值。
+跨机交接耗时在 `stage_and_link_timing_summary.csv` 的
+`stage1->2` 行。激活张量走 HCCL，交接计时也包含 CPU 元数据和 ACK。
+推荐层数见 `recommended_hetero_plan.json`。验证推荐时，两边去掉
+`--profile`、替换 `--layers` 并保留核心额度和本轮容量设置。
+
 已有容器且 Ray 已连好、推理服务已退出：只在 head 容器中运行：
 
 ```bash

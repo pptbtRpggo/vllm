@@ -37,6 +37,59 @@ def test_profile_host_sync_reaches_the_real_profile_subprocess(model):
     assert plan["serve_command"] is None
 
 
+@pytest.mark.parametrize("profile", [(), ("--profile",)])
+def test_core_fractions_bind_to_the_same_stage_plan_for_serving_and_profile(
+    model, profile
+):
+    result = invoke(model, "--npu-core-fractions", "1,1,0.5,1/4", *profile)
+    assert result.returncode == 0, result.stderr
+    launch = json.loads(result.stdout)
+    stages = launch["plan"]["stages"]
+    assert [s.get("npu_core_fraction", "1") for s in stages] == ["1", "1", "1/2", "1/4"]
+    assert json.loads(launch["environment"]["VLLM_HETERO_PP_PLAN"]) == launch["plan"]
+
+
+@pytest.mark.parametrize("fractions", ["1,1/2", "1,1,0,1/4", "1,1,1/0,1/4", "1,1,2,1"])
+def test_invalid_core_fractions_rejected_before_launch(model, fractions):
+    result = invoke(model, "--npu-core-fractions", fractions)
+    assert result.returncode != 0
+    assert "--npu-core-fractions 需要四个" in result.stderr
+    assert not result.stdout
+
+
+@pytest.mark.parametrize("ip", ["192.0.2.10", "192.0.2.20"])
+def test_native_hccl_profile_uses_one_plan_and_two_mp_roles(model, ip):
+    result = invoke(
+        model,
+        "--node-ip",
+        ip,
+        "--transport",
+        "hccl",
+        "--profile",
+        "--npu-core-fractions",
+        "1,1,1/2,1/4",
+    )
+    assert result.returncode == 0, result.stderr
+    launch = json.loads(result.stdout)
+    assert launch["ray_command"] is None
+    env = launch["environment"]
+    assert json.loads(env["VLLM_HETERO_PP_PLAN"]) == launch["plan"]
+    assert [s.get("npu_core_fraction", "1") for s in launch["plan"]["stages"]] == [
+        "1",
+        "1",
+        "1/2",
+        "1/4",
+    ]
+    if ip.endswith(".10"):
+        assert launch["profile_command"][-1].endswith("profile_edgeshard.sh")
+        assert launch["profile_environment"]["PROFILE_TRANSPORT"] == "hccl"
+    else:
+        command = launch["profile_command"]
+        assert "--headless" in command and "--no-async-scheduling" in command
+        assert command[command.index("--worker-cls") + 1].endswith("Native910BWorker")
+        assert command[command.index("--num-gpu-blocks-override") + 1] == "64"
+
+
 def test_overlap_verification_selects_head_profiler_and_small_batches(model):
     result = invoke(model, "--verify-overlap")
     assert result.returncode == 0, result.stderr
@@ -139,12 +192,11 @@ def test_hccl_starts_native_mp_on_each_node_without_ray(model, ip, rank):
     [
         (("--peer-soc", "310p"), "910B"),
         (("--head-soc", "310p", "--peer-soc", "310p"), "910B"),
-        (("--profile",), "profile"),
         (("--master-port", "8000"), "端口"),
         (("--master-port", "65536"), "端口"),
     ],
 )
-def test_hccl_rejects_unsupported_topology_profile_and_ports(model, extra, message):
+def test_hccl_rejects_unsupported_topology_and_ports(model, extra, message):
     result = invoke(model, "--transport", "hccl", *extra)
     assert result.returncode != 0
     assert message in result.stderr
