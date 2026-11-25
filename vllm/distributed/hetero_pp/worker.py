@@ -11,65 +11,6 @@ if TYPE_CHECKING:
     from vllm.distributed.hetero_pp.profiling import StageProfiler
 
 
-def apply_npu_core_limit(soc: str, fraction: str) -> dict:
-    """Apply and verify a process-local CANN quota on the already bound device."""
-    from fractions import Fraction
-
-    import acl
-
-    rt = acl.rt
-    if not all(
-        callable(getattr(rt, name, None))
-        for name in ("get_device_res_limit", "set_device_res_limit")
-    ):
-        raise RuntimeError("NPU core limit requires CANN's device resource limit APIs")
-    device, ret = rt.get_device()
-    if ret != 0:
-        raise RuntimeError(f"cannot query device for NPU core limit (ACL error {ret})")
-
-    # CANN resource types 0/1 are Cube/Vector on A2. On 310P type 0 is AI Core.
-    resources = (
-        ("cube_core_num", "vector_core_num") if soc == "910B" else ("ai_core_num",)
-    )
-
-    def read_limits():
-        limits = {}
-        for kind, name in enumerate(resources):
-            count, ret = rt.get_device_res_limit(device, kind)
-            if ret != 0 or count < 1:
-                raise RuntimeError(
-                    f"{soc} device {device}: cannot read {name} core limit "
-                    f"(count {count}, ACL error {ret})"
-                )
-            limits[name] = count
-        return limits
-
-    original = read_limits()
-    ratio = Fraction(fraction)
-    requested = {name: int(count * ratio) for name, count in original.items()}
-    if min(requested.values()) < 1:
-        raise RuntimeError(f"{soc} NPU core limit {fraction} rounds below one core")
-    for kind, name in enumerate(resources):
-        ret = rt.set_device_res_limit(device, kind, requested[name])
-        if ret != 0:
-            raise RuntimeError(
-                f"{soc} device {device}: cannot set {name} core limit to "
-                f"{requested[name]} (ACL error {ret})"
-            )
-    effective = read_limits()
-    if effective != requested:
-        raise RuntimeError(
-            f"{soc} device {device}: NPU core limit readback {effective} "
-            f"does not match {requested}"
-        )
-    return {
-        "fraction": str(ratio),
-        "logical_device_id": device,
-        "original": original,
-        "effective": effective,
-    }
-
-
 class _AdjacentLink:
     def __init__(self, channel, rank):
         self.channel, self.rank = channel, rank
@@ -81,7 +22,7 @@ class _AdjacentLink:
         return self.channel.send(values, self.rank + 1, sequence)
 
 
-class ProfileWorkerMixin:
+class StagingWorkerMixin:
     if TYPE_CHECKING:
         # Supplied by the native SoC worker selected lazily in __getattr__.
         vllm_config: VllmConfig
@@ -94,7 +35,6 @@ class ProfileWorkerMixin:
         distributed_init_method: str
         _hetero_timeout_s: float
         _hetero_profiler: StageProfiler | None
-        _hetero_stage_soc: str
 
     def _get_hetero_profiler(self):
         if hasattr(self, "_hetero_profiler"):
@@ -163,30 +103,8 @@ class ProfileWorkerMixin:
             # enabling pickle/custom-object deserialization.
             return json.loads(json.dumps(result))
 
-    def _hetero_context(self):
-        from contextlib import ExitStack
-
-        import torch
-
-        from vllm.config import set_current_vllm_config
-
-        stack = ExitStack()
-        stack.enter_context(set_current_vllm_config(self.vllm_config))
-        stack.enter_context(torch.inference_mode())
-        torch.npu.set_device(self.device)
-        return stack
-
-
-class StagingWorkerMixin(ProfileWorkerMixin):
     def _init_worker_distributed_environment(self):
         from datetime import timedelta
-
-        # The native _init_device has already selected this actor's NPU.
-        fraction = getattr(self, "_hetero_npu_core_fraction", "1")
-        if fraction != "1":
-            self._hetero_npu_core_limit = apply_npu_core_limit(
-                self._hetero_stage_soc, fraction
-            )
 
         from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 
@@ -223,6 +141,19 @@ class StagingWorkerMixin(ProfileWorkerMixin):
         # reject rather than duplicate stage sends inside the runner.
         if getattr(self.model_runner, "broadcast_pp_output", False):
             raise ValueError("broadcast_pp_output runner path is not admitted")
+
+    def _hetero_context(self):
+        from contextlib import ExitStack
+
+        import torch
+
+        from vllm.config import set_current_vllm_config
+
+        stack = ExitStack()
+        stack.enter_context(set_current_vllm_config(self.vllm_config))
+        stack.enter_context(torch.inference_mode())
+        torch.npu.set_device(self.device)
+        return stack
 
     def _run_staged_step(self, *args):
         from vllm.distributed.hetero_pp.step import run_stage

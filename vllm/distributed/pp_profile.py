@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Profile CPU/Gloo or native HCCL PP, then plan a fixed-order layer split.
+"""Profile the opt-in CPU/Gloo PP backend, then plan a fixed-order layer split.
 
 Only the four-stage layer-measured backend is admitted. Collection writes a
 bound manifest; offline planning refuses unbound old traces. A DP result is a
@@ -23,7 +23,6 @@ import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -43,7 +42,6 @@ _TRACE_ENV = (
     "VLLM_HETERO_PP_PLAN",
 )
 _TRANSPORT = "cpu_gloo"
-_NATIVE_TRANSPORT = "native_hccl"
 
 
 def _sha(path: Path) -> str:
@@ -190,7 +188,7 @@ def shutdown_llm(llm: Any) -> None:
 
 def _load_topology(value: str | Path | dict | None) -> dict:
     if value is None:
-        raise ValueError("--hetero-plan is required for PP profiling")
+        raise ValueError("--hetero-plan is required for the CPU/Gloo profile backend")
     raw = (
         copy.deepcopy(value)
         if isinstance(value, dict)
@@ -209,11 +207,6 @@ def validate_profile_args(args: Any) -> None:
         raise ValueError("--hetero-plan is required")
     if getattr(args, "comm_timing", None) not in (None, "shared-clock", "ack"):
         raise ValueError("unknown communication timing")
-    if (
-        getattr(args, "pp_transport", "gloo") == "hccl"
-        and getattr(args, "comm_timing", None) == "shared-clock"
-    ):
-        raise ValueError("native HCCL profiling requires ACK timing")
     if getattr(args, "compute_timing", None) not in (None, "event", "host-sync"):
         raise ValueError("unknown compute timing")
     if getattr(args, "collect_only", False) and getattr(args, "skip_run", False):
@@ -233,7 +226,9 @@ def validate_profile_args(args: Any) -> None:
             raise ValueError("profiling requires synchronous --no-async-scheduling")
 
 
-def _configure_engine(engine_args, transport=_TRANSPORT, topology=None):
+def _configure_engine(engine_args):
+    from vllm.v1.executor.hetero_pp_executor import HeteroPPExecutor
+
     if engine_args is None:
         raise ValueError("engine_args are required for live profiling")
     args = copy.copy(engine_args)
@@ -278,27 +273,6 @@ def _configure_engine(engine_args, transport=_TRANSPORT, topology=None):
     if not args.enforce_eager or args.async_scheduling is not False:
         raise ValueError("live profiling requires eager synchronous execution")
     backend = getattr(args, "distributed_executor_backend", None)
-    if transport == _NATIVE_TRANSPORT:
-        from vllm.distributed.hetero_pp.native_worker import NATIVE_WORKER
-
-        if (
-            backend not in (None, "mp")
-            or args.nnodes != 2
-            or args.node_rank != 0
-            or args.master_addr != topology["stages"][0]["node_ip"]
-            or args.worker_cls not in ("auto", NATIVE_WORKER)
-            or args.enable_prefix_caching is not False
-        ):
-            raise ValueError(
-                "native HCCL requires mp, head node rank 0, nnodes=2, "
-                "matching master address and prefix cache disabled"
-            )
-        args.distributed_executor_backend = "mp"
-        args.worker_cls = NATIVE_WORKER
-        return args
-
-    from vllm.v1.executor.hetero_pp_executor import HeteroPPExecutor
-
     if backend not in (None, "auto", HeteroPPExecutor):
         raise ValueError(
             "omit --distributed-executor-backend; the profile entry selects its class"
@@ -418,7 +392,7 @@ def _source_hashes():
     return {str(p.relative_to(_ROOT)): _sha(p) for p in sorted(set(paths))}
 
 
-def _validate_startup(reports, topology, config, transport=_TRANSPORT):
+def _validate_startup(reports, topology, config):
     if not isinstance(reports, list) or len(reports) != 4:
         raise ValueError("profile manifest requires all four actual startup reports")
     model_sha = hashlib.sha256(
@@ -426,7 +400,6 @@ def _validate_startup(reports, topology, config, transport=_TRANSPORT):
     ).hexdigest()
     end = 0
     sources = _source_hashes()
-    native = transport == _NATIVE_TRANSPORT
     for rank, report in enumerate(reports):
         stage = topology["stages"][rank]
         if (
@@ -435,24 +408,11 @@ def _validate_startup(reports, topology, config, transport=_TRANSPORT):
             or report.get("soc") != stage["soc"]
             or report.get("layers")
             not in ([end, end + stage["layers"]], (end, end + stage["layers"]))
-            or (not native and report.get("world_backend") != "gloo")
-            or (
-                native
-                and (
-                    report.get("pp_tensor_backend") != "hccl"
-                    or report.get("control_backend") != "gloo"
-                )
-            )
+            or report.get("world_backend") != "gloo"
             or report.get("model_config_sha256") != model_sha
         ):
             raise ValueError(
-                f"rank {rank} startup does not match profile topology/model/transport"
-            )
-        fraction = str(Fraction(stage.get("npu_core_fraction", "1")))
-        actual = report.get("npu_core_limit", {}).get("fraction", "1")
-        if actual != fraction:
-            raise ValueError(
-                f"rank {rank} NPU core limit does not match profile topology"
+                f"rank {rank} startup does not match profile topology/model/Gloo"
             )
         for name, digest in report.get("sources", {}).items():
             relative = (
@@ -465,16 +425,7 @@ def _validate_startup(reports, topology, config, transport=_TRANSPORT):
         if not report.get("sources"):
             raise ValueError("startup report lacks actual adapter source hashes")
         end += stage["layers"]
-    keys: tuple[str, ...] = (
-        "vllm",
-        "torch",
-        "torch_npu",
-        "model_config_sha256",
-        "sources",
-    )
-    if not native:
-        keys += ("ray",)
-    for key in keys:
+    for key in ("vllm", "torch", "torch_npu", "ray", "model_config_sha256", "sources"):
         if any(r.get(key) != reports[0].get(key) for r in reports) or not reports[
             0
         ].get(key):
@@ -498,7 +449,6 @@ def _validate_flush(
     live=False,
     comm_timing=None,
     compute_timing=None,
-    transport=_TRANSPORT,
 ):
     if not isinstance(receipts, list) or len(receipts) != 4:
         raise ValueError("flush must return exactly four rank receipts")
@@ -524,7 +474,7 @@ def _validate_flush(
             or receipt.get("complete") is not True
             or receipt.get("pending") != 0
             or receipt.get("errors") != []
-            or receipt.get("transport") != transport
+            or receipt.get("transport") != _TRANSPORT
             or receipt.get("trace_session", receipt.get("session")) != session
             or remote_path.name != name
         ):
@@ -562,7 +512,7 @@ def _validate_flush(
                 or row.get("pp_size") != 4
                 or row.get("tp_size") != 1
                 or row.get("trace_session") != session
-                or row.get("transport") != transport
+                or row.get("transport") != _TRANSPORT
                 or row.get("compute_model") != "layer-measured"
                 or row.get("device_id") != rank
                 or row.get("profile_device_id", rank) != rank
@@ -582,23 +532,18 @@ def _validate_flush(
     return ordered, raw_files
 
 
-def _load_bound_manifest(directory, topology, transport=None):
+def _load_bound_manifest(directory, topology):
     path = directory / "profile_manifest.json"
     if not path.is_file():
         raise ValueError(
-            "trusted PP profile_manifest.json is required; old traces are not admitted"
+            "trusted CPU/Gloo profile_manifest.json is required; "
+            "old traces are not admitted"
         )
     manifest = json.loads(path.read_text())
-    expected_transport = manifest.get("transport") if transport is None else transport
     if (
         manifest.get("version") != 1
         or manifest.get("complete") is not True
-        or expected_transport not in (_TRANSPORT, _NATIVE_TRANSPORT)
-        or manifest.get("transport") != expected_transport
-        or (
-            expected_transport == _NATIVE_TRANSPORT
-            and manifest.get("comm_timing") != "ack"
-        )
+        or manifest.get("transport") != _TRANSPORT
         or manifest.get("topology_sha256") != _digest(topology)
         or manifest.get("hetero_plan") != topology
         or manifest.get("engine_config_sha256")
@@ -618,7 +563,6 @@ def _load_bound_manifest(directory, topology, transport=None):
         topology,
         comm_timing=manifest.get("comm_timing", "shared-clock"),
         compute_timing=manifest.get("compute_timing", "event"),
-        transport=expected_transport,
     )
     if raw != manifest.get("raw_files"):
         raise ValueError("raw trace hash manifest changed")
@@ -638,7 +582,7 @@ def _load_bound_manifest(directory, topology, transport=None):
     return manifest
 
 
-def _collect(*, directory, topology, args, llm_factory, workload, memory, transport):
+def _collect(*, directory, topology, args, llm_factory, workload, memory):
     llm = None
     supplied_memory = memory is not None
     try:
@@ -647,17 +591,6 @@ def _collect(*, directory, topology, args, llm_factory, workload, memory, transp
         snapshot = _engine_snapshot(config)
         if memory is not None:
             memory.validate_engine_config(config)
-        if transport == _NATIVE_TRANSPORT:
-            reports = llm.collective_rpc(
-                "start_native_pp_profile",
-                timeout=120,
-                args=(
-                    str(directory),
-                    os.environ["VLLM_PP_TRACE_SESSION"],
-                    os.environ["VLLM_PP_COMPUTE_TIMING"],
-                ),
-            )
-            _validate_startup(reports, topology, config, transport)
         run_traced_generate(llm, workload)
         receipts = llm.collective_rpc("flush_pp_profile")
         from vllm.distributed.hetero_pp.trace_export import collect_profile_traces
@@ -671,12 +604,11 @@ def _collect(*, directory, topology, args, llm_factory, workload, memory, transp
             live=True,
             comm_timing=os.environ.get("VLLM_PP_COMM_TIMING", "shared-clock"),
             compute_timing=os.environ["VLLM_PP_COMPUTE_TIMING"],
-            transport=transport,
         )
         # Worker provenance crosses the same RPC boundary in both in-process
         # and multiprocess EngineCore mode. The driver need not own Executor.
         reports = [receipt.get("identity") for receipt in receipts]
-        _validate_startup(reports, topology, config, transport)
+        _validate_startup(reports, topology, config)
         observations = llm.collective_rpc("get_pp_memory_observation")
         if (
             not isinstance(observations, list)
@@ -724,7 +656,7 @@ def _collect(*, directory, topology, args, llm_factory, workload, memory, transp
         manifest = dict(
             version=1,
             complete=True,
-            transport=transport,
+            transport=_TRANSPORT,
             comm_timing=os.environ.get("VLLM_PP_COMM_TIMING", "shared-clock"),
             compute_timing=os.environ["VLLM_PP_COMPUTE_TIMING"],
             trace_session=os.environ["VLLM_PP_TRACE_SESSION"],
@@ -738,11 +670,7 @@ def _collect(*, directory, topology, args, llm_factory, workload, memory, transp
             model_config_sha256=reports[0]["model_config_sha256"],
             startup_reports=reports,
             actual_runtimes=[
-                {
-                    k: r[k]
-                    for k in ("rank", "vllm", "torch", "torch_npu", "ray")
-                    if k in r
-                }
+                {k: r[k] for k in ("rank", "vllm", "torch", "torch_npu", "ray")}
                 for r in reports
             ],
             flush_receipts=receipts,
@@ -758,8 +686,8 @@ def _collect(*, directory, topology, args, llm_factory, workload, memory, transp
                 "the intervening RPC gap is excluded"
             ),
             throughput_scope=(
-                "stage bottleneck candidate only; overlapped pipeline "
-                "throughput is not measured by this DP"
+                "stage bottleneck candidate only; single-inflight executor "
+                "throughput is not optimized or measured by this DP"
             ),
         )
     finally:
@@ -813,20 +741,9 @@ def profile_pp_partition(
     layer_aggregation="microbatch",
     comm_timing=None,
     compute_timing=None,
-    pp_transport=None,
 ):
     """Collect/validate bound staged traces and optionally run fixed-order DP."""
     topology = _load_topology(hetero_plan)
-    transports = {"gloo": _TRANSPORT, "hccl": _NATIVE_TRANSPORT}
-    if pp_transport is not None and pp_transport not in transports:
-        raise ValueError("unknown PP transport")
-    transport = transports.get(pp_transport, _TRANSPORT)
-    if transport == _NATIVE_TRANSPORT:
-        if any(s["soc"] != "910B" for s in topology["stages"]):
-            raise ValueError("native HCCL profiling requires four 910B devices")
-        if comm_timing == "shared-clock":
-            raise ValueError("native HCCL profiling requires ACK timing")
-        comm_timing = "ack"
     if comm_timing not in (None, "shared-clock", "ack"):
         raise ValueError("unknown communication timing")
     if compute_timing not in (None, "event", "host-sync"):
@@ -857,7 +774,7 @@ def profile_pp_partition(
         else None
     )
     if not skip_run:
-        args = _configure_engine(engine_args, transport, topology)
+        args = _configure_engine(engine_args)
         if memory is None and getattr(args, "num_gpu_blocks_override", None) is None:
             raise ValueError(
                 "automatic KV allocation needs an explicit --memory-profile; "
@@ -878,25 +795,6 @@ def profile_pp_partition(
                 num_iters=num_iters,
                 num_iters_warmup=num_iters_warmup,
             )
-            if transport == _NATIVE_TRANSPORT:
-                if args.max_num_seqs is None or args.max_num_batched_tokens is None:
-                    raise ValueError(
-                        "native HCCL profiling requires explicit "
-                        "--max-num-seqs and --max-num-batched-tokens"
-                    )
-                batches = workload.iteration_prompts or [workload.prompts]
-                if workload.warmup_prompts:
-                    batches = [*batches, workload.warmup_prompts]
-                if workload.max_tokens != 1 or any(
-                    len(batch) > args.max_num_seqs
-                    or sum(len(p["prompt_token_ids"]) for p in batch)
-                    > args.max_num_batched_tokens
-                    for batch in batches
-                ):
-                    raise ValueError(
-                        "native HCCL profiling needs one full prefill batch "
-                        "per iteration and one output token"
-                    )
             manifest, memory = _collect(
                 directory=directory,
                 topology=topology,
@@ -904,7 +802,6 @@ def profile_pp_partition(
                 llm_factory=llm_factory,
                 workload=workload,
                 memory=memory,
-                transport=transport,
             )
         finally:
             for key, value in previous.items():
@@ -916,9 +813,7 @@ def profile_pp_partition(
         if dump_dir is None:
             raise ValueError("--trace-dir is required with --skip-run")
         directory = Path(dump_dir).expanduser().resolve()
-        manifest = _load_bound_manifest(
-            directory, topology, transport if pp_transport is not None else None
-        )
+        manifest = _load_bound_manifest(directory, topology)
         if compute_timing is not None and compute_timing != manifest.get(
             "compute_timing", "event"
         ):
@@ -962,7 +857,6 @@ def profile_pp_partition(
         directory / "recommendation_receipt.json",
         {
             "compute_timing": manifest.get("compute_timing", "event"),
-            "transport": manifest["transport"],
             "profile_manifest_sha256": _sha(directory / "profile_manifest.json"),
             "recommended_hetero_plan_sha256": _sha(
                 directory / "recommended_hetero_plan.json"
@@ -1011,15 +905,6 @@ def format_serve_command(plan: PPPartitionPlan, dump_dir=None) -> str:
             "recommended hetero topology/plan SHA does not match DP output"
         )
     scope = manifest["engine_config"]
-    if manifest["transport"] == _NATIVE_TRANSPORT:
-        layers = ",".join(str(s["layers"]) for s in raw["stages"])
-        fractions = ",".join(s.get("npu_core_fraction", "1") for s in raw["stages"])
-        return (
-            "Trace-off HCCL candidate for both launchers: "
-            f"--transport hccl --layers {layers} --npu-core-fractions {fractions}\n"
-            "Keep the profiled capacity options and validate full token IDs "
-            "and actual memory after re-serve."
-        )
     command = [
         sys.executable,
         "-m",
@@ -1080,8 +965,9 @@ def add_cli_args(parser):
     from vllm.engine.arg_utils import EngineArgs
 
     parser.add_argument("model_tag", nargs="?")
-    parser.add_argument("--hetero-plan", type=str, help="Required PP topology JSON.")
-    parser.add_argument("--pp-transport", choices=("gloo", "hccl"))
+    parser.add_argument(
+        "--hetero-plan", type=str, help="Required CPU/Gloo topology JSON."
+    )
     parser.add_argument("--trace-dir", type=str)
     parser.add_argument("--output-json", type=str)
     parser.add_argument("--collect-only", action="store_true")
@@ -1173,7 +1059,6 @@ def run_from_cli_args(args):
         collect_only=args.collect_only,
         comm_timing=getattr(args, "comm_timing", None),
         compute_timing=getattr(args, "compute_timing", None),
-        pp_transport=getattr(args, "pp_transport", None),
     )
 
 

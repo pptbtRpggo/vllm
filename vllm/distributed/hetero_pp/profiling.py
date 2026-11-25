@@ -488,7 +488,6 @@ class StageProfiler:
         timeout_s=60,
         comm_timing=None,
         compute_timing=None,
-        transport="cpu_gloo",
     ):
         self.compute_timing = (
             compute_timing or os.environ.get("VLLM_PP_COMPUTE_TIMING") or "event"
@@ -537,11 +536,6 @@ class StageProfiler:
         )
         if self.comm_timing not in ("shared-clock", "ack"):
             raise ValueError("unknown profiling communication timing")
-        if transport not in ("cpu_gloo", "native_hccl"):
-            raise ValueError("unknown profiling transport")
-        if transport == "native_hccl" and self.comm_timing != "ack":
-            raise ValueError("native HCCL profiling requires ACK timing")
-        self.transport = transport
         self.rank, self.pp_size = rank, pp_size
         self.session = session
         self.clock_domain = monotonic_clock_domain()
@@ -566,7 +560,7 @@ class StageProfiler:
         }
         self.provenance = {
             "schema_version": 2,
-            "transport": self.transport,
+            "transport": "cpu_gloo",
             "trace_session": session,
             "clock_domain": self.clock_domain,
             "pp_rank": rank,
@@ -660,7 +654,7 @@ class StageProfiler:
             "compute_model": "layer-measured",
             "compute_delay_placement": "none",
             "compute_delay_ms": 0.0,
-            "transport": self.transport,
+            "transport": "cpu_gloo",
             **self.timing_metadata,
             "lm_head_timing": self.lm_head_timing,
             "profile_provenance_sha256": self.provenance_sha,

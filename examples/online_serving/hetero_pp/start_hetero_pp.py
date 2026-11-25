@@ -21,7 +21,6 @@ import urllib.error
 import urllib.request
 import uuid
 from contextlib import suppress
-from fractions import Fraction
 from pathlib import Path
 
 from check_cpu_gloo import (
@@ -71,11 +70,6 @@ def argument_parser():
     parser.add_argument(
         "--layers", help="四 stage 层数；原 910B→310P 默认 18,18,6,6，其他组合均分"
     )
-    parser.add_argument(
-        "--npu-core-fractions",
-        type=parse_npu_core_fractions,
-        help="按 PP stage 0–3 设置核心比例，例如 1,1,1/2,1/4",
-    )
     parser.add_argument("--python", help="已有 NPU Python，默认沿用环境探测")
     parser.add_argument("--cann-env", help="可选，本机已有 CANN set_env.sh")
     parser.add_argument(
@@ -117,7 +111,7 @@ def argument_parser():
     parser.add_argument(
         "--profile",
         action="store_true",
-        help="采集并生成 EdgeShard DP 推荐，不启动 API",
+        help="连接 Ray 后采集并生成 DP 推荐，不启动 API",
     )
     parser.add_argument(
         "--verify-overlap",
@@ -148,20 +142,6 @@ def argument_parser():
     return parser
 
 
-def parse_npu_core_fractions(value):
-    try:
-        fractions = [Fraction(part.strip()) for part in value.split(",")]
-    except (ValueError, ZeroDivisionError):
-        raise argparse.ArgumentTypeError(
-            "--npu-core-fractions 需要四个有效比例，例如 1,1,1/2,1/4"
-        ) from None
-    if len(fractions) != 4 or any(not 0 < ratio <= 1 for ratio in fractions):
-        raise argparse.ArgumentTypeError(
-            "--npu-core-fractions 需要四个比例，每项满足 0 < x <= 1"
-        )
-    return tuple(map(str, fractions))
-
-
 def validate_options(args):
     if args.verify_overlap and (args.profile or args.transport != "gloo"):
         raise ValueError("--verify-overlap 仅用于 Gloo 在线验证")
@@ -173,8 +153,11 @@ def validate_options(args):
         raise ValueError("--verify-overlap 需要至少 392 token 的模型上下文")
     if args.peer_soc is None:
         args.peer_soc = "910b" if args.transport == "hccl" else "310p"
-    if args.transport == "hccl" and (args.head_soc, args.peer_soc) != ("910b", "910b"):
-        raise ValueError("HCCL 模式当前只支持两端各两张 910B；异构请用 gloo")
+    if args.transport == "hccl":
+        if (args.head_soc, args.peer_soc) != ("910b", "910b"):
+            raise ValueError("HCCL 模式当前只支持两端各两张 910B；异构请用 gloo")
+        if args.profile:
+            raise ValueError("HCCL 模式不支持当前 EdgeShard --profile；采集请用 gloo")
     if not args.profile and args.profile_compute_timing != "event":
         raise ValueError("--profile-compute-timing 仅用于 --profile")
     if args.profile:
@@ -283,10 +266,6 @@ def make_launch(args, node_ip, python, environment, output=None):
             )
         ],
     }
-    if args.npu_core_fractions is not None:
-        for stage, ratio in zip(plan["stages"], args.npu_core_fractions, strict=True):
-            if ratio != "1":
-                stage["npu_core_fraction"] = ratio
     if (args.head_soc, args.peer_soc) != ("910b", "310p"):
         plan["validation_mode"] = (
             "910b_only" if args.head_soc == args.peer_soc == "910b" else "explicit"
@@ -383,7 +362,37 @@ def make_launch(args, node_ip, python, environment, output=None):
             serve += ["--block-size", str(args.block_size)]
         if args.num_gpu_blocks_override is not None:
             serve += ["--num-gpu-blocks-override", str(args.num_gpu_blocks_override)]
-    profile_command, profile_environment = profile_head_command(args, role)
+    profile_command = None
+    profile_environment = {}
+    if args.profile and role == "head":
+        profile_command = [
+            "bash",
+            str(Path(__file__).with_name("profile_edgeshard.sh")),
+        ]
+        profile_environment = {
+            "MODEL": str(args.model),
+            "TRACE_ROOT": str(args.trace_root),
+            # Profiling retains its existing bounded collection protocol.
+            "PROFILE_MAX_MODEL_LEN": str(
+                args.max_model_len if args.max_model_len is not None else 512
+            ),
+            "PROFILE_MAX_NUM_BATCHED_TOKENS": str(
+                args.max_num_batched_tokens
+                if args.max_num_batched_tokens is not None
+                else 256
+            ),
+            "PROFILE_MAX_NUM_SEQS": str(
+                args.max_num_seqs if args.max_num_seqs is not None else 4
+            ),
+            "PROFILE_GPU_MEMORY_UTILIZATION": str(
+                args.gpu_memory_utilization
+                if args.gpu_memory_utilization is not None
+                else 0.8
+            ),
+            "PROFILE_BLOCK_SIZE": str(args.block_size or 128),
+            "PROFILE_NUM_GPU_BLOCKS": str(args.num_gpu_blocks_override or 64),
+            "PROFILE_COMPUTE_TIMING": args.profile_compute_timing,
+        }
     return dict(
         transport="gloo",
         role=role,
@@ -396,36 +405,8 @@ def make_launch(args, node_ip, python, environment, output=None):
     )
 
 
-_PROFILE_OPTIONS = (
-    ("max_model_len", 512, "PROFILE_MAX_MODEL_LEN"),
-    ("max_num_batched_tokens", 256, "PROFILE_MAX_NUM_BATCHED_TOKENS"),
-    ("max_num_seqs", 4, "PROFILE_MAX_NUM_SEQS"),
-    ("gpu_memory_utilization", 0.8, "PROFILE_GPU_MEMORY_UTILIZATION"),
-    ("block_size", 128, "PROFILE_BLOCK_SIZE"),
-    ("num_gpu_blocks_override", 64, "PROFILE_NUM_GPU_BLOCKS"),
-)
-
-
-def profile_head_command(args, role):
-    if not args.profile or role != "head":
-        return None, {}
-    environment = {
-        "MODEL": str(args.model),
-        "TRACE_ROOT": str(args.trace_root),
-        "PROFILE_COMPUTE_TIMING": args.profile_compute_timing,
-        "PROFILE_TRANSPORT": args.transport,
-    }
-    environment.update(
-        {
-            key: str(getattr(args, name) or default)
-            for name, default, key in _PROFILE_OPTIONS
-        }
-    )
-    return ["bash", str(Path(__file__).with_name("profile_edgeshard.sh"))], environment
-
-
 def make_native_launch(args, node_ip, python, environment, plan, role):
-    """Use native MP/HCCL with optional worker-local quotas and profiling."""
+    """Use the upstream MP executor and Ascend worker, without custom PP hooks."""
     updates = {
         "VLLM_HOST_IP": node_ip,
         "HCCL_IF_IP": node_ip,
@@ -462,42 +443,26 @@ def make_native_launch(args, node_ip, python, environment, plan, role):
         "float16",
         "--enforce-eager",
     ]
-    if args.profile or any("npu_core_fraction" in stage for stage in plan["stages"]):
-        updates["VLLM_HETERO_PP_PLAN"] = json.dumps(plan)
-        updates["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-        command += [
-            "--worker-cls",
-            "vllm.distributed.hetero_pp.native_worker.Native910BWorker",
-        ]
-    if role == "head" and not args.profile:
+    if role == "head":
         # The peer checks this API for a bounded startup, then remains attached
         # to its own headless worker process. Health is not inference validation.
         command += ["--host", "0.0.0.0", "--port", str(args.api_port)]
         template = resolve_chat_template(args.chat_template)
         if template:
             command += ["--chat-template", template]
-    elif role == "worker":
+    else:
         command.append("--headless")
-    for name, default, _ in _PROFILE_OPTIONS:
+    for name in (
+        "max_model_len",
+        "max_num_batched_tokens",
+        "max_num_seqs",
+        "gpu_memory_utilization",
+        "block_size",
+        "num_gpu_blocks_override",
+    ):
         value = getattr(args, name)
-        if args.profile and value is None:
-            value = default
         if value is not None:
             command += ["--" + name.replace("_", "-"), str(value)]
-    profile_command, profile_environment = profile_head_command(args, role)
-    if args.profile:
-        if role == "head":
-            profile_environment.update(
-                PROFILE_MASTER_ADDR=args.head, PROFILE_MASTER_PORT=str(args.master_port)
-            )
-        else:
-            profile_command = command + [
-                "--no-async-scheduling",
-                "--enable-chunked-prefill",
-                "--no-enable-prefix-caching",
-                "--seed",
-                "7",
-            ]
     return dict(
         transport="hccl",
         role=role,
@@ -509,14 +474,13 @@ def make_native_launch(args, node_ip, python, environment, plan, role):
             "VLLM_PP_TRACE_SESSION",
             "VLLM_PP_COMPUTE_MODEL",
             "VLLM_PP_COMPUTE_TIMING",
-            "VLLM_PP_COMM_TIMING",
             "RAY_ADDRESS",
             "VLLM_USE_V2_MODEL_RUNNER",
         ],
         ray_command=None,
-        serve_command=None if args.profile else command,
-        profile_command=profile_command,
-        profile_environment=profile_environment,
+        serve_command=command,
+        profile_command=None,
+        profile_environment={},
     )
 
 
@@ -668,24 +632,6 @@ def start_services(args, launch, environment, output, python):
     environment = dict(environment, **launch["environment"])
     if launch["transport"] == "hccl":
         headless = launch["role"] == "worker"
-        if args.profile:
-            profile_env = dict(environment, **launch["profile_environment"])
-            profile_env.update(PY=python, PLAN=str(output / "plan.json"))
-            log = output / "profile.log"
-            print(f"启动 HCCL EdgeShard，角色={launch['role']}；日志 {log}", flush=True)
-            rc = profile_foreground(
-                launch["profile_command"], profile_env, log, args.profile_timeout
-            )
-            write_json(
-                output / "profile_exit.json",
-                {
-                    "returncode": rc,
-                    "transport": "hccl",
-                    "role": launch["role"],
-                    "profile_and_planning_completed": rc == 0 and not headless,
-                },
-            )
-            return rc if rc >= 0 else 128 - rc
         log = output / ("worker.log" if headless else "api.log")
         print(f"启动原生 HCCL/mp，角色={launch['role']}；日志 {log}", flush=True)
         rc = serve_foreground(

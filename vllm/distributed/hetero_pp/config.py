@@ -5,7 +5,6 @@
 import math
 import os
 from dataclasses import dataclass
-from fractions import Fraction
 from pathlib import Path
 
 
@@ -14,7 +13,6 @@ class Stage:
     node_ip: str
     soc: str
     layers: int
-    npu_core_fraction: str = "1"
 
 
 @dataclass(frozen=True)
@@ -32,26 +30,15 @@ class PipelinePlan:
             raise ValueError("first backend requires four stages")
         stages = []
         for item in raw:
-            if set(item) - {"npu_core_fraction"} != {"node_ip", "soc", "layers"}:
-                raise ValueError(
-                    "stage requires node_ip, soc, layers and optional npu_core_fraction"
-                )
+            if set(item) != {"node_ip", "soc", "layers"}:
+                raise ValueError("stage requires node_ip, soc and layers")
             if not isinstance(item["node_ip"], str) or not item["node_ip"].strip():
                 raise ValueError("node_ip must be nonempty")
             if item["soc"] not in ("910B", "310P"):
                 raise ValueError("only 910B and 310P are admitted")
             if type(item["layers"]) is not int or item["layers"] <= 0:
                 raise ValueError("each stage must have positive integer layers")
-            ratio = item.get("npu_core_fraction", "1")
-            try:
-                fraction = Fraction(ratio) if isinstance(ratio, str) else 0
-            except (ValueError, ZeroDivisionError):
-                fraction = 0
-            if not 0 < fraction <= 1:
-                raise ValueError("npu_core_fraction must be a string in (0, 1]")
-            stages.append(
-                Stage(item["node_ip"], item["soc"], item["layers"], str(fraction))
-            )
+            stages.append(Stage(**item))
         if sum(s.layers for s in stages) != total_layers:
             raise ValueError("stage layers must sum to model hidden layers")
         mode = value.get("validation_mode", "mixed")

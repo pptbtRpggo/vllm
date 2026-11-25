@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# 在 head 的匹配服务环境内运行；当前推理服务已退出。
+# 在 head 的匹配服务环境内运行；两端 Ray 已启动，当前推理服务已退出。
 if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
 set -euo pipefail
 
@@ -12,7 +12,6 @@ PLAN="${PLAN:-}"                      # 当前已跑通的 PP4 topology JSON
 RAY_ADDRESS="${RAY_ADDRESS:-}"         # 例如 141.147.135.53:16379
 TRACE_ROOT="${TRACE_ROOT:-}"           # 本地结果根目录；自动回收远端 rank 记录
 PROFILE_COMPUTE_TIMING="${PROFILE_COMPUTE_TIMING:-event}" # event / host-sync
-PROFILE_TRANSPORT="${PROFILE_TRANSPORT:-gloo}"
 PY="${PY:-${VIRTUAL_ENV:-$REPO/.venv}/bin/python}"
 
 check_timing() {
@@ -83,14 +82,13 @@ from pathlib import Path
 directory = Path(sys.argv[1]).resolve()
 manifest = json.loads((directory / "profile_manifest.json").read_text())
 compute_timing = manifest.get("compute_timing", "event")
-transport = manifest.get("transport")
 if compute_timing not in ("event", "host-sync"):
     raise ValueError("未知 compute timing")
 if (manifest.get("complete") is not True
         or manifest.get("version") != 1
-        or transport not in ("cpu_gloo", "native_hccl")
+        or manifest.get("transport") != "cpu_gloo"
         or manifest.get("comm_timing") != "ack"):
-    raise ValueError("速率统计需要完整的 PP ACK profile manifest")
+    raise ValueError("速率统计需要完整的 CPU/Gloo ACK profile manifest")
 
 # 只加载无 Torch 依赖的配对校验器；离线统计不初始化 NPU/Ray。
 source = Path(sys.argv[2]) / "vllm/distributed/pp_comm_trace.py"
@@ -109,7 +107,7 @@ for rank in range(4):
         if (row.get("pp_rank") != rank or row.get("tp_rank") != 0
                 or row.get("pp_size") != 4 or row.get("tp_size") != 1
                 or row.get("trace_session") != manifest["trace_session"]
-                or row.get("transport") != transport
+                or row.get("transport") != "cpu_gloo"
                 or row.get("comm_timing") != "ack"
                 or row.get("compute_timing", "event") != compute_timing
                 or type(row.get("is_warmup")) is not bool
@@ -262,13 +260,12 @@ if compute_timing == "host-sync":
     print("compute=execute+sample 的同步主机区间和，含 CPU 提交/同步成本；每层边界同步。")
 else:
     print("compute=execute+sample 的设备事件区间和，不含两个 RPC 之间的空档。")
-path = "HCCL 张量与 Gloo 控制/元数据" if transport == "native_hccl" else "D2H/Gloo/H2D"
-print(f"handoff=发送端 ACK 完成窗口，含 {path} 和 DONE；含零 payload 交接。")
+print("handoff=发送端 ACK 完成窗口，含 D2H/Gloo/H2D/DONE；含零 payload 交接。")
 print("计算和通信的分位数不能直接相加得到请求延迟；本表不是 HTTP/排队延迟。")
 print(f"耗时表：{directory / 'stage_and_link_timing_summary.csv'}")
 print(f"逐步计算：{directory / 'stage_compute_samples.csv'}")
 
-print(f"\n有效交接速率（Gbps）：含 {path} 和 DONE，按应用层 payload 计算。")
+print("\n有效交接速率（Gbps）：包含 D2H/Gloo/H2D/DONE，不是物理网卡带宽。")
 print(f"排除预热交接 {warmup_count} 条、零 payload 交接 {zero_count} 条。")
 print(f"{'链路':<12} {'阶段':<8} {'样本':>5} {'均值':>9} {'汇总速率':>9} "
       f"{'P10':>9} {'P50':>9} {'P90':>9} {'P95':>9} {'P99':>9}")
@@ -299,8 +296,8 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
 四个 stage 统一使用 NPU 同步后的 CPU 单调时钟；不读取 profiling Event 时间戳。
 默认 event；host-sync 包含主机提交/同步成本，结果不可与旧 Event trace 混合。
 PY 是当前能运行异构 vLLM 的 Python 路径；默认当前虚拟环境或项目 .venv。
-Gloo 需要事先连接 Ray；HCCL 使用两端统一入口 --transport hccl --profile。
-TRACE_ROOT 为本地结果根目录；采集结束后自动通过 worker RPC 回收 peer 记录。
+Ray 必须已连接，两边使用匹配的项目代码与环境，四张卡供本次采集使用。
+TRACE_ROOT 为本地结果根目录；采集结束后自动通过已有 Ray 回收 peer 原始记录。
 
 流程：4 条合成输入，1 轮预热 + 2 轮采集，每请求只输出首个 token，不做后续 decode。
 只统计 prefill 的四 stage/三链路成本并做 latency DP，排除预热，保存汇总与逐步 CSV。
@@ -324,20 +321,7 @@ if (($#)); then echo '未知参数；使用 --help 查看说明。' >&2; exit 2;
 
 [[ -d "$MODEL" ]] || { echo '请设置 MODEL 为可读模型目录。' >&2; exit 2; }
 [[ -r "$PLAN" && -f "$PLAN" ]] || { echo '请设置 PLAN 为当前 PP4 topology JSON。' >&2; exit 2; }
-engine_transport=(--pp-transport "$PROFILE_TRANSPORT")
-case "$PROFILE_TRANSPORT" in
-  gloo)
-    [[ -n "$RAY_ADDRESS" ]] || { echo '请设置 RAY_ADDRESS=head_IP:端口。' >&2; exit 2; }
-    export RAY_ADDRESS
-    ;;
-  hccl)
-    [[ -n "${PROFILE_MASTER_ADDR:-}" && -n "${PROFILE_MASTER_PORT:-}" ]] ||
-      { echo 'HCCL profiling 请用两端统一启动入口。' >&2; exit 2; }
-    engine_transport+=(--distributed-executor-backend mp --nnodes 2 --node-rank 0
-      --master-addr "$PROFILE_MASTER_ADDR" --master-port "$PROFILE_MASTER_PORT")
-    ;;
-  *) echo 'PROFILE_TRANSPORT 只能是 gloo 或 hccl。' >&2; exit 2 ;;
-esac
+[[ -n "$RAY_ADDRESS" ]] || { echo '请设置 RAY_ADDRESS=head_IP:端口。' >&2; exit 2; }
 [[ "$TRACE_ROOT" == /* ]] || { echo '请设置 TRACE_ROOT 为本地结果目录的绝对路径。' >&2; exit 2; }
 [[ -x "$PY" && -f "$PY" ]] || { echo '请设置 PY 为匹配服务环境的 Python 绝对路径。' >&2; exit 2; }
 [[ "$PROFILE_COMPUTE_TIMING" == event || "$PROFILE_COMPUTE_TIMING" == host-sync ]] || {
@@ -345,7 +329,7 @@ esac
 }
 
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
-export VLLM_USE_V2_MODEL_RUNNER=0
+export RAY_ADDRESS VLLM_USE_V2_MODEL_RUNNER=0
 # 由 pp-profile 分配本轮 session 和 trace 配置，避免继承旧采集环境。
 unset VLLM_PP_STAGE_TRACE VLLM_PP_TRACE_SESSION VLLM_PP_COMPUTE_MODEL VLLM_PP_COMPUTE_TIMING
 
@@ -358,7 +342,6 @@ echo '1/3 采集 prefill 至首 token 的成本（每请求输出 1 token；请�
 # 日志放在 trace 目录外，保证 collector 启动前目录为空。
 "$PY" -m vllm.entrypoints.cli.main pp-profile "$MODEL" \
   --hetero-plan "$PLAN" --trace-dir "$TRACE" --collect-only \
-  "${engine_transport[@]}" \
   --compute-model layer-measured --comm-timing ack \
   --compute-timing "$PROFILE_COMPUTE_TIMING" \
   --input-len 64 --output-len 1 --num-prompts 4 \
@@ -377,7 +360,7 @@ profile_statistics "$TRACE" 2>&1 | tee -a "$TRACE.log"
 
 echo '3/3 仅以 prefill latency 做离线 DP 推荐（不占 NPU）'
 "$PY" -m vllm.entrypoints.cli.main pp-profile \
-  --hetero-plan "$PLAN" --trace-dir "$TRACE" --pp-transport "$PROFILE_TRANSPORT" \
+  --hetero-plan "$PLAN" --trace-dir "$TRACE" \
   --skip-run --objective latency --workload prefill \
   --output-json "$TRACE/latency_plan.json" 2>&1 | tee -a "$TRACE.log"
 
