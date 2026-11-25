@@ -81,6 +81,8 @@ class PipelineActor:
             is_driver_worker=True,
         )
         self.wrapper.init_worker([kwargs])
+        self.wrapper.worker._hetero_stage_soc = stage.soc
+        self.wrapper.worker._hetero_npu_core_fraction = stage.npu_core_fraction
         self.wrapper.init_device()
         self.wrapper.worker._hetero_verify_overlap = (
             os.environ.get("VLLM_HETERO_PP_VERIFY_OVERLAP") == "1"
@@ -138,6 +140,8 @@ class PipelineActor:
             sources=sources,
             world_backend=str(torch.distributed.get_backend()),
         )
+        if stage.npu_core_fraction != "1":
+            report["npu_core_limit"] = self.wrapper.worker._hetero_npu_core_limit
         self.wrapper.worker._hetero_profile_identity = {
             **report,
             "profile_device_id": rank,

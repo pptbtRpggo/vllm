@@ -72,6 +72,43 @@ def test_docker_forwards_overlap_flag_on_both_hosts(environment, local):
     assert "--verify-overlap" in shlex.split(result.stdout)
 
 
+@pytest.mark.parametrize("local", ["141.147.135.53", "141.147.135.54"])
+def test_docker_forwards_core_fractions_on_both_hosts(environment, local):
+    environment["TEST_LOCAL_IP"] = local
+    result = invoke(environment, "--npu-core-fractions", "1,1,1/2,1/4", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout)
+    index = command.index("--npu-core-fractions")
+    assert command[index + 1] == "1,1,1/2,1/4"
+
+
+@pytest.mark.parametrize("local", ["141.147.135.53", "141.147.135.54"])
+def test_docker_forwards_hccl_profile_and_core_fractions(environment, local):
+    environment["TEST_LOCAL_IP"] = local
+    result = invoke(
+        environment,
+        "--transport",
+        "hccl",
+        "--profile",
+        "--npu-core-fractions",
+        "1,1,1/2,1/4",
+        "--dry-run",
+    )
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout)
+    assert "--profile" in command
+    assert command[command.index("--npu-core-fractions") + 1] == "1,1,1/2,1/4"
+
+
+def test_docker_rejects_core_fractions_in_debug_shell(environment):
+    result = invoke(
+        environment, "--npu-core-fractions", "1,1,1/2,1/4", "--shell", "--dry-run"
+    )
+    assert result.returncode != 0
+    assert "--shell" in result.stderr
+    assert not result.stdout
+
+
 @pytest.mark.parametrize("option", ["--profile", "--shell", "--transport=hccl"])
 def test_docker_overlap_flag_rejects_incompatible_modes(environment, option):
     options = option.split("=")
@@ -133,9 +170,7 @@ def test_hccl_docker_selects_910b_and_forwards_native_network_and_port(
     )
 
 
-@pytest.mark.parametrize(
-    "extra", [("--peer-soc", "310p"), ("--profile",), ("--master-port", "8000")]
-)
+@pytest.mark.parametrize("extra", [("--peer-soc", "310p"), ("--master-port", "8000")])
 def test_hccl_host_rejects_invalid_configuration_before_docker(environment, extra):
     result = invoke(environment, "--transport", "hccl", "--dry-run", *extra)
     assert result.returncode != 0
