@@ -123,7 +123,7 @@ class ProfileWorkerMixin:
     def flush_pp_profile(self):
         profiler = self._get_hetero_profiler()
         return (
-            profiler.flush()
+            profiler.flush(final=True)
             if profiler is not None
             else {"enabled": False, "complete": False, "pending": 0}
         )

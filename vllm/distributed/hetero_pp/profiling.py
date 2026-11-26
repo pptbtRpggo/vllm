@@ -608,6 +608,7 @@ class StageProfiler:
         self._event_reread = None
         self._diagnostic_lock = threading.Lock()
         self._closed = False
+        self._final_receipt = None
         self._queue: queue.Queue[_Step | threading.Event | None] = queue.Queue(
             maxsize=8
         )
@@ -623,6 +624,11 @@ class StageProfiler:
         )
 
         self._check()
+        if self._final_receipt is not None:
+            if scheduler.total_num_scheduled_tokens:
+                self._error = RuntimeError("profile received work after final flush")
+                raise self._error
+            return None
         self._finalize_pending()
         if not scheduler.total_num_scheduled_tokens:
             self.zero_steps += 1
@@ -694,7 +700,8 @@ class StageProfiler:
     def sample(self, fn):
         self._check()
         if self.pending is None:
-            self.unassociated_sample_calls += 1
+            if self._final_receipt is None:
+                self.unassociated_sample_calls += 1
             return fn()
         capture = _Capture(self, "sample")
         try:
@@ -936,10 +943,12 @@ class StageProfiler:
             flush=True,
         )
 
-    def flush(self):
+    def flush(self, *, final=False):
         if self._closed:
             raise RuntimeError("profile writer is closed")
         self._check()
+        if self._final_receipt is not None:
+            return self._final_receipt
         self._finalize_pending()
         barrier = threading.Event()
         self._queue.put(barrier, timeout=self.timeout_s)
@@ -967,6 +976,10 @@ class StageProfiler:
             "profile_provenance_sha256": self.provenance_sha,
         }
         self.manifest_path.write_text(json.dumps(receipt, indent=2))
+        if final:
+            # Export and shutdown must reuse the collection receipt, even when
+            # EngineCore sends a later zero-token request cleanup step.
+            self._final_receipt = receipt
         return receipt
 
     def close(self, raise_errors=True):

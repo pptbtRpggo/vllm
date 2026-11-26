@@ -389,6 +389,34 @@ class ProfilingTests(unittest.TestCase):
         self.assertEqual(row["sample_device_ms"], 0)
         self.assertIsNone(row["lm_head_ms"])
 
+    def test_export_keeps_final_receipt_during_scheduler_cleanup(self):
+        from vllm.distributed.hetero_pp.worker import ProfileWorkerMixin
+
+        worker = ProfileWorkerMixin()
+        worker.rank = 0
+        worker.parallel_config = NS(world_size=4)
+        worker._hetero_profiler = self.prof
+
+        step = self.prof.begin(schedule(), self.runner, 0)
+        self.prof.execute(step, lambda: self.model(torch.ones(1, 2)))
+        receipt = worker.flush_pp_profile()
+        manifest_bytes = self.prof.manifest_path.read_bytes()
+
+        # EngineCore can notify workers of finished requests after generate()
+        # returns, even if there are no tokens left to execute.
+        cleanup = NS(total_num_scheduled_tokens=0, finished_req_ids={"r"})
+        self.assertIsNone(self.prof.begin(cleanup, self.runner, 1))
+        execution_result = object()
+        self.assertIs(
+            self.prof.execute(None, lambda: execution_result), execution_result
+        )
+        export = worker.export_pp_profile(0)
+
+        self.assertEqual(export["manifest"], receipt)
+        self.assertEqual(self.prof.manifest_path.read_bytes(), manifest_bytes)
+        self.prof.close()
+        self.assertEqual(self.prof.manifest_path.read_bytes(), manifest_bytes)
+
     def test_head_is_unhooked_but_its_work_remains_in_stage_total(self):
         clock, hooks = [0], []
         head = self.model.logits_processor
