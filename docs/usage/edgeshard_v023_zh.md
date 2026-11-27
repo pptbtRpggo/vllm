@@ -63,7 +63,7 @@ test ! -e "$TRACE"
   --hetero-plan "$PLAN" --trace-dir "$TRACE" --collect-only \
   --compute-model layer-measured --comm-timing ack \
   --input-len 64 --output-len 1 --num-prompts 4 \
-  --num-iters-warmup 1 --num-iters 2 --seed 7 \
+  --num-iters-warmup 8 --num-iters 16 --seed 7 \
   --dtype float16 --enforce-eager --no-async-scheduling \
   --max-model-len 512 --max-num-batched-tokens 256 --max-num-seqs 4 \
   --block-size 128 --num-gpu-blocks-override 64 \
@@ -76,8 +76,8 @@ test ! -e "$TRACE"
 上面使用新 ACK 口径，适用于同机或跨物理机的三条链路。要复用原共享时钟口径，
 显式换成 `--comm-timing shared-clock`；不传参数时，实时采集仍默认 `shared-clock`。
 
-这个例子中，每次 `generate()` 输入四条合成 token prompt：一轮 warmup，
-两轮正式采集。warmup 与正式 prompt 不同，正式迭代之间的 prompt 也不同。
+每次 `generate()` 输入四条合成 token prompt。八轮预热共 32 条，十六轮正式
+采集共 64 条，总计 96 条不同的 prompt。DP 只使用正式采集的纯 prefill step。
 每请求只输出首个 token（`max_tokens=1`、`ignore_eos=True`、greedy），
 到首 token 即结束，不做后续 decode。统计和切分推荐均只使用纯 prefill 样本，
 不混入 decode 或 mixed step；这不是完整 GSM8K 题目或模型质量评测。
@@ -201,7 +201,8 @@ PROFILE_COMPUTE_TIMING=host-sync \
 
 本模式测的是包含主机提交与同步成本的同步 profile，逐层屏障会改变正常任务重叠。
 它用于保守估计和生成候选；推荐分层的实际 TTFT 仍在关闭 profile 后测量。
-默认只输出 1 token，只统计纯 prefill，1 轮 warmup + 2 轮正式、每轮 4 请求。
+默认每条只输出 1 token，只统计纯 prefill。每轮 4 条请求，预热 8 轮（32 条），
+正式采集 16 轮（64 条）。
 完成后检查四个 rank receipt 的 `complete=true/errors=[]/pending=0`，
 以及总 manifest `complete=true/compute_timing=host-sync`；
 统计和 DP 均会拒绝跨 rank 或跨轮混用 Event/host-sync 数据。

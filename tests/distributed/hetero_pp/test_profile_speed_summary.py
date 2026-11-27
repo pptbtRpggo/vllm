@@ -398,6 +398,9 @@ def test_profile_automatically_summarizes_only_after_success(tmp_path, collect_e
     assert "--gpu-memory-utilization 0.7" in captured[0]
     assert "--max-num-seqs 8" in captured[0]
     assert "--output-len 1 " in captured[0]
+    assert "--num-prompts 4 " in captured[0]
+    assert "--num-iters-warmup 8 " in captured[0]
+    assert "--num-iters 16 " in captured[0]
     summaries = list((tmp_path / "shared").glob("*/communication_speed_summary.csv"))
     if collect_exit:
         assert len(captured) == 1 and not summaries

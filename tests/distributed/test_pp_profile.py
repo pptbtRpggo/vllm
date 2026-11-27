@@ -475,6 +475,33 @@ class ProfileControllerTests(unittest.TestCase):
         )
         self.assertTrue((self.directory / "pp_memory_profile.json").exists())
 
+    def test_only_measured_rounds_contribute_to_edge_shard_costs(self):
+        engine = FixtureEngine()
+        plan = self.mod.profile_pp_partition(
+            dump_dir=self.directory,
+            hetero_plan=topology(),
+            engine_args=engine_args(),
+            llm_factory=lambda: engine,
+            memory_profile=memory_profile(),
+            workload_kind="prefill",
+            num_prompts=4,
+            input_len=64,
+            output_len=1,
+            num_iters=16,
+            num_iters_warmup=8,
+            seed=7,
+        )
+        calls = [(call[1], call[2]) for call in engine.calls if call[0] == "generate"]
+        self.assertEqual([warmup for warmup, _ in calls], [True] * 8 + [False] * 16)
+        self.assertEqual([len(prompts) for _, prompts in calls], [4] * 24)
+        tokens = {
+            tuple(prompt["prompt_token_ids"])
+            for _, prompts in calls
+            for prompt in prompts
+        }
+        self.assertEqual(len(tokens), 96)
+        self.assertEqual([rank.n_steps for rank in plan.rank_costs], [16] * 4)
+
     def test_collection_uses_worker_provenance_with_multiprocess_core(self):
         engine = FixtureEngine(expose_executor=False)
         self.collect(engine)

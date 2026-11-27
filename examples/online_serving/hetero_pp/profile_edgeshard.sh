@@ -302,7 +302,8 @@ PY 是当前能运行异构 vLLM 的 Python 路径；默认当前虚拟环境或
 Gloo 需要事先连接 Ray；HCCL 使用两端统一入口 --transport hccl --profile。
 TRACE_ROOT 为本地结果根目录；采集结束后自动通过 worker RPC 回收 peer 记录。
 
-流程：4 条合成输入，1 轮预热 + 2 轮采集，每请求只输出首个 token，不做后续 decode。
+流程：每轮 4 条合成输入。8 轮预热（32 条）+ 16 轮正式采集（64 条）。
+每请求只输出首个 token，不做后续 decode。
 只统计 prefill 的四 stage/三链路成本并做 latency DP，排除预热，保存汇总与逐步 CSV。
 使用 ACK 测通信，默认固定 64 个 KV blocks；这是小规模流程验证，不是 GSM8K 压测。
 统一 --profile 入口会传入上下文、token budget、max seq、显存比例及 KV block 配置。
@@ -362,7 +363,7 @@ echo '1/3 采集 prefill 至首 token 的成本（每请求输出 1 token；请�
   --compute-model layer-measured --comm-timing ack \
   --compute-timing "$PROFILE_COMPUTE_TIMING" \
   --input-len 64 --output-len 1 --num-prompts 4 \
-  --num-iters-warmup 1 --num-iters 2 --seed 7 \
+  --num-iters-warmup 8 --num-iters 16 --seed 7 \
   --dtype float16 --enforce-eager --no-async-scheduling \
   --max-model-len "${PROFILE_MAX_MODEL_LEN:-512}" \
   --max-num-batched-tokens "${PROFILE_MAX_NUM_BATCHED_TOKENS:-256}" \

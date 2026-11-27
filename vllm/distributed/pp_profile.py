@@ -72,6 +72,15 @@ class ProfileWorkload:
     temperature: float = 0.0
     warmup_prompts: list[dict[str, list[int]]] | None = None
     iteration_prompts: list[list[dict[str, list[int]]]] | None = None
+    warmup_iteration_prompts: list[list[dict[str, list[int]]]] | None = None
+
+    def warmup_batches(self) -> list[list[dict[str, list[int]]]]:
+        """Return the warmup rounds, accepting a single reusable legacy batch."""
+        if self.warmup_iteration_prompts is not None:
+            return self.warmup_iteration_prompts
+        if self.warmup_prompts is not None:
+            return [self.warmup_prompts] * self.num_iters_warmup
+        return []
 
 
 def build_profile_workload(
@@ -113,13 +122,15 @@ def build_profile_workload(
         return prompts
 
     measured = [fresh() for _ in range(num_iters)]
+    warmup = [fresh() for _ in range(num_iters_warmup)]
     return ProfileWorkload(
         measured[0],
         output_len,
         num_iters,
         num_iters_warmup,
-        warmup_prompts=fresh() if num_iters_warmup else None,
+        warmup_prompts=warmup[0] if warmup else None,
         iteration_prompts=measured,
+        warmup_iteration_prompts=warmup,
     )
 
 
@@ -157,10 +168,14 @@ def run_traced_generate(llm: Any, workload: ProfileWorkload) -> None:
     measured = workload.iteration_prompts or [workload.prompts] * workload.num_iters
     if len(measured) != workload.num_iters or any(not rows for rows in measured):
         raise ValueError("provide one nonempty prompt batch per measured iteration")
+    warmup_batches = workload.warmup_batches()
+    if len(warmup_batches) != workload.num_iters_warmup or any(
+        not batch for batch in warmup_batches
+    ):
+        raise ValueError("provide one nonempty prompt batch per warmup iteration")
     keys = {tuple(p["prompt_token_ids"]) for rows in measured for p in rows}
-    if workload.num_iters_warmup and (
-        not workload.warmup_prompts
-        or any(tuple(p["prompt_token_ids"]) in keys for p in workload.warmup_prompts)
+    if any(
+        tuple(p["prompt_token_ids"]) in keys for batch in warmup_batches for p in batch
     ):
         raise ValueError("warmup requires separate, disjoint warmup_prompts")
     params = SamplingParams(
@@ -168,18 +183,13 @@ def run_traced_generate(llm: Any, workload: ProfileWorkload) -> None:
         ignore_eos=workload.ignore_eos,
         max_tokens=workload.max_tokens,
     )
-    for i in range(workload.num_iters_warmup + workload.num_iters):
-        warmup = i < workload.num_iters_warmup
+    for i, prompts in enumerate([*warmup_batches, *measured]):
+        warmup = i < len(warmup_batches)
         # The staged executor drains previously admitted RPCs before these
         # worker control calls. generate() returning alone is not the barrier.
         result = llm.collective_rpc("set_pp_profile_warmup", args=(warmup,))
         if not isinstance(result, list) or len(result) != 4:
             raise ValueError("warmup RPC must return all four worker receipts")
-        prompts = (
-            workload.warmup_prompts
-            if warmup
-            else measured[i - workload.num_iters_warmup]
-        )
         llm.generate(prompts, sampling_params=params, use_tqdm=False)
 
 
@@ -1008,9 +1018,8 @@ def profile_pp_partition(
                         "native HCCL profiling requires explicit "
                         "--max-num-seqs and --max-num-batched-tokens"
                     )
-                batches = workload.iteration_prompts or [workload.prompts]
-                if workload.warmup_prompts:
-                    batches = [*batches, workload.warmup_prompts]
+                measured = workload.iteration_prompts or [workload.prompts]
+                batches = [*workload.warmup_batches(), *measured]
                 if workload.max_tokens != 1 or any(
                     len(batch) > args.max_num_seqs
                     or sum(len(p["prompt_token_ids"]) for p in batch)
