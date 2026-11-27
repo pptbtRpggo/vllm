@@ -115,6 +115,26 @@ def argument_parser():
         "--num-gpu-blocks-override", type=int, help="可选，固定 KV block 数"
     )
     parser.add_argument(
+        "--async-scheduling",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="HCCL 普通服务可显式选择；profiling 使用同步调度",
+    )
+    parser.add_argument(
+        "--enable-chunked-prefill",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="HCCL 普通服务可显式选择；profiling 开启",
+    )
+    parser.add_argument(
+        "--model-runner-v1", action="store_true", help="HCCL 使用 V1 runner"
+    )
+    parser.add_argument("--seed", type=int, help="HCCL 普通服务的模型随机种子")
+    parser.add_argument(
+        "--expected-checkpoint-sha256",
+        help="HCCL 回测使用，要求本机模型内容与指定 SHA256 一致",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="采集并生成 EdgeShard DP 推荐，不启动 API",
@@ -162,6 +182,10 @@ def parse_npu_core_fractions(value):
     return tuple(map(str, fractions))
 
 
+def _valid_sha256(value: str) -> bool:
+    return len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
 def validate_options(args):
     if args.verify_overlap and (args.profile or args.transport != "gloo"):
         raise ValueError("--verify-overlap 仅用于 Gloo 在线验证")
@@ -175,6 +199,26 @@ def validate_options(args):
         args.peer_soc = "910b" if args.transport == "hccl" else "310p"
     if args.transport == "hccl" and (args.head_soc, args.peer_soc) != ("910b", "910b"):
         raise ValueError("HCCL 模式当前只支持两端各两张 910B；异构请用 gloo")
+    if args.transport != "hccl" and (
+        args.async_scheduling is not None
+        or args.enable_chunked_prefill is not None
+        or args.model_runner_v1
+        or args.seed is not None
+        or args.expected_checkpoint_sha256 is not None
+    ):
+        raise ValueError(
+            "调度、runner、seed、checkpoint SHA 开关仅供 HCCL 启动入口使用"
+        )
+    if args.profile and (
+        args.async_scheduling is True or args.enable_chunked_prefill is False
+    ):
+        raise ValueError("profiling 要求关闭异步调度并开启 chunked prefill")
+    if args.profile and args.seed not in (None, 7):
+        raise ValueError("profiling 固定使用 --seed 7")
+    if args.expected_checkpoint_sha256 is not None and not _valid_sha256(
+        args.expected_checkpoint_sha256
+    ):
+        raise ValueError("--expected-checkpoint-sha256 需要 64 位小写十六进制 SHA256")
     if not args.profile and args.profile_compute_timing != "event":
         raise ValueError("--profile-compute-timing 仅用于 --profile")
     if args.profile:
@@ -430,6 +474,8 @@ def make_native_launch(args, node_ip, python, environment, plan, role):
         "VLLM_HOST_IP": node_ip,
         "HCCL_IF_IP": node_ip,
         "VLLM_PP_LAYER_PARTITION": args.layers,
+        "VLLM_HETERO_PP_PLAN": json.dumps(plan),
+        "HETERO_PP_RUN_MODE": "profile" if args.profile else "serve",
     }
     interface = args.interface or environment.get("GLOO_SOCKET_IFNAME")
     if interface:
@@ -461,14 +507,23 @@ def make_native_launch(args, node_ip, python, environment, plan, role):
         "--dtype",
         "float16",
         "--enforce-eager",
+        "--no-enable-prefix-caching",
+        "--worker-cls",
+        "vllm.distributed.hetero_pp.native_worker.Native910BWorker",
     ]
-    if args.profile or any("npu_core_fraction" in stage for stage in plan["stages"]):
-        updates["VLLM_HETERO_PP_PLAN"] = json.dumps(plan)
+    if (
+        args.profile
+        or args.model_runner_v1
+        or any("npu_core_fraction" in stage for stage in plan["stages"])
+    ):
         updates["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-        command += [
-            "--worker-cls",
-            "vllm.distributed.hetero_pp.native_worker.Native910BWorker",
-        ]
+    if not args.profile:
+        if args.seed is not None:
+            command += ["--seed", str(args.seed)]
+        for name in ("async_scheduling", "enable_chunked_prefill"):
+            value = getattr(args, name)
+            if value is not None:
+                command.append(("--" if value else "--no-") + name.replace("_", "-"))
     if role == "head" and not args.profile:
         # The peer checks this API for a bounded startup, then remains attached
         # to its own headless worker process. Health is not inference validation.
@@ -486,6 +541,7 @@ def make_native_launch(args, node_ip, python, environment, plan, role):
             command += ["--" + name.replace("_", "-"), str(value)]
     profile_command, profile_environment = profile_head_command(args, role)
     if args.profile:
+        updates["HETERO_PP_PROFILE_COMPUTE_TIMING"] = args.profile_compute_timing
         if role == "head":
             profile_environment.update(
                 PROFILE_MASTER_ADDR=args.head, PROFILE_MASTER_PORT=str(args.master_port)
@@ -494,7 +550,6 @@ def make_native_launch(args, node_ip, python, environment, plan, role):
             profile_command = command + [
                 "--no-async-scheduling",
                 "--enable-chunked-prefill",
-                "--no-enable-prefix-caching",
                 "--seed",
                 "7",
             ]
@@ -504,6 +559,9 @@ def make_native_launch(args, node_ip, python, environment, plan, role):
         plan=plan,
         environment=updates,
         unset_environment=[
+            "HETERO_PP_RUN_MODE",
+            "HETERO_PP_CHECKPOINT_SHA256",
+            "HETERO_PP_PROFILE_COMPUTE_TIMING",
             "VLLM_HETERO_PP_PLAN",
             "VLLM_PP_STAGE_TRACE",
             "VLLM_PP_TRACE_SESSION",
@@ -893,6 +951,22 @@ def main(argv=None):
         launch = make_launch(args, node_ip, python, env, output)
         write_json(output / "local_preflight.json", dict(inventory, network=network))
         write_json(output / "plan.json", launch["plan"])
+        if args.transport == "hccl":
+            print("校验本机模型文件内容，用于两端启动比对……", flush=True)
+            helper = ROOT / "vllm/distributed/hetero_pp/checkpoint_identity.py"
+            rc, result = capture(
+                [python, "-S", str(helper), str(args.model)], env, args.startup_timeout
+            )
+            digest = result.strip()
+            if rc or not _valid_sha256(digest):
+                raise ValueError(f"模型文件校验失败：{result.strip()}")
+            expected_digest = args.expected_checkpoint_sha256
+            if expected_digest is not None and digest != expected_digest:
+                raise ValueError(
+                    "本机 checkpoint 与回测引用的模型内容不同："
+                    f"实际 {digest}，要求 {expected_digest}"
+                )
+            launch["environment"]["HETERO_PP_CHECKPOINT_SHA256"] = digest
         write_json(output / "launch.json", launch)
         print(
             f"本机 {expected}，角色={launch['role']}，网卡={network['interface']}",

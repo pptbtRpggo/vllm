@@ -676,6 +676,98 @@ class ProfilingTests(unittest.TestCase):
         self.assertIn(str(raised.exception.__cause__), failure["error"])
         self.assertFalse(self.rows())
 
+    def test_native_worker_preserves_receive_failure_through_shutdown(self):
+        self._assert_native_worker_preserves_transport_failure("receive")
+
+    def test_native_worker_preserves_send_failure_through_shutdown(self):
+        self._assert_native_worker_preserves_transport_failure("send")
+
+    def _assert_native_worker_preserves_transport_failure(self, phase):
+        from vllm.distributed.hetero_pp.native_worker import (
+            NativeWorkerMixin,
+            _NativeLink,
+        )
+        from vllm.distributed.hetero_pp.profiling import AckControl
+
+        with tempfile.TemporaryDirectory() as directory:
+            profiler = self.mod.StageProfiler(
+                directory,
+                "failed-native-handoff",
+                self.model,
+                torch.device("cpu"),
+                2,
+                4,
+                comm_timing="ack",
+                transport="native_hccl",
+            )
+            original = RuntimeError(f"injected HCCL {phase} failure")
+            shutdowns = []
+
+            def fail(*_):
+                raise original
+
+            group = NS(
+                cpu_group=object(),
+                rank_in_group=2,
+                irecv_tensor_dict=fail,
+                isend_tensor_dict=fail,
+            )
+
+            class NativeBase:
+                model_runner: NS
+
+                def execute_model(self, scheduler):
+                    if phase == "receive":
+                        return group.irecv_tensor_dict()
+                    result = self.model_runner.execute_model(scheduler)
+                    return group.isend_tensor_dict({"hidden_states": result})
+
+                def shutdown(self):
+                    shutdowns.append(self)
+
+            class Worker(NativeWorkerMixin, NativeBase):
+                pass
+
+            worker = Worker()
+            worker.rank = 2
+            worker.device = profiler.device
+            worker._hetero_profiler = profiler
+            worker._profile_sequence = 7
+            worker.model_runner = NS(
+                **vars(self.runner),
+                execute_model=lambda _: self.model(torch.ones(1, 2)),
+            )
+            try:
+                with (
+                    patch(
+                        "vllm.distributed.parallel_state.get_pp_group",
+                        return_value=group,
+                    ),
+                    patch.object(AckControl, "send"),
+                    patch.object(AckControl, "receive"),
+                    patch.object(_NativeLink, "validate_payload"),
+                    self.assertRaises(RuntimeError) as raised,
+                ):
+                    worker.execute_model(schedule())
+                self.assertIs(raised.exception, original)
+
+                with self.assertRaisesRegex(RuntimeError, "profile writer") as flush:
+                    profiler.flush()
+                self.assertIs(flush.exception.__cause__, original)
+                worker.shutdown()
+                self.assertEqual(shutdowns, [worker])
+                self.assertIsNone(profiler.pending)
+                self.assertFalse(profiler.manifest_path.exists())
+                self.assertEqual(profiler.path.read_text(), "")
+                report = Path(directory) / "pp_profile_failure_pp2_tp0.json"
+                failure = json.loads(report.read_text())
+                self.assertEqual(failure["pp_rank"], 2)
+                self.assertEqual(failure["step"], 7)
+                self.assertEqual(failure["phase"], phase)
+                self.assertIn(str(original), failure["error"])
+            finally:
+                profiler.close(raise_errors=False)
+
     def test_worker_routes_execute_and_sample_through_real_profiler(self):
         from contextlib import nullcontext
 

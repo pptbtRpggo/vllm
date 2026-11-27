@@ -28,6 +28,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import regex as re
+
 from vllm.distributed.pp_memory import PPMemoryProfile
 from vllm.distributed.pp_partition import PPPartitionPlan, format_plan
 from vllm.logger import init_logger
@@ -347,6 +349,7 @@ def _engine_snapshot(config):
         num_layers=config.model_config.get_total_num_hidden_layers(),
         pipeline_parallel_size=config.parallel_config.pipeline_parallel_size,
         tensor_parallel_size=config.parallel_config.tensor_parallel_size,
+        data_parallel_size=getattr(config.parallel_config, "data_parallel_size", None),
         enforce_eager=config.model_config.enforce_eager,
         disable_cascade_attn=config.model_config.disable_cascade_attn,
         async_scheduling=config.scheduler_config.async_scheduling,
@@ -418,7 +421,98 @@ def _source_hashes():
     return {str(p.relative_to(_ROOT)): _sha(p) for p in sorted(set(paths))}
 
 
-def _validate_startup(reports, topology, config, transport=_TRANSPORT):
+def _validate_native_worker_config(rank, observation, scope):
+    if not isinstance(observation, dict):
+        raise ValueError(f"rank {rank} lacks serving_config_observation")
+    # The checkpoint identity is verified separately; paths may differ by node.
+    groups = {
+        "model": (
+            "revision",
+            "dtype",
+            "quantization",
+            "max_model_len",
+            "enforce_eager",
+            "disable_cascade_attn",
+        ),
+        "cache": (
+            "kv_cache_dtype",
+            "block_size",
+            "gpu_memory_utilization",
+            "num_gpu_blocks_override",
+            "kv_cache_memory_bytes",
+            "enable_prefix_caching",
+        ),
+        "scheduler": (
+            "max_num_seqs",
+            "max_num_batched_tokens",
+            "async_scheduling",
+            "enable_chunked_prefill",
+        ),
+        "parallel": (
+            "pipeline_parallel_size",
+            "tensor_parallel_size",
+            "data_parallel_size",
+        ),
+    }
+    for group, fields in groups.items():
+        actual = observation.get(group)
+        if not isinstance(actual, dict):
+            raise ValueError(f"rank {rank} lacks serving_config_observation.{group}")
+        for field in fields:
+            name = "cache_dtype" if field == "kv_cache_dtype" else field
+            if name not in actual or field not in scope:
+                raise ValueError(f"rank {rank} lacks effective {group}.{name}")
+            observed, expected = actual[name], scope[field]
+            if field == "dtype" and isinstance(observed, str):
+                observed = observed.removeprefix("torch.")
+            if type(observed) is not type(expected) or observed != expected:
+                raise ValueError(
+                    f"rank {rank} {group}.{name}: "
+                    f"expected {expected!r}, observed {observed!r}"
+                )
+
+
+def _validate_memory_observations(observations, scope, transport):
+    if (
+        not isinstance(observations, list)
+        or len(observations) != 4
+        or any(
+            not isinstance(row, dict) or type(row.get("pp_rank")) is not int
+            for row in observations
+        )
+        or {r.get("pp_rank") for r in observations} != set(range(4))
+    ):
+        raise ValueError("memory observation RPC must cover all four ranks")
+    if transport == _NATIVE_TRANSPORT:
+        blocks = scope["num_gpu_blocks_override"]
+        for row in observations:
+            rank = row["pp_rank"]
+            if row.get("tp_rank") != 0:
+                raise ValueError(f"rank {rank} memory observation requires TP rank 0")
+            _validate_native_worker_config(
+                rank, row.get("serving_config_observation"), scope
+            )
+            actual_blocks = row.get("num_gpu_blocks")
+            if blocks is not None and (
+                type(actual_blocks) is not int or actual_blocks != blocks
+            ):
+                raise ValueError(
+                    f"rank {rank} actual KV block count differs from configured policy"
+                )
+
+
+def _native_checkpoint_sha256(reports) -> str:
+    expected = reports[0].get("checkpoint_sha256")
+    for rank, report in enumerate(reports):
+        observed = report.get("checkpoint_sha256")
+        if not isinstance(observed, str) or not re.fullmatch(r"[0-9a-f]{64}", observed):
+            raise ValueError(f"rank {rank} lacks a valid HCCL checkpoint SHA-256")
+        if observed != expected:
+            raise ValueError(f"rank {rank} HCCL checkpoint SHA-256 differs from rank 0")
+    return expected
+
+
+def _validate_startup(reports, topology, config, transport=_TRANSPORT) -> str | None:
     if not isinstance(reports, list) or len(reports) != 4:
         raise ValueError("profile manifest requires all four actual startup reports")
     model_sha = hashlib.sha256(
@@ -427,6 +521,7 @@ def _validate_startup(reports, topology, config, transport=_TRANSPORT):
     end = 0
     sources = _source_hashes()
     native = transport == _NATIVE_TRANSPORT
+    scope = _engine_snapshot(config) if native else None
     for rank, report in enumerate(reports):
         stage = topology["stages"][rank]
         if (
@@ -464,6 +559,10 @@ def _validate_startup(reports, topology, config, transport=_TRANSPORT):
                 raise ValueError(f"rank {rank} source SHA does not match {relative}")
         if not report.get("sources"):
             raise ValueError("startup report lacks actual adapter source hashes")
+        if scope is not None:
+            _validate_native_worker_config(
+                rank, report.get("serving_config_observation"), scope
+            )
         end += stage["layers"]
     keys: tuple[str, ...] = (
         "vllm",
@@ -487,6 +586,7 @@ def _validate_startup(reports, topology, config, transport=_TRANSPORT):
         ]
         if None in ids or len(set(ids)) != 2:
             raise ValueError("profile requires two distinct actual devices per node")
+    return _native_checkpoint_sha256(reports) if native else None
 
 
 def _validate_flush(
@@ -611,7 +711,7 @@ def _load_bound_manifest(directory, topology, transport=None):
         file = (_ROOT / relative).resolve()
         if not file.is_relative_to(_ROOT) or not file.is_file() or _sha(file) != digest:
             raise ValueError(f"profile source SHA changed: {relative}")
-    _, raw = _validate_flush(
+    receipts, raw = _validate_flush(
         directory,
         manifest["flush_receipts"],
         manifest["trace_session"],
@@ -635,16 +735,42 @@ def _load_bound_manifest(directory, topology, transport=None):
             key
         ):
             raise ValueError(f"profile evidence SHA changed: {name}")
+    if expected_transport == _NATIVE_TRANSPORT:
+        scope = manifest["engine_config"]
+        if receipts != json.loads((directory / "flush_receipts.json").read_text()):
+            raise ValueError(
+                "native manifest flush receipts differ from saved receipts"
+            )
+        reports = [receipt.get("identity") for receipt in receipts]
+        if reports != manifest.get("startup_reports") or not all(
+            isinstance(report, dict) for report in reports
+        ):
+            raise ValueError("native worker startup reports differ from trace receipts")
+        _native_checkpoint_sha256(reports)
+        for rank, report in enumerate(reports):
+            _validate_native_worker_config(
+                rank, report.get("serving_config_observation"), scope
+            )
+        _validate_memory_observations(
+            json.loads((directory / "memory_observations.json").read_text()),
+            scope,
+            expected_transport,
+        )
     return manifest
 
 
 def _collect(*, directory, topology, args, llm_factory, workload, memory, transport):
+    from vllm.distributed.hetero_pp.profile_memory import validate_fixed_kv_capacity
+
     llm = None
     supplied_memory = memory is not None
+    checkpoint_sha256 = None
     try:
         llm = llm_factory() if llm_factory else _default_llm_factory(args)
         config = llm.llm_engine.vllm_config
         snapshot = _engine_snapshot(config)
+        if transport == _NATIVE_TRANSPORT:
+            validate_fixed_kv_capacity(config)
         if memory is not None:
             memory.validate_engine_config(config)
         if transport == _NATIVE_TRANSPORT:
@@ -657,7 +783,7 @@ def _collect(*, directory, topology, args, llm_factory, workload, memory, transp
                     os.environ["VLLM_PP_COMPUTE_TIMING"],
                 ),
             )
-            _validate_startup(reports, topology, config, transport)
+            checkpoint_sha256 = _validate_startup(reports, topology, config, transport)
         run_traced_generate(llm, workload)
         receipts = llm.collective_rpc("flush_pp_profile")
         from vllm.distributed.hetero_pp.trace_export import collect_profile_traces
@@ -676,14 +802,12 @@ def _collect(*, directory, topology, args, llm_factory, workload, memory, transp
         # Worker provenance crosses the same RPC boundary in both in-process
         # and multiprocess EngineCore mode. The driver need not own Executor.
         reports = [receipt.get("identity") for receipt in receipts]
-        _validate_startup(reports, topology, config, transport)
+        if _validate_startup(reports, topology, config, transport) != checkpoint_sha256:
+            raise ValueError(
+                "HCCL checkpoint SHA-256 changed between startup and flush"
+            )
         observations = llm.collective_rpc("get_pp_memory_observation")
-        if (
-            not isinstance(observations, list)
-            or len(observations) != 4
-            or sorted(r.get("pp_rank", -1) for r in observations) != list(range(4))
-        ):
-            raise ValueError("memory observation RPC must cover all four ranks")
+        _validate_memory_observations(observations, snapshot, transport)
         if memory is None:
             from vllm.distributed.hetero_pp.profile_memory import (
                 build_fixed_block_memory_profile,
@@ -982,6 +1106,48 @@ def profile_pp_partition(
     return plan
 
 
+def _native_trace_off_args(
+    topology, scope, engine_args, checkpoint_sha256
+) -> list[str]:
+    stages = topology["stages"]
+    arguments = [
+        "--transport",
+        "hccl",
+        "--head",
+        stages[0]["node_ip"],
+        "--peer",
+        stages[-1]["node_ip"],
+        "--layers",
+        ",".join(str(stage["layers"]) for stage in stages),
+        "--npu-core-fractions",
+        ",".join(stage.get("npu_core_fraction", "1") for stage in stages),
+        "--expected-checkpoint-sha256",
+        checkpoint_sha256,
+        "--model-runner-v1",
+        "--seed",
+        str(engine_args["seed"]),
+    ]
+    if engine_args.get("master_port") is not None:
+        arguments += ["--master-port", str(engine_args["master_port"])]
+    for key in (
+        "max_model_len",
+        "max_num_batched_tokens",
+        "max_num_seqs",
+        "gpu_memory_utilization",
+        "block_size",
+        "num_gpu_blocks_override",
+    ):
+        if scope[key] is not None:
+            arguments += ["--" + key.replace("_", "-"), str(scope[key])]
+    arguments.append("--async-scheduling")
+    arguments.append(
+        "--enable-chunked-prefill"
+        if scope["enable_chunked_prefill"]
+        else "--no-enable-chunked-prefill"
+    )
+    return arguments
+
+
 def format_serve_command(plan: PPPartitionPlan, dump_dir=None) -> str:
     """Generate the dedicated trace-off entrypoint from the bound runtime scope."""
     if dump_dir is None:
@@ -1012,13 +1178,46 @@ def format_serve_command(plan: PPPartitionPlan, dump_dir=None) -> str:
         )
     scope = manifest["engine_config"]
     if manifest["transport"] == _NATIVE_TRANSPORT:
-        layers = ",".join(str(s["layers"]) for s in raw["stages"])
-        fractions = ",".join(s.get("npu_core_fraction", "1") for s in raw["stages"])
+        launcher_settings = {
+            "revision": None,
+            "dtype": "float16",
+            "quantization": None,
+            "kv_cache_dtype": "auto",
+            "kv_cache_memory_bytes": None,
+            "enforce_eager": True,
+            "disable_cascade_attn": False,
+            "enable_prefix_caching": False,
+            "use_v2_model_runner": False,
+        }
+        mismatches = [
+            key for key, value in launcher_settings.items() if scope[key] != value
+        ]
+        if type(scope["enable_chunked_prefill"]) is not bool:
+            mismatches.append("enable_chunked_prefill")
+        if mismatches:
+            raise ValueError(
+                f"HCCL launcher cannot replay profiled settings: {mismatches}"
+            )
+        engine_args = json.loads((directory / "engine_args.json").read_text())
+        seed = engine_args.get("seed")
+        if type(seed) is not int or seed != scope["seed"]:
+            raise ValueError("HCCL launcher seed differs from the profiled engine")
+        args = _native_trace_off_args(
+            raw,
+            scope,
+            engine_args,
+            manifest["startup_reports"][0]["checkpoint_sha256"],
+        )
+        original_layers = ",".join(
+            str(stage["layers"]) for stage in manifest["hetero_plan"]["stages"]
+        )
         return (
-            "Trace-off HCCL candidate for both launchers: "
-            f"--transport hccl --layers {layers} --npu-core-fractions {fractions}\n"
-            "Keep the profiled capacity options and validate full token IDs "
-            "and actual memory after re-serve."
+            "Trace-off HCCL candidate using the profiled capacity on both nodes:\n"
+            f"{shlex.join(args)}\n"
+            "Reuse the local model path and device selection on each node. "
+            "Prefix caching stays off and asynchronous scheduling is enabled. "
+            f"For the baseline, change only --layers to {original_layers}. "
+            "Validate full token IDs and actual memory after re-serve."
         )
     command = [
         sys.executable,

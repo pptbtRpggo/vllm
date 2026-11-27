@@ -64,7 +64,8 @@ def test_native_worker_binds_stage_quota_before_native_distributed_init(monkeypa
             calls.append("native HCCL")
 
     class Worker(native_worker.NativeWorkerMixin, AscendBase):
-        pass
+        def _check_native_startup(self):
+            calls.append("cross-rank configuration check")
 
     worker = Worker()
     worker.rank, worker.local_rank = 3, 1
@@ -79,8 +80,53 @@ def test_native_worker_binds_stage_quota_before_native_distributed_init(monkeypa
         model_config=SimpleNamespace(get_total_num_hidden_layers=lambda: 8),
     )
     worker._init_worker_distributed_environment()
-    assert calls == [("910B", "1/4"), "native HCCL"]
+    assert calls == [("910B", "1/4"), "native HCCL", "cross-rank configuration check"]
     assert worker._hetero_npu_core_limit == {"fraction": "1/4"}
+
+
+def test_native_worker_preserves_serving_with_transformer_partition():
+    from vllm.distributed.hetero_pp.native_worker import NativeWorkerMixin
+
+    class AscendBase:
+        def load_model(self):
+            transformer = SimpleNamespace(start_layer=2, end_layer=4)
+            self.model_runner = SimpleNamespace(
+                model=SimpleNamespace(transformer=transformer)
+            )
+
+    class Worker(NativeWorkerMixin, AscendBase):
+        pass
+
+    worker = Worker()
+    worker.rank = 1
+    worker._native_plan = SimpleNamespace(layer_ranges=[(0, 2), (2, 4)])
+    worker.load_model()
+    assert worker._verified_native_layers() == (2, 4)
+    worker.model_runner.model.transformer.start_layer = 0
+    with pytest.raises(ValueError, match="rank 1 loaded layers"):
+        worker._verified_native_layers()
+
+
+def test_native_worker_observes_transformers_module_list_partition():
+    from torch import nn
+
+    from vllm.distributed.hetero_pp.native_worker import NativeWorkerMixin
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    model = nn.Module()
+    model.layers = nn.ModuleList(
+        [
+            PPMissingLayer(),
+            nn.Linear(1, 1),
+            nn.Linear(1, 1),
+            PPMissingLayer(),
+        ]
+    )
+    worker = NativeWorkerMixin()
+    worker.rank = 1
+    worker.model_runner = SimpleNamespace(model=model)
+    worker._native_plan = SimpleNamespace(layer_ranges=[(0, 1), (1, 3), (3, 4)])
+    assert worker._verified_native_layers() == (1, 3)
 
 
 def test_native_ack_finishes_native_receive_dependencies_before_done(monkeypatch):

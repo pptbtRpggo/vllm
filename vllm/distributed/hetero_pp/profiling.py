@@ -42,6 +42,10 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 class AckControl:
     """Bounded, identity-bound CPU control frames on reserved Gloo tags.
@@ -603,6 +607,7 @@ class StageProfiler:
         self.zero_steps = self.unassociated_sample_calls = 0
         self.records = self.warmup_records = self.sample_records = 0
         self._error = None
+        self.step_failure_reported = False
         self._failed_step = None
         self._failed_traceback = None
         self._event_reread = None
@@ -683,35 +688,54 @@ class StageProfiler:
             return _AckTraceLink(step, original, self.timeout_s)
         return _TraceLink(step, original)
 
+    def abort_step(self, step, error, *, phase):
+        """Discard an incomplete step and retain the exception being raised."""
+        if self.pending is step:
+            self.pending = None
+        self.step_failure_reported = True
+        with self._diagnostic_lock:
+            if self._error is not None:
+                return
+            self._error = error
+            sequence = step.metadata["step"]
+            logger.error(
+                "PP profiling failed on stage %d, step %d during %s: %s",
+                self.rank,
+                sequence,
+                phase,
+                error,
+            )
+            try:
+                self._failure(traceback.format_exc(), step=sequence, phase=phase)
+            except OSError:
+                logger.exception("Could not write PP profiling failure report")
+
     def execute(self, step, fn):
         if step is None:
             return fn()
         capture = _Capture(self, "execute")
         try:
             result = capture.run(fn)
-        except BaseException:
-            self.pending = None
-            self._error = RuntimeError("profile execute capture failed")
-            self._failure(traceback.format_exc())
+        except BaseException as error:
+            self.abort_step(step, error, phase="execute")
             raise
         step.execute = capture
         return result
 
     def sample(self, fn):
         self._check()
-        if self.pending is None:
+        step = self.pending
+        if step is None:
             if self._final_receipt is None:
                 self.unassociated_sample_calls += 1
             return fn()
         capture = _Capture(self, "sample")
         try:
             result = capture.run(fn)
-        except BaseException:
-            self.pending = None
-            self._error = RuntimeError("profile sample capture failed")
-            self._failure(traceback.format_exc())
+        except BaseException as error:
+            self.abort_step(step, error, phase="sample")
             raise
-        self.pending.sample = capture
+        step.sample = capture
         self._finalize_pending()
         return result
 
@@ -861,11 +885,11 @@ class StageProfiler:
         self.warmup_records += int(row["is_warmup"])
         self.sample_records += int(row["sample_called"])
 
-    def _failure(self, error):
+    def _failure(self, error, **fields):
         failure = self.manifest_path.with_name(
             f"pp_profile_failure_pp{self.rank}_tp0.json"
         )
-        detail = {**self.provenance, "error": error}
+        detail = {**self.provenance, **fields, "error": error}
         if self._event_reread is not None:
             detail["event_reread"] = self._event_reread
         failure.write_text(json.dumps(detail, indent=2))
@@ -892,6 +916,8 @@ class StageProfiler:
                 self._write_row(row)
             except Exception as error:
                 with self._diagnostic_lock:
+                    if self._error is not None:
+                        continue
                     # Keep the rejected numeric snapshot for diagnostics.
                     self._failed_step = step if resolving else None
                     self._failed_traceback = traceback.format_exc()
@@ -1141,6 +1167,7 @@ def serving_config_observation(worker):
                 "quantization",
                 "max_model_len",
                 "enforce_eager",
+                "disable_cascade_attn",
             ),
         ),
         "cache": (
@@ -1152,11 +1179,17 @@ def serving_config_observation(worker):
                 "num_gpu_blocks",
                 "num_gpu_blocks_override",
                 "kv_cache_memory_bytes",
+                "enable_prefix_caching",
             ),
         ),
         "scheduler": (
             cfg.scheduler_config,
-            ("max_num_seqs", "max_num_batched_tokens", "async_scheduling"),
+            (
+                "max_num_seqs",
+                "max_num_batched_tokens",
+                "async_scheduling",
+                "enable_chunked_prefill",
+            ),
         ),
         "parallel": (
             cfg.parallel_config,

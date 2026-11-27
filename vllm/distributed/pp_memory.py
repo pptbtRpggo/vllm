@@ -18,6 +18,18 @@ from typing import Any
 import regex as re
 
 
+def validate_fixed_block_capacity(
+    num_gpu_blocks: int, block_size: int, max_model_len: int, max_num_seqs: int
+) -> None:
+    """Check capacity with independent rounding for every active sequence."""
+    required_blocks = ((max_model_len + block_size - 1) // block_size) * max_num_seqs
+    if num_gpu_blocks < required_blocks:
+        raise ValueError(
+            "cache_policy fixed_blocks capacity is insufficient: "
+            f"need at least {required_blocks} blocks for serving_config"
+        )
+
+
 def observe_worker_memory(worker: Any) -> dict[str, Any]:
     """Observe loaded tensor storage and allocator peaks after a drained workload.
 
@@ -210,20 +222,12 @@ class PPMemoryProfile:
                     raise ValueError(
                         f"cache_policy.{key} does not match serving_config"
                     )
-            block_size = policy["block_size"]
-            # Charge each sequence's block rounding independently. This is a
-            # conservative capacity precondition, not evidence for pool bytes;
-            # the collector must measure the actual storage separately.
-            required_blocks = (
-                (self.serving_config["max_model_len"] + block_size - 1)
-                // block_size
-                * self.serving_config["max_num_seqs"]
+            validate_fixed_block_capacity(
+                policy["num_gpu_blocks"],
+                policy["block_size"],
+                self.serving_config["max_model_len"],
+                self.serving_config["max_num_seqs"],
             )
-            if policy["num_gpu_blocks"] < required_blocks:
-                raise ValueError(
-                    "cache_policy fixed_blocks capacity is insufficient: "
-                    f"need at least {required_blocks} blocks for serving_config"
-                )
 
     def validate_dimensions(self, num_layers: int, pp_size: int) -> None:
         if (self.num_layers, self.pp_size) != (num_layers, pp_size):

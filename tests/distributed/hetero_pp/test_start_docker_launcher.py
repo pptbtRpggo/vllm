@@ -100,6 +100,21 @@ def test_docker_forwards_hccl_profile_and_core_fractions(environment, local):
     assert command[command.index("--npu-core-fractions") + 1] == "1,1,1/2,1/4"
 
 
+@pytest.mark.parametrize("local", ["141.147.135.53", "141.147.135.54"])
+def test_docker_forwards_hccl_serving_flags(environment, local):
+    environment["TEST_LOCAL_IP"] = local
+    flags = ("--async-scheduling", "--no-enable-chunked-prefill", "--model-runner-v1")
+    inputs = {"--expected-checkpoint-sha256": "a" * 64, "--seed": "7"}
+    values = [part for pair in inputs.items() for part in pair]
+    result = invoke(environment, "--transport", "hccl", *flags, *values, "--dry-run")
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout)
+    assert all(command.count(flag) == 1 for flag in flags)
+    assert all(
+        command[command.index(key) + 1] == value for key, value in inputs.items()
+    )
+
+
 def test_docker_rejects_core_fractions_in_debug_shell(environment):
     result = invoke(
         environment, "--npu-core-fractions", "1,1,1/2,1/4", "--shell", "--dry-run"

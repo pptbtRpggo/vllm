@@ -49,6 +49,13 @@ usage() {
                        按 PP stage 0–3 指定核心比例，例如 1,1,1/2,1/4
   --profile           Gloo 或 HCCL：head 采集/打印统计/生成 DP，不启动 API
   --verify-overlap    仅 Gloo 在线：head 自动验证 Stage 0/1 NPU 批次重叠
+  --async-scheduling / --no-async-scheduling
+  --enable-chunked-prefill / --no-enable-chunked-prefill
+                       可选，显式设定 HCCL 普通服务的调度与 chunked prefill
+  --model-runner-v1    HCCL 回测使用与采集一致的 V1 runner
+  --seed N            HCCL 普通服务的模型随机种子
+  --expected-checkpoint-sha256 SHA
+                       HCCL 回测所使用的 checkpoint 内容 SHA256
   --trace-root DIR    可选，本机结果目录；不需要共享，默认随本轮日志保存
                        head 通过 worker RPC 收回并校验 peer 记录
   --profile-timeout N profiling 全流程上限秒数，默认 3600
@@ -79,7 +86,9 @@ while (($#)); do
     --shell) debug_shell=true; shift ;;
     --profile) profile=true; shift ;;
     --verify-overlap) verify_overlap=true; shift ;;
-    --head|--peer|--head-soc|--peer-soc|--transport|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--master-port|--api-port|--layers|--npu-core-fractions|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python|--chat-template|--trace-root|--profile-timeout|--profile-compute-timing|--block-size|--num-gpu-blocks-override)
+    --async-scheduling|--no-async-scheduling|--enable-chunked-prefill|--no-enable-chunked-prefill|--model-runner-v1)
+      forward+=("$1"); shift ;;
+    --head|--peer|--head-soc|--peer-soc|--transport|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--master-port|--api-port|--layers|--npu-core-fractions|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python|--chat-template|--trace-root|--profile-timeout|--profile-compute-timing|--block-size|--num-gpu-blocks-override|--seed|--expected-checkpoint-sha256)
       (($# >= 2)) && [[ -n "$2" && "$2" != --* ]] || die "$1 缺少参数"
       case "$1" in
         --head) head="$2" ;; --peer) peer="$2" ;; --model) model="$2" ;;

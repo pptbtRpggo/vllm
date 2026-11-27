@@ -39,6 +39,21 @@ def _integer(value: Any, label: str, minimum: int = 0) -> int:
     return value
 
 
+def validate_fixed_kv_capacity(config: Any) -> None:
+    """Reject an insufficient explicit block count using resolved engine settings."""
+    from vllm.distributed.pp_memory import validate_fixed_block_capacity
+
+    cache = config.cache_config
+    blocks = getattr(cache, "num_gpu_blocks_override", None)
+    if blocks is not None:
+        validate_fixed_block_capacity(
+            _integer(blocks, "fixed block count", 1),
+            _integer(cache.block_size, "block_size", 1),
+            _integer(config.model_config.max_model_len, "max_model_len", 1),
+            _integer(config.scheduler_config.max_num_seqs, "max_num_seqs", 1),
+        )
+
+
 def _layer_id(name: str) -> int:
     if str(name).isdigit():
         return int(name)
@@ -89,6 +104,7 @@ def build_fixed_block_memory_profile(
     model = config.model_config
     n_layers = model.get_total_num_hidden_layers()
     _integer(safety_margin_bytes, "safety_margin_bytes")
+    validate_fixed_kv_capacity(config)
     blocks = _integer(cache.num_gpu_blocks_override, "fixed block count", 1)
     if cache.kv_cache_memory_bytes is not None:
         raise ValueError("fixed-byte KV overrides are not supported")
@@ -113,6 +129,26 @@ def build_fixed_block_memory_profile(
         raise ValueError("observations must cover each original PP rank once")
     all_layers, partitions, devices = [], [], []
     for rank, row in enumerate(ordered):
+        utilization = scope["gpu_memory_utilization"]
+        if "serving_config_observation" in row:
+            observation = row["serving_config_observation"]
+            cache_observation = (
+                observation.get("cache") if isinstance(observation, dict) else None
+            )
+            reported_utilization = (
+                cache_observation.get("gpu_memory_utilization")
+                if isinstance(cache_observation, dict)
+                else None
+            )
+            if (
+                type(reported_utilization) not in (int, float)
+                or reported_utilization != utilization
+            ):
+                raise ValueError(
+                    f"rank {rank} cache.gpu_memory_utilization: "
+                    f"expected {utilization!r}, observed {reported_utilization!r}"
+                )
+            utilization = reported_utilization
         if row.get("includes_kv_pool") is not True:
             raise ValueError("allocator observation must explicitly include KV pool")
         if row.get("num_gpu_blocks") != blocks:
@@ -168,7 +204,7 @@ def build_fixed_block_memory_profile(
             raise ValueError("allocator observation is inconsistent")
         non_torch = max(0, total - free - reserved)
         other_peak = peak - model_bytes - pool
-        budget = math.floor(total * scope["gpu_memory_utilization"])
+        budget = math.floor(total * utilization)
         devices.append(
             DeviceMemory(
                 pp_rank=rank,

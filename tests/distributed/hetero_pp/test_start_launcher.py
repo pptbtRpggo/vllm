@@ -86,6 +86,7 @@ def test_native_hccl_profile_uses_one_plan_and_two_mp_roles(model, ip):
     else:
         command = launch["profile_command"]
         assert "--headless" in command and "--no-async-scheduling" in command
+        assert command.count("--no-enable-prefix-caching") == 1
         assert command[command.index("--worker-cls") + 1].endswith("Native910BWorker")
         assert command[command.index("--num-gpu-blocks-override") + 1] == "64"
 
@@ -177,13 +178,15 @@ def test_hccl_starts_native_mp_on_each_node_without_ray(model, ip, rank):
         assert command[command.index(flag) + 1] == value
     assert ("--headless" in command) is (rank == "1")
     assert ("--chat-template" in command) is (rank == "0")
+    assert command.count("--no-enable-prefix-caching") == 1
     assert "--no-async-scheduling" not in command
     assert "--max-model-len" not in command
     env = launch["environment"]
     assert env["VLLM_PP_LAYER_PARTITION"] == "18,18,6,6"
     assert env["HCCL_IF_IP"] == ip
     assert env["TP_SOCKET_IFNAME"] == env["GLOO_SOCKET_IFNAME"] == "eth1"
-    assert "VLLM_HETERO_PP_PLAN" not in env
+    assert json.loads(env["VLLM_HETERO_PP_PLAN"]) == launch["plan"]
+    assert "vllm.distributed.hetero_pp.native_worker.Native910BWorker" in command
     assert [stage["soc"] for stage in launch["plan"]["stages"]] == ["910B"] * 4
 
 
@@ -212,9 +215,28 @@ def test_hccl_uses_balanced_layers_and_native_capacity_defaults(model):
         "--max-num-batched-tokens",
         "--max-num-seqs",
         "--gpu-memory-utilization",
-        "--no-enable-prefix-caching",
     ):
         assert flag not in launch["serve_command"]
+
+
+def test_hccl_serve_accepts_explicit_scheduling_and_chunked_prefill(model):
+    result = invoke(
+        model,
+        "--transport",
+        "hccl",
+        "--no-async-scheduling",
+        "--enable-chunked-prefill",
+        "--model-runner-v1",
+        "--seed",
+        "7",
+    )
+    assert result.returncode == 0, result.stderr
+    launch = json.loads(result.stdout)
+    command = launch["serve_command"]
+    assert "--no-async-scheduling" in command
+    assert "--enable-chunked-prefill" in command
+    assert command[command.index("--seed") + 1] == "7"
+    assert launch["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "0"
 
 
 @pytest.mark.parametrize("ip", ["192.0.2.10", "192.0.2.20"])
@@ -256,7 +278,6 @@ def test_hccl_service_removes_inherited_gloo_profile_and_ray_state(
         calls.append(command)
         for name in (
             "RAY_ADDRESS",
-            "VLLM_HETERO_PP_PLAN",
             "VLLM_PP_STAGE_TRACE",
             "VLLM_PP_TRACE_SESSION",
             "VLLM_PP_COMPUTE_MODEL",
@@ -264,6 +285,7 @@ def test_hccl_service_removes_inherited_gloo_profile_and_ray_state(
             "VLLM_USE_V2_MODEL_RUNNER",
         ):
             assert name not in env
+        assert json.loads(env["VLLM_HETERO_PP_PLAN"]) == launch["plan"]
         assert env["VLLM_PP_LAYER_PARTITION"] == "12,12,12,12"
         assert kwargs["headless"] is (ip == "192.0.2.20")
         assert kwargs["health_host"] == (
@@ -392,6 +414,53 @@ def test_main_checks_configured_local_soc_before_starting_ray(
     else:
         assert (output / "failure.json").exists()
         assert not (output / "ray_started.json").exists()
+
+
+def test_hccl_replay_rejects_a_different_checkpoint_before_start(
+    launcher, model, tmp_path, monkeypatch
+):
+    ip = "192.0.2.10"
+    monkeypatch.setattr(launcher, "ipv4_interfaces", lambda: [])
+    monkeypatch.setattr(
+        launcher,
+        "select_network",
+        lambda *a, **kw: {"node_ip": ip, "interface": "eth0"},
+    )
+    route = SimpleNamespace(connect=lambda *a: None, bind=lambda *a: None)
+    monkeypatch.setattr(launcher.socket, "socket", lambda *a: nullcontext(route))
+    monkeypatch.setattr(
+        launcher, "discover_runtime", lambda *a: (sys.executable, {}, {"soc": "910B"})
+    )
+    monkeypatch.setattr(launcher, "capture", lambda *a: (0, "b" * 64 + "\n"))
+    monkeypatch.setattr(
+        launcher,
+        "start_services",
+        lambda *a: pytest.fail("mismatched checkpoint started"),
+    )
+    output = tmp_path / "replay"
+    assert (
+        launcher.main(
+            [
+                "--head",
+                ip,
+                "--peer",
+                "192.0.2.20",
+                "--node-ip",
+                ip,
+                "--transport",
+                "hccl",
+                "--model",
+                str(model),
+                "--output",
+                str(output),
+                "--expected-checkpoint-sha256",
+                "a" * 64,
+            ]
+        )
+        == 1
+    )
+    failure = json.loads((output / "failure.json").read_text())
+    assert "checkpoint 与回测引用的模型内容不同" in failure["error"]
 
 
 def test_service_uses_vllm_capacity_and_batch_defaults(model):

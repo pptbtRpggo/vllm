@@ -70,7 +70,9 @@ def config():
     )
     return NS(
         model_config=model,
-        parallel_config=NS(pipeline_parallel_size=4, tensor_parallel_size=1),
+        parallel_config=NS(
+            pipeline_parallel_size=4, tensor_parallel_size=1, data_parallel_size=1
+        ),
         cache_config=NS(
             cache_dtype="auto",
             block_size=16,
@@ -488,12 +490,51 @@ class ProfileControllerTests(unittest.TestCase):
         reports[2]["npu_core_limit"] = {"fraction": "1/2"}
         self.mod._validate_startup(reports, plan, config())
 
+    def test_insufficient_fixed_blocks_fail_before_workload(self):
+        engine = FixtureEngine()
+        args = engine_args()
+        cfg = engine.llm_engine.vllm_config
+        args.nnodes, args.node_rank, args.master_addr = 2, 0, "10.0.0.1"
+        args.worker_cls, args.enable_prefix_caching = "auto", False
+        args.max_num_seqs, args.max_num_batched_tokens = 2, 32
+        args.num_gpu_blocks_override = cfg.cache_config.num_gpu_blocks_override = 15
+        with self.assertRaisesRegex(ValueError, "need at least 16 blocks"):
+            self.mod.profile_pp_partition(
+                dump_dir=self.directory,
+                hetero_plan=topology(),
+                engine_args=args,
+                pp_transport="hccl",
+                llm_factory=lambda: engine,
+                collect_only=True,
+                num_prompts=1,
+                input_len=2,
+                num_iters=1,
+                num_iters_warmup=1,
+            )
+        self.assertEqual(engine.calls, [])
+        self.assertTrue(engine.closed)
+
     def test_hccl_profile_collects_ack_and_plans_with_same_core_fractions(self):
+        from dataclasses import replace
+
+        from vllm.distributed.hetero_pp.profiling import serving_config_observation
+
         plan = topology()
         for stage, ratio in zip(plan["stages"][2:], ("1/2", "1/4"), strict=True):
             stage["npu_core_fraction"] = ratio
+        checkpoint_sha256 = "a" * 64
 
         class NativeEngine(FixtureEngine):
+            bad_startup_config = False
+            bad_memory_config = False
+            wrong_block_count = False
+            wrong_checkpoint = False
+
+            def serving_scope(self):
+                return serving_config_observation(
+                    NS(vllm_config=self.llm_engine.vllm_config)
+                )
+
             def generate(self, *args, **kwargs):
                 super().generate(*args, **kwargs)
                 for rank, rows in enumerate(self.rows):
@@ -545,36 +586,95 @@ class ProfileControllerTests(unittest.TestCase):
                             world_backend="hccl",
                             pp_tensor_backend="hccl",
                             control_backend="gloo",
+                            checkpoint_sha256=checkpoint_sha256,
+                            serving_config_observation=self.serving_scope(),
                         )
                         if rank >= 2:
                             report["npu_core_limit"] = {
                                 "fraction": plan["stages"][rank]["npu_core_fraction"]
                             }
+                    if self.bad_startup_config:
+                        report = self.worker_reports[2]["serving_config_observation"]
+                        report["scheduler"]["async_scheduling"] = True
+                    if self.wrong_checkpoint:
+                        self.worker_reports[3]["checkpoint_sha256"] = "b" * 64
                     return self.worker_reports
                 receipts = super().collective_rpc(method, args, **kwargs)
                 if method == "flush_pp_profile":
                     for receipt in receipts:
                         receipt.update(transport="native_hccl", comm_timing="ack")
+                if method == "get_pp_memory_observation":
+                    cache = self.llm_engine.vllm_config.cache_config
+                    for row in receipts:
+                        row["serving_config_observation"] = self.serving_scope()
+                        row["num_gpu_blocks"] = cache.num_gpu_blocks_override
+                    if self.bad_memory_config:
+                        row = receipts[3]["serving_config_observation"]
+                        row["cache"]["gpu_memory_utilization"] = 0.5
+                    if self.wrong_block_count:
+                        receipts[1]["num_gpu_blocks"] -= 1
                 return receipts
 
-        engine = NativeEngine()
-        args = engine_args()
-        args.nnodes, args.node_rank, args.master_addr = 2, 0, "10.0.0.1"
-        args.worker_cls, args.enable_prefix_caching = "auto", False
-        args.max_num_seqs, args.max_num_batched_tokens = 2, 32
-        self.mod.profile_pp_partition(
-            dump_dir=self.directory,
-            hetero_plan=plan,
-            engine_args=args,
-            pp_transport="hccl",
-            llm_factory=lambda: engine,
-            memory_profile=memory_profile(),
-            collect_only=True,
-            num_prompts=1,
-            input_len=2,
-            num_iters=1,
-            num_iters_warmup=1,
+        supplied_profile = memory_profile()
+        fixed_profile = replace(
+            supplied_profile,
+            serving_config=dict(
+                supplied_profile.serving_config, max_num_batched_tokens=128
+            ),
+            cache_policy=dict(
+                mode="fixed_blocks",
+                num_gpu_blocks=16,
+                block_size=16,
+                kv_cache_dtype="auto",
+            ),
         )
+
+        def collect(engine, directory):
+            args = engine_args()
+            args.nnodes, args.node_rank, args.master_addr = 2, 0, "10.0.0.1"
+            args.master_port = 29501
+            args.worker_cls, args.enable_prefix_caching = "auto", False
+            args.max_num_seqs, args.max_num_batched_tokens = 2, 128
+            args.num_gpu_blocks_override = 16
+            args.seed = 7
+            cfg = engine.llm_engine.vllm_config
+            cfg.model_config.seed = 7
+            cfg.cache_config.num_gpu_blocks_override = 16
+            cfg.scheduler_config.enable_chunked_prefill = False
+            cfg.scheduler_config.max_num_batched_tokens = 128
+            self.mod.profile_pp_partition(
+                dump_dir=directory,
+                hetero_plan=plan,
+                engine_args=args,
+                pp_transport="hccl",
+                llm_factory=lambda: engine,
+                memory_profile=fixed_profile,
+                collect_only=True,
+                num_prompts=1,
+                input_len=2,
+                num_iters=1,
+                num_iters_warmup=1,
+            )
+
+        for name, error in (
+            ("bad_startup_config", r"rank 2.*async_scheduling"),
+            ("bad_memory_config", r"rank 3.*gpu_memory_utilization"),
+            ("wrong_block_count", r"rank 1 actual KV block count"),
+            ("wrong_checkpoint", r"rank 3.*checkpoint"),
+        ):
+            with self.subTest(name=name):
+                engine = NativeEngine()
+                setattr(engine, name, True)
+                directory = self.directory.with_name(name)
+                with self.assertRaisesRegex(ValueError, error):
+                    collect(engine, directory)
+                self.assertFalse((directory / "profile_manifest.json").exists())
+                self.assertTrue(engine.closed)
+                if name in ("bad_startup_config", "wrong_checkpoint"):
+                    self.assertEqual(engine.calls, [("rpc", "start_native_pp_profile")])
+
+        engine = NativeEngine()
+        collect(engine, self.directory)
         self.assertEqual(engine.calls[0], ("rpc", "start_native_pp_profile"))
         self.assertTrue(engine.closed)
         with self.assertRaisesRegex(ValueError, "transport binding"):
@@ -590,10 +690,61 @@ class ProfileControllerTests(unittest.TestCase):
             pp_transport="hccl",
             skip_run=True,
         )
-        self.assertIn(
+        command = self.mod.format_serve_command(result, self.directory)
+        for argument in (
             "--npu-core-fractions 1,1,1/2,1/4",
-            self.mod.format_serve_command(result, self.directory),
+            "--head 10.0.0.1 --peer 10.0.0.2",
+            "--master-port 29501",
+            "--max-model-len 128",
+            "--max-num-seqs 2",
+            "--max-num-batched-tokens 128",
+            "--gpu-memory-utilization 0.9",
+            "--block-size 16",
+            "--num-gpu-blocks-override 16",
+            f"--expected-checkpoint-sha256 {checkpoint_sha256}",
+            "--model-runner-v1",
+            "--seed 7",
+            "--async-scheduling",
+            "--no-enable-chunked-prefill",
+            "change only --layers to 2,2,2,2",
+        ):
+            self.assertIn(argument, command)
+        self.assertNotIn("--profile", command)
+
+        raw_path = self.directory / "memory_observations.json"
+        raw = json.loads(raw_path.read_text())
+        manifest_path = self.directory / "profile_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["startup_reports"][2]["checkpoint_sha256"] = "broken"
+        manifest["flush_receipts"][2]["identity"]["checkpoint_sha256"] = "broken"
+        flush_path = self.directory / "flush_receipts.json"
+        self.mod._write(flush_path, manifest["flush_receipts"])
+        manifest["flush_receipts_sha256"] = self.mod._sha(flush_path)
+        self.mod._write(manifest_path, manifest)
+        with self.assertRaisesRegex(ValueError, r"rank 2.*checkpoint"):
+            self.mod.profile_pp_partition(
+                dump_dir=self.directory,
+                hetero_plan=plan,
+                pp_transport="hccl",
+                skip_run=True,
+            )
+        manifest["startup_reports"][2]["checkpoint_sha256"] = checkpoint_sha256
+        manifest["flush_receipts"][2]["identity"]["checkpoint_sha256"] = (
+            checkpoint_sha256
         )
+        self.mod._write(flush_path, manifest["flush_receipts"])
+        manifest["flush_receipts_sha256"] = self.mod._sha(flush_path)
+        raw[2]["serving_config_observation"]["cache"]["enable_prefix_caching"] = True
+        self.mod._write(raw_path, raw)
+        manifest["memory_observations_sha256"] = self.mod._sha(raw_path)
+        self.mod._write(manifest_path, manifest)
+        with self.assertRaisesRegex(ValueError, r"rank 2.*enable_prefix_caching"):
+            self.mod.profile_pp_partition(
+                dump_dir=self.directory,
+                hetero_plan=plan,
+                pp_transport="hccl",
+                skip_run=True,
+            )
 
     def test_collection_rejects_incomplete_or_corrupt_rank_receipts(self):
         for engine in (

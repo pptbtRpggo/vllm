@@ -145,6 +145,9 @@ head 自动采集、回收 peer trace、打印表格和输出 DP。peer 不重�
 
 两个宿主机都执行以下命令，按本机实际情况填写模型路径和空闲卡。
 两边的 IP、端口、分层、核心额度和 profiling 容量参数保持一致。
+入口在每台机器读取一次 checkpoint 文件计算 SHA，目录路径可以不同。
+四个 worker 在加载权重前核对 checkpoint、分层、限核及实际运行配置。
+参数不同会报出具体字段和 rank。
 
 ```bash
 bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
@@ -168,8 +171,15 @@ headless worker。
 `pp_tensor_backend=hccl`，以及 stage 2/3 的 `npu_core_limit` 读回值。
 跨机交接耗时在 `stage_and_link_timing_summary.csv` 的
 `stage1->2` 行。激活张量走 HCCL，交接计时也包含 CPU 元数据和 ACK。
-推荐层数见 `recommended_hetero_plan.json`。验证推荐时，两边去掉
-`--profile`、替换 `--layers` 并保留核心额度和本轮容量设置。
+推荐层数见 `recommended_hetero_plan.json`。将输出的回测参数加到两端启动命令，
+各自填写本机的 `--model` 和 `--devices`。原分层对照只替换 `--layers`，
+两轮使用相同核心额度、容量和组批设置。固定 KV block 数不足时，采集会在加载
+权重前给出所需的最小 block 数。
+此 HCCL 启动入口的采集和普通服务均关闭前缀缓存。采集使用同步调度，
+生成的回测参数显式开启异步调度，并保留采集时的 checkpoint、V1 runner、
+seed 和 chunked prefill 设置。
+手动启动普通服务时，也可以用对应的 `--no-async-scheduling` 和
+`--no-enable-chunked-prefill` 关闭这些功能。
 
 已有容器且 Ray 已连好、推理服务已退出：只在 head 容器中运行：
 

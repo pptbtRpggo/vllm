@@ -95,6 +95,16 @@ class MemoryBuilderTests(unittest.TestCase):
         self.assertEqual(profile.devices[0].estimate(0, 1, 4)["required_bytes"], 712)
         profile.validate_engine_config(config())
 
+    def test_peer_budget_setting_cannot_be_replaced_with_head_setting(self):
+        data = observations()
+        data[2]["serving_config_observation"] = {
+            "cache": {"gpu_memory_utilization": 0.25}
+        }
+        with self.assertRaisesRegex(ValueError, r"rank 2.*gpu_memory_utilization"):
+            self.mod.build_fixed_block_memory_profile(
+                data, config(), safety_margin_bytes=64
+            )
+
     def test_pool_or_blocks_mismatch_is_rejected(self):
         for key, value in [
             ("kv_cache_storage_bytes", 129),

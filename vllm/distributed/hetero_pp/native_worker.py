@@ -11,8 +11,10 @@ from types import SimpleNamespace
 
 from vllm.distributed.hetero_pp.config import PipelinePlan, worker_for_soc_name
 from vllm.distributed.hetero_pp.worker import ProfileWorkerMixin, apply_npu_core_limit
+from vllm.logger import init_logger
 
 NATIVE_WORKER = __name__ + ".Native910BWorker"
+logger = init_logger(__name__)
 
 
 @contextmanager
@@ -79,6 +81,40 @@ class _NativeLink:
         return timed.send(values, timed.step.metadata["step"])
 
 
+def _native_layer_range(model, num_layers):
+    for candidate in (
+        getattr(model, "model", None),
+        getattr(model, "transformer", None),
+        model,
+    ):
+        start = getattr(candidate, "start_layer", None)
+        end = getattr(candidate, "end_layer", None)
+        if type(start) is int and type(end) is int:
+            return start, end
+
+    from torch import nn
+
+    if not isinstance(model, nn.Module):
+        return None
+
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    # The Transformers backend keeps the global layer indices by inserting
+    # placeholders for every layer owned by another PP stage.
+    ranges = set()
+    for module in model.modules():
+        if not isinstance(module, nn.ModuleList) or len(module) != num_layers:
+            continue
+        missing = [isinstance(layer, PPMissingLayer) for layer in module]
+        if not any(missing):
+            continue
+        local = [i for i, absent in enumerate(missing) if not absent]
+        if not local or local != list(range(local[0], local[-1] + 1)):
+            raise ValueError("loaded PP layers must form a contiguous range")
+        ranges.add((local[0], local[-1] + 1))
+    return ranges.pop() if len(ranges) == 1 else None
+
+
 class NativeWorkerMixin(ProfileWorkerMixin):
     # The concrete NPUWorker base is selected lazily in __getattr__.
     _hetero_profiler = None
@@ -119,13 +155,49 @@ class NativeWorkerMixin(ProfileWorkerMixin):
                 stage.soc, stage.npu_core_fraction
             )
         super()._init_worker_distributed_environment()  # type: ignore[misc]
+        self._check_native_startup()
+
+    def _check_native_startup(self):
+        from vllm.distributed.hetero_pp.native_startup import check_native_startup
+
+        self._native_checkpoint = check_native_startup(self, self._native_plan)
+        if os.environ.get("HETERO_PP_RUN_MODE") == "profile":
+            from vllm.distributed.hetero_pp.profile_memory import (
+                validate_fixed_kv_capacity,
+            )
+
+            validate_fixed_kv_capacity(self.vllm_config)
+
+    def _verified_native_layers(self, *, allow_unavailable=False):
+        model = self.model_runner.model
+        layers = _native_layer_range(model, self._native_plan.layer_ranges[-1][1])
+        if layers is None and allow_unavailable:
+            logger.warning("Cannot verify loaded PP layers for rank %d", self.rank)
+            return None
+        if layers is None:
+            raise ValueError(f"rank {self.rank} does not expose its loaded PP layers")
+        if layers != self._native_plan.layer_ranges[self.rank]:
+            expected = self._native_plan.layer_ranges[self.rank]
+            raise ValueError(
+                f"rank {self.rank} loaded layers {layers} differ from native plan "
+                f"{expected}"
+            )
+        return layers
+
+    def load_model(self):
+        super().load_model()  # type: ignore[misc]
+        profile = os.environ.get("HETERO_PP_RUN_MODE") == "profile"
+        self._verified_native_layers(allow_unavailable=not profile)
 
     def start_native_pp_profile(self, directory, session, compute_timing):
         import torch
         import torch_npu
 
         import vllm
-        from vllm.distributed.hetero_pp.profiling import StageProfiler
+        from vllm.distributed.hetero_pp.profiling import (
+            StageProfiler,
+            serving_config_observation,
+        )
         from vllm.distributed.parallel_state import get_pp_group
 
         if self._hetero_profiler is not None:
@@ -154,10 +226,7 @@ class NativeWorkerMixin(ProfileWorkerMixin):
             for p in base.glob("*.py")
         }
         model = self.model_runner.model
-        inner = getattr(model, "model", model)
-        layers = (inner.start_layer, inner.end_layer)
-        if layers != self._native_plan.layer_ranges[self.rank]:
-            raise ValueError(f"rank {self.rank} loaded layers differ from native plan")
+        layers = self._verified_native_layers()
         self._hetero_profile_identity = {
             "rank": self.rank,
             "profile_device_id": self.rank,
@@ -178,6 +247,8 @@ class NativeWorkerMixin(ProfileWorkerMixin):
             "world_backend": world_backend,
             "pp_tensor_backend": backend,
             "control_backend": "gloo",
+            "checkpoint_sha256": self._native_checkpoint,
+            "serving_config_observation": serving_config_observation(self),
         }
         core_limit = getattr(self, "_hetero_npu_core_limit", None)
         if core_limit is not None:
@@ -215,27 +286,39 @@ class NativeWorkerMixin(ProfileWorkerMixin):
         if step is None:
             return execute(scheduler_output)
 
-        group = get_pp_group()
-        link = _NativeLink(group, lambda: torch.npu.synchronize(self.device))
-        timed = _AckTraceLink(step, link, profiler.timeout_s)
+        phase = "execute"
+
+        def handoff(operation, fn, *args, **kwargs):
+            nonlocal phase
+            phase = operation
+            result = fn(timed, *args, **kwargs)
+            phase = "execute"
+            return result
 
         def compute(original, *args, **kwargs):
             return profiler.execute(step, lambda: original(*args, **kwargs))
 
-        with (
-            _observe_method(
-                group,
-                "irecv_tensor_dict",
-                lambda *a, **kw: link.receive(timed, *a, **kw),
-            ),
-            _observe_method(
-                group,
-                "isend_tensor_dict",
-                lambda *a, **kw: link.transmit(timed, *a, **kw),
-            ),
-            _observe_method(self.model_runner, "execute_model", compute),
-        ):
-            return execute(scheduler_output)
+        try:
+            group = get_pp_group()
+            link = _NativeLink(group, lambda: torch.npu.synchronize(self.device))
+            timed = _AckTraceLink(step, link, profiler.timeout_s)
+            with (
+                _observe_method(
+                    group,
+                    "irecv_tensor_dict",
+                    lambda *a, **kw: handoff("receive", link.receive, *a, **kw),
+                ),
+                _observe_method(
+                    group,
+                    "isend_tensor_dict",
+                    lambda *a, **kw: handoff("send", link.transmit, *a, **kw),
+                ),
+                _observe_method(self.model_runner, "execute_model", compute),
+            ):
+                return execute(scheduler_output)
+        except BaseException as error:
+            profiler.abort_step(step, error, phase=phase)
+            raise
 
     def sample_tokens(self, grammar_output):
         sample = super().sample_tokens  # type: ignore[misc]
@@ -245,8 +328,9 @@ class NativeWorkerMixin(ProfileWorkerMixin):
 
     def shutdown(self):
         try:
-            if self._hetero_profiler is not None:
-                self._hetero_profiler.close()
+            profiler = self._hetero_profiler
+            if profiler is not None:
+                profiler.close(raise_errors=not profiler.step_failure_reported)
         finally:
             super().shutdown()  # type: ignore[misc]
 
