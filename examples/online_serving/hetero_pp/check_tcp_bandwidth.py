@@ -7,6 +7,7 @@ Run on B: python check_tcp_bandwidth.py client --host <A_HOST_IP> \
 --parallel 4 --warmup 3 --seconds 30
 Swap roles to test the other direction. The server exits after one test.
 Only the client specifies parallelism, warmup and measurement duration.
+On Linux, add --interface to bind sockets to the local network interface.
 All receivers use one interval on the server's monotonic clock. Whole recv calls
 are counted by completion time (up to 1 MiB boundary granularity per stream).
 This measures host TCP payload throughput, not NPU or full Gloo handoff speed.
@@ -75,10 +76,44 @@ def receive_test(conn, window, barrier, start_event, timeout) -> dict:
     return {"bytes": measured, "total": total, "pid": os.getpid()}
 
 
-def send_stream(host, port, duration, timeout) -> dict:
+def bind_interface(conn: socket.socket, interface) -> None:
+    """Apply Linux SO_BINDTODEVICE before connecting or listening."""
+    if interface is None:
+        return
+    option = getattr(socket, "SO_BINDTODEVICE", None)
+    if option is None:
+        raise ValueError("--interface requires Linux SO_BINDTODEVICE support")
+    name = os.fsencode(interface)
+    # Linux IFNAMSIZ is 16 bytes including the terminating NUL.
+    if not 0 < len(name) < 16 or b"\0" in name:
+        raise ValueError(f"invalid interface name: {interface!r}")
+    try:
+        conn.setsockopt(socket.SOL_SOCKET, option, name + b"\0")
+    except OSError as error:
+        raise OSError(
+            error.errno, f"cannot bind to interface {interface!r}: {error.strerror}"
+        ) from error
+
+
+def connect(host, port, timeout, interface) -> socket.socket:
+    """Connect using the requested interface or the system's default routing."""
+    if interface is None:
+        return socket.create_connection((host, port), timeout)
+    conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        conn.settimeout(timeout)
+        bind_interface(conn, interface)
+        conn.connect((host, port))
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def send_stream(host, port, duration, timeout, interface) -> dict:
     """Send one stream through warmup, measurement and a short drain margin."""
     buffer = bytes(CHUNK_BYTES)
-    with socket.create_connection((host, port), timeout) as conn:
+    with connect(host, port, timeout, interface) as conn:
         conn.settimeout(timeout)
         if conn.recv(1) != b"G":
             raise ValueError("unexpected server greeting")
@@ -151,6 +186,7 @@ def serve(args: argparse.Namespace) -> dict:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.settimeout(args.timeout)
+        bind_interface(listener, args.interface)
         listener.bind((args.bind, args.port))
         listener.listen(32)
         host, port = listener.getsockname()
@@ -219,7 +255,7 @@ def send_test(args: argparse.Namespace) -> dict:
     results = context.Queue()
     processes = []
     try:
-        with socket.create_connection((args.host, args.port), args.timeout) as control:
+        with connect(args.host, args.port, args.timeout, args.interface) as control:
             control.settimeout(duration + args.timeout)
             write_message(control, settings)
             if read_message(control) != {"ready": True}:
@@ -235,6 +271,7 @@ def send_test(args: argparse.Namespace) -> dict:
                         args.port,
                         duration,
                         args.timeout,
+                        args.interface,
                     ),
                 )
                 process.start()
@@ -259,6 +296,9 @@ def main() -> int:
     client.add_argument("--warmup", type=nonnegative_seconds, default=3.0)
     client.add_argument("--parallel", type=int, default=4)
     for mode in (server, client):
+        mode.add_argument(
+            "-I", "--interface", help="bind all sockets to this local interface (Linux)"
+        )
         mode.add_argument("--port", type=int, default=5201)
         mode.add_argument(
             "--timeout",

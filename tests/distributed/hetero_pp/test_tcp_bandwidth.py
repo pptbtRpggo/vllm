@@ -16,9 +16,10 @@ SCRIPT = (
 
 
 class TCPBandwidthTest(unittest.TestCase):
-    def run_transfer(self, parallel, warmup):
+    def run_transfer(self, parallel, warmup, interface=None):
         # Catches sender-only timing and truncated/unacknowledged transfers.
         self.assertTrue(SCRIPT.exists(), "TCP meter has not been implemented")
+        interface_args = ["--interface", interface] if interface is not None else []
         server = subprocess.Popen(
             [
                 sys.executable,
@@ -31,6 +32,7 @@ class TCPBandwidthTest(unittest.TestCase):
                 "0",
                 "--timeout",
                 "5",
+                *interface_args,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -59,6 +61,7 @@ class TCPBandwidthTest(unittest.TestCase):
                     str(warmup),
                     "--timeout",
                     "5",
+                    *interface_args,
                 ],
                 capture_output=True,
                 text=True,
@@ -100,6 +103,34 @@ class TCPBandwidthTest(unittest.TestCase):
 
     def test_four_independent_streams(self):
         self.run_transfer(parallel=4, warmup=0.1)
+
+    @unittest.skipUnless(
+        hasattr(socket, "SO_BINDTODEVICE"), "requires Linux interface binding"
+    )
+    def test_transfer_with_interface_on_both_ends(self):
+        self.run_transfer(parallel=2, warmup=0, interface="lo")
+
+    def test_cannot_fall_back_to_default_route_when_interface_binding_fails(self):
+        for args in (["server", "--port", "0"], ["client", "--host", "127.0.0.1"]):
+            with self.subTest(mode=args[0]):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-S",
+                        str(SCRIPT),
+                        *args,
+                        "--interface",
+                        "missingnic999",
+                        "--timeout",
+                        "0.1",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("interface", result.stderr)
+                self.assertEqual(result.stdout, "")
 
     def test_early_disconnect_is_not_reported_as_a_successful_measurement(self):
         server = subprocess.Popen(
