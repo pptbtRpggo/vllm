@@ -32,10 +32,12 @@ def export_profile(profiler):
     )
 
 
-def collect_profile_traces(llm, directory, receipts):
+def collect_profile_traces(llm, directory, receipts, *, pp_size=4):
     """Fetch missing rank evidence without SSH or a shared filesystem."""
-    if len(receipts) != 4 or {r.get("rank") for r in receipts} != set(range(4)):
-        raise ValueError("trace collection requires four distinct rank receipts")
+    if len(receipts) != pp_size or {r.get("rank") for r in receipts} != set(
+        range(pp_size)
+    ):
+        raise ValueError("trace collection requires distinct receipts for all ranks")
     for receipt in receipts:
         rank = receipt["rank"]
         path = directory / f"pp_stage_pp{rank}_tp0.jsonl"
@@ -49,7 +51,7 @@ def collect_profile_traces(llm, directory, receipts):
                 manifest_path.write_text(json.dumps(receipt, indent=2))
             continue
         replies = llm.collective_rpc("export_pp_profile", args=(rank,))
-        if len(replies) != 4 or any(
+        if len(replies) != pp_size or any(
             reply is not None for i, reply in enumerate(replies) if i != rank
         ):
             raise ValueError("unexpected rank profile export replies")

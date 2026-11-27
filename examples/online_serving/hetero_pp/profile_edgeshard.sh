@@ -8,11 +8,13 @@ set -euo pipefail
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 # 修改下面四项，或运行前 export 同名变量。
 MODEL="${MODEL:-}"                    # 容器内模型目录，两边相同路径可用
-PLAN="${PLAN:-}"                      # 当前已跑通的 PP4 topology JSON
+PLAN="${PLAN:-}"                      # 当前运行的 PP topology JSON
 RAY_ADDRESS="${RAY_ADDRESS:-}"         # 例如 141.147.135.53:16379
 TRACE_ROOT="${TRACE_ROOT:-}"           # 本地结果根目录；自动回收远端 rank 记录
 PROFILE_COMPUTE_TIMING="${PROFILE_COMPUTE_TIMING:-event}" # event / host-sync
 PROFILE_TRANSPORT="${PROFILE_TRANSPORT:-gloo}"
+PROFILE_PP_SIZE="${PROFILE_PP_SIZE:-4}"
+PROFILE_NNODES="${PROFILE_NNODES:-2}"
 PY="${PY:-${VIRTUAL_ENV:-$REPO/.venv}/bin/python}"
 
 check_timing() {
@@ -91,6 +93,10 @@ if (manifest.get("complete") is not True
         or transport not in ("cpu_gloo", "native_hccl")
         or manifest.get("comm_timing") != "ack"):
     raise ValueError("速率统计需要完整的 PP ACK profile manifest")
+pp_size = manifest.get("engine_config", {}).get("pipeline_parallel_size", 4)
+if type(pp_size) is not int or (pp_size != 4 and
+        (pp_size != 2 or transport != "native_hccl")):
+    raise ValueError("不支持的 profile stage 数")
 
 # 只加载无 Torch 依赖的配对校验器；离线统计不初始化 NPU/Ray。
 source = Path(sys.argv[2]) / "vllm/distributed/pp_comm_trace.py"
@@ -98,7 +104,7 @@ spec = importlib.util.spec_from_file_location("pp_comm_trace", source)
 pairing = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pairing)
 by_rank = []
-for rank in range(4):
+for rank in range(pp_size):
     name = f"pp_stage_pp{rank}_tp0.jsonl"
     content = (directory / name).read_bytes()
     if hashlib.sha256(content).hexdigest() != manifest.get("raw_files", {}).get(name):
@@ -107,7 +113,7 @@ for rank in range(4):
     for line in content.decode().splitlines():
         row = json.loads(line)
         if (row.get("pp_rank") != rank or row.get("tp_rank") != 0
-                or row.get("pp_size") != 4 or row.get("tp_size") != 1
+                or row.get("pp_size") != pp_size or row.get("tp_size") != 1
                 or row.get("trace_session") != manifest["trace_session"]
                 or row.get("transport") != transport
                 or row.get("comm_timing") != "ack"
@@ -121,11 +127,11 @@ for rank in range(4):
         indexed[key] = row
     by_rank.append(indexed)
 if any(set(rows) != set(by_rank[0]) for rows in by_rank[1:]):
-    raise ValueError("四个 stage 的 step 不完整匹配")
+    raise ValueError("各 stage 的 step 不完整匹配")
 
 samples, handoff_samples = [], []
 warmup_count = zero_count = 0
-for rank in range(3):
+for rank in range(pp_size - 1):
     for step, sender in sorted(by_rank[rank].items()):
         receiver = by_rank[rank + 1][step]
         status, timing = pairing.paired_transfer(sender, receiver)
@@ -197,8 +203,8 @@ for rank, rows in enumerate(by_rank):
         ))
 
 timing_summary = []
-items = [f"stage{rank}" for rank in range(4)] + [
-    f"stage{rank}->{rank + 1}" for rank in range(3)]
+items = [f"stage{rank}" for rank in range(pp_size)] + [
+    f"stage{rank}->{rank + 1}" for rank in range(pp_size - 1)]
 for phase in ("prefill",):
     for item in items:
         group = [s for s in compute_samples + handoff_samples
@@ -215,7 +221,7 @@ for phase in ("prefill",):
         timing_summary.append(row)
 
 summary = []
-for rank in range(3):
+for rank in range(pp_size - 1):
     link = f"stage{rank}->{rank + 1}"
     link_samples = [s for s in samples if s["link"] == link]
     if not link_samples:
@@ -304,7 +310,7 @@ TRACE_ROOT 为本地结果根目录；采集结束后自动通过 worker RPC 回
 
 流程：每轮 4 条合成输入。8 轮预热（32 条）+ 16 轮正式采集（64 条）。
 每请求只输出首个 token，不做后续 decode。
-只统计 prefill 的四 stage/三链路成本并做 latency DP，排除预热，保存汇总与逐步 CSV。
+只统计 prefill 的 stage 和相邻链路成本并做 latency DP，排除预热，保存汇总与逐步 CSV。
 使用 ACK 测通信，默认固定 64 个 KV blocks；这是小规模流程验证，不是 GSM8K 压测。
 统一 --profile 入口会传入上下文、token budget、max seq、显存比例及 KV block 配置。
 不启动/停止 Ray，不安装依赖，不自动切换服务到推荐配置。
@@ -324,8 +330,8 @@ fi
 if (($#)); then echo '未知参数；使用 --help 查看说明。' >&2; exit 2; fi
 
 [[ -d "$MODEL" ]] || { echo '请设置 MODEL 为可读模型目录。' >&2; exit 2; }
-[[ -r "$PLAN" && -f "$PLAN" ]] || { echo '请设置 PLAN 为当前 PP4 topology JSON。' >&2; exit 2; }
-engine_transport=(--pp-transport "$PROFILE_TRANSPORT")
+[[ -r "$PLAN" && -f "$PLAN" ]] || { echo '请设置 PLAN 为当前 PP topology JSON。' >&2; exit 2; }
+engine_transport=(--pp-transport "$PROFILE_TRANSPORT" --pipeline-parallel-size "$PROFILE_PP_SIZE")
 case "$PROFILE_TRANSPORT" in
   gloo)
     [[ -n "$RAY_ADDRESS" ]] || { echo '请设置 RAY_ADDRESS=head_IP:端口。' >&2; exit 2; }
@@ -333,8 +339,8 @@ case "$PROFILE_TRANSPORT" in
     ;;
   hccl)
     [[ -n "${PROFILE_MASTER_ADDR:-}" && -n "${PROFILE_MASTER_PORT:-}" ]] ||
-      { echo 'HCCL profiling 请用两端统一启动入口。' >&2; exit 2; }
-    engine_transport+=(--distributed-executor-backend mp --nnodes 2 --node-rank 0
+      { echo 'HCCL profiling 请用统一启动入口。' >&2; exit 2; }
+    engine_transport+=(--distributed-executor-backend mp --nnodes "$PROFILE_NNODES" --node-rank 0
       --master-addr "$PROFILE_MASTER_ADDR" --master-port "$PROFILE_MASTER_PORT")
     ;;
   *) echo 'PROFILE_TRANSPORT 只能是 gloo 或 hccl。' >&2; exit 2 ;;
@@ -354,7 +360,7 @@ mkdir -p -- "$TRACE_ROOT"
 TRACE=$(mktemp -d "$TRACE_ROOT/edgeshard_$(date +%Y%m%d_%H%M%S)_XXXXXX")
 echo "本轮结果：$TRACE"
 echo "日志：$TRACE.log"
-echo "计算计时：${PROFILE_COMPUTE_TIMING}（四个 stage 一致）"
+echo "计算计时：${PROFILE_COMPUTE_TIMING}（各 stage 一致）"
 echo '1/3 采集 prefill 至首 token 的成本（每请求输出 1 token；请勿同时运行其他占卡任务）'
 # 日志放在 trace 目录外，保证 collector 启动前目录为空。
 "$PY" -m vllm.entrypoints.cli.main pp-profile "$MODEL" \
@@ -379,6 +385,7 @@ profile_statistics "$TRACE" 2>&1 | tee -a "$TRACE.log"
 echo '3/3 仅以 prefill latency 做离线 DP 推荐（不占 NPU）'
 "$PY" -m vllm.entrypoints.cli.main pp-profile \
   --hetero-plan "$PLAN" --trace-dir "$TRACE" --pp-transport "$PROFILE_TRANSPORT" \
+  --pipeline-parallel-size "$PROFILE_PP_SIZE" \
   --skip-run --objective latency --workload prefill \
   --output-json "$TRACE/latency_plan.json" 2>&1 | tee -a "$TRACE.log"
 

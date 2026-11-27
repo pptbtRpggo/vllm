@@ -56,7 +56,7 @@ def remaining(deadline):
     return seconds
 
 
-def prepare_environment(repo, environment, devices=None):
+def prepare_environment(repo, environment, devices=None, *, device_count=2):
     """Keep the local SDK and visibility; ensure probe assertions are enabled."""
     env = dict(environment)
     env.pop("PYTHONOPTIMIZE", None)
@@ -75,10 +75,12 @@ def prepare_environment(repo, environment, devices=None):
     env["LD_LIBRARY_PATH"] = os.pathsep.join(p for p in libraries if p)
     if devices is not None:
         values = devices.split(",")
-        if len(values) != 2 or not all(v.isascii() and v.isdigit() for v in values):
-            raise ValueError("--devices 需要两个不同的设备号，例如 0,1")
-        if int(values[0]) == int(values[1]):
-            raise ValueError("--devices 的两个设备号不能相同")
+        if (
+            len(values) != device_count
+            or not all(v.isascii() and v.isdigit() for v in values)
+            or len({int(v) for v in values}) != device_count
+        ):
+            raise ValueError(f"--devices 需要 {device_count} 个不同的设备号")
         env["ASCEND_RT_VISIBLE_DEVICES"] = devices
     return env
 
@@ -217,7 +219,7 @@ def soc_family(name):
     return family
 
 
-def inspect_runtime(repo):
+def inspect_runtime(repo, device_count=2):
     """Exercise the probe's local operations before attributing errors to Gloo."""
     if sys.flags.optimize:
         raise RuntimeError("Python 优化关闭了 assert；请移除 -O/PYTHONOPTIMIZE")
@@ -242,10 +244,10 @@ def inspect_runtime(repo):
     if not dist.is_gloo_available():
         raise RuntimeError("当前 PyTorch 没有 Gloo 支持")
     count = torch.npu.device_count()
-    if count != 2:
+    if count != device_count:
         raise RuntimeError(
-            f"当前可见 NPU 为 {count} 张，本入口需要两张；"
-            "多卡机器用 --devices 指定两张，少于两张时检查容器映射/设备权限"
+            f"当前可见 NPU 为 {count} 张，本入口需要 {device_count} 张；"
+            "检查 --devices、容器映射和设备权限"
         )
     devices = []
     for index in range(count):
@@ -493,8 +495,10 @@ def load_sdk_environment(script, environment, deadline):
     return dict(environment, **values)
 
 
-def discover_runtime(args, output, deadline):
-    original = prepare_environment(ROOT, os.environ, args.devices)
+def discover_runtime(args, output, deadline, device_count=2):
+    original = prepare_environment(
+        ROOT, os.environ, args.devices, device_count=device_count
+    )
     contexts = [("current", original)]
     scripts = cann_scripts(original, args.cann_env)
     if args.cann_env:
@@ -508,7 +512,17 @@ def discover_runtime(args, output, deadline):
             label = str(script)
             base_env = load_sdk_environment(script, original, deadline)
         for python in python_candidates(ROOT, args.python, base_env):
-            env = prepare_environment(ROOT, base_env, args.devices)
+            env = prepare_environment(
+                ROOT, base_env, args.devices, device_count=device_count
+            )
+            inspect_command = [
+                python,
+                str(Path(__file__).resolve()),
+                "--inspect-runtime",
+                str(ROOT),
+                "--inspect-device-count",
+                str(device_count),
+            ]
             print(f"检查本机环境：{python}；SDK={label}", flush=True)
             try:
                 site_rc, site_text = capture(
@@ -526,27 +540,20 @@ def discover_runtime(args, output, deadline):
                         str(plugin) + os.pathsep + env["LD_LIBRARY_PATH"]
                     )
                 rc, text = capture(
-                    [
-                        python,
-                        str(Path(__file__).resolve()),
-                        "--inspect-runtime",
-                        str(ROOT),
-                    ],
+                    inspect_command,
                     env,
                     min(90, remaining(deadline)),
                 )
                 atb = Path("/usr/local/Ascend/nnal/atb/set_env.sh")
                 if rc and "libatb.so" in text and atb.is_file():
                     env = prepare_environment(
-                        ROOT, load_sdk_environment(atb, env, deadline), args.devices
+                        ROOT,
+                        load_sdk_environment(atb, env, deadline),
+                        args.devices,
+                        device_count=device_count,
                     )
                     rc, text = capture(
-                        [
-                            python,
-                            str(Path(__file__).resolve()),
-                            "--inspect-runtime",
-                            str(ROOT),
-                        ],
+                        inspect_command,
                         env,
                         min(90, remaining(deadline)),
                     )
@@ -733,6 +740,13 @@ def argument_parser():
     )
     parser.add_argument("--output", type=Path, help="本机全新日志目录，默认自动创建")
     parser.add_argument("--inspect-runtime", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--inspect-device-count",
+        type=int,
+        choices=(1, 2),
+        default=2,
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -740,7 +754,8 @@ def main(argv=None):
     parser = argument_parser()
     args = parser.parse_args(argv)
     if args.inspect_runtime:
-        print(MARKER + json.dumps(inspect_runtime(args.inspect_runtime)), flush=True)
+        info = inspect_runtime(args.inspect_runtime, args.inspect_device_count)
+        print(MARKER + json.dumps(info), flush=True)
         return 0
     if not args.head:
         parser.error("两端都需要 --head <其中一台机器的本地 IPv4>")

@@ -59,6 +59,8 @@ class HeteroPPExecutor(Executor):
                 )
             layers = self.model_config.hf_text_config.num_hidden_layers
             self.plan = PipelinePlan.from_dict(json.loads(raw), layers)
+            if self.plan.validation_mode == "910b_pp2":
+                raise ValueError("PP2 requires the native HCCL executor")
             self.timeout_s = self.plan.timeout_s
             profile_env = profile_actor_environment()
             self._profiling_enabled = bool(profile_env["VLLM_PP_STAGE_TRACE"])

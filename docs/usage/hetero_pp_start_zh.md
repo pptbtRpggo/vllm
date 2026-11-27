@@ -6,12 +6,15 @@
 普通服务模式不发测试请求；显式 `--profile` 模式执行内部采集负载。
 通信检查通过之后，仍需用真实模型完成下面的验证。
 
+单机两卡和双机各一卡用 `--pp-size 2`。两种模式都支持 HCCL、按 stage 设置核心额度
+以及自动 EdgeShard profiling，见 [PP2 命令与回测步骤](edgeshard_v023_zh.md#单机两卡或两机各一卡用-hccl-做-pp2-profile)。
+
 ## 选择 Gloo 或原生 HCCL
 
 | 选项 | 执行入口 | stage 间张量通信 | 当前范围 |
 | --- | --- | --- | --- |
 | `--transport gloo`（默认） | 自定义 PP 执行器＋Ray | NPU→CPU→Gloo→CPU→NPU | 下述四种型号组合；支持现有 profiling |
-| `--transport hccl` | 原生 `vllm serve`＋双机 `mp` | Ascend 原生 HCCL 设备通信组 | 仅 910B＋910B；不支持现有 `--profile` |
+| `--transport hccl` | 原生 `vllm serve`＋`mp` | Ascend 原生 HCCL 设备通信组 | 910B 的 PP2/PP4，支持 `--profile` |
 
 Gloo 在线服务默认使用 vLLM 的 PP 批队列。四个 stage 可同时容纳四个调度批次，
 完成一批后继续提交就绪批次。批内请求和 token 数仍由 vLLM 调度器决定。
@@ -43,8 +46,7 @@ bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
 - **必须已有可用的跨机 HCCL 网络。** 主机 ping、Ray 或 Gloo 成功不代表
   NPU 网络已经连通。`--interface` 选择主机网卡，不配置 NPU 网口 IP、路由
   或物理网络。原生分布式通信可能还使用动态端口，不能只开放 master 端口。
-- 当前 `hccl` 拒绝 310P/异构组合及 `--profile`，不会静默退回 Gloo。
-  如果比较同一 910B 拓扑的 Gloo，在两边改为 `--transport gloo`，并显式写
+- 如果比较同一 PP4 910B 拓扑的 Gloo，在两边改为 `--transport gloo`，并显式写
   `--head-soc 910b --peer-soc 910b`。两种模式同时改变执行器和张量传输路径，
   结果差异不能全部归因于 HCCL 与 Gloo 的网络耗时。
 

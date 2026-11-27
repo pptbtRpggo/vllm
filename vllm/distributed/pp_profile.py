@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Profile CPU/Gloo or native HCCL PP, then plan a fixed-order layer split.
 
-Only the four-stage layer-measured backend is admitted. Collection writes a
+Collection admits fixed PP4 and native HCCL PP2 with per-layer measurements.
+The controller writes a
 bound manifest; offline planning refuses unbound old traces. A DP result is a
 candidate under measured-cost and supplied-memory assumptions, not a measured
 throughput improvement or an unconditional memory-safety guarantee.
@@ -161,7 +162,7 @@ def prepare_trace_dir(
     return path
 
 
-def run_traced_generate(llm: Any, workload: ProfileWorkload) -> None:
+def run_traced_generate(llm: Any, workload: ProfileWorkload, *, pp_size=4) -> None:
     """Run distinct warmup and measured batches through barriered worker RPCs."""
     from vllm.sampling_params import SamplingParams
 
@@ -188,8 +189,8 @@ def run_traced_generate(llm: Any, workload: ProfileWorkload) -> None:
         # The staged executor drains previously admitted RPCs before these
         # worker control calls. generate() returning alone is not the barrier.
         result = llm.collective_rpc("set_pp_profile_warmup", args=(warmup,))
-        if not isinstance(result, list) or len(result) != 4:
-            raise ValueError("warmup RPC must return all four worker receipts")
+        if not isinstance(result, list) or len(result) != pp_size:
+            raise ValueError("warmup RPC must return every worker receipt")
         llm.generate(prompts, sampling_params=params, use_tqdm=False)
 
 
@@ -232,8 +233,11 @@ def validate_profile_args(args: Any) -> None:
         raise ValueError("--collect-only cannot be combined with --skip-run")
     if getattr(args, "skip_run", False) and not getattr(args, "trace_dir", None):
         raise ValueError("--trace-dir is required with --skip-run")
-    if getattr(args, "pipeline_parallel_size", 4) != 4:
-        raise ValueError("profiling requires PP=4 with the fixed topology")
+    pp_size = getattr(args, "pipeline_parallel_size", 4)
+    if pp_size != 4 and not (
+        pp_size == 2 and getattr(args, "pp_transport", None) == "hccl"
+    ):
+        raise ValueError("profiling requires PP4 or native HCCL PP2")
     if getattr(args, "tensor_parallel_size", 1) != 1:
         raise ValueError("profiling requires TP=1")
     if getattr(args, "compute_model", "layer-measured") != "layer-measured":
@@ -285,25 +289,29 @@ def _configure_engine(engine_args, transport=_TRANSPORT, topology=None):
         )
     ):
         raise ValueError("custom attention_config is not replayed by this entry")
-    if args.pipeline_parallel_size != 4 or args.tensor_parallel_size != 1:
-        raise ValueError("live profiling requires PP=4 and TP=1")
+    pp_size = len(topology["stages"]) if topology is not None else 4
+    if args.pipeline_parallel_size != pp_size or args.tensor_parallel_size != 1:
+        raise ValueError("live profiling requires the configured PP size and TP=1")
     if not args.enforce_eager or args.async_scheduling is not False:
         raise ValueError("live profiling requires eager synchronous execution")
     backend = getattr(args, "distributed_executor_backend", None)
     if transport == _NATIVE_TRANSPORT:
         from vllm.distributed.hetero_pp.native_worker import NATIVE_WORKER
 
+        if topology is None:
+            raise ValueError("native HCCL profiling requires a topology")
+        stages = topology["stages"]
         if (
             backend not in (None, "mp")
-            or args.nnodes != 2
+            or args.nnodes != len({stage["node_ip"] for stage in stages})
             or args.node_rank != 0
-            or args.master_addr != topology["stages"][0]["node_ip"]
+            or args.master_addr != stages[0]["node_ip"]
             or args.worker_cls not in ("auto", NATIVE_WORKER)
             or args.enable_prefix_caching is not False
         ):
             raise ValueError(
-                "native HCCL requires mp, head node rank 0, nnodes=2, "
-                "matching master address and prefix cache disabled"
+                "native HCCL requires mp, head node rank 0, matching node count "
+                "and master address, and prefix cache disabled"
             )
         args.distributed_executor_backend = "mp"
         args.worker_cls = NATIVE_WORKER
@@ -483,16 +491,17 @@ def _validate_native_worker_config(rank, observation, scope):
 
 
 def _validate_memory_observations(observations, scope, transport):
+    pp_size = scope["pipeline_parallel_size"]
     if (
         not isinstance(observations, list)
-        or len(observations) != 4
+        or len(observations) != pp_size
         or any(
             not isinstance(row, dict) or type(row.get("pp_rank")) is not int
             for row in observations
         )
-        or {r.get("pp_rank") for r in observations} != set(range(4))
+        or {r.get("pp_rank") for r in observations} != set(range(pp_size))
     ):
-        raise ValueError("memory observation RPC must cover all four ranks")
+        raise ValueError("memory observation RPC must cover all PP ranks")
     if transport == _NATIVE_TRANSPORT:
         blocks = scope["num_gpu_blocks_override"]
         for row in observations:
@@ -523,8 +532,9 @@ def _native_checkpoint_sha256(reports) -> str:
 
 
 def _validate_startup(reports, topology, config, transport=_TRANSPORT) -> str | None:
-    if not isinstance(reports, list) or len(reports) != 4:
-        raise ValueError("profile manifest requires all four actual startup reports")
+    stages = topology["stages"]
+    if not isinstance(reports, list) or len(reports) != len(stages):
+        raise ValueError("profile manifest requires all actual startup reports")
     model_sha = hashlib.sha256(
         config.model_config.hf_config.to_json_string().encode()
     ).hexdigest()
@@ -532,8 +542,8 @@ def _validate_startup(reports, topology, config, transport=_TRANSPORT) -> str | 
     sources = _source_hashes()
     native = transport == _NATIVE_TRANSPORT
     scope = _engine_snapshot(config) if native else None
-    for rank, report in enumerate(reports):
-        stage = topology["stages"][rank]
+    local_devices: dict[str, set[int]] = {}
+    for rank, (stage, report) in enumerate(zip(stages, reports, strict=True)):
         if (
             report.get("rank") != rank
             or report.get("node_ip") != stage["node_ip"]
@@ -573,6 +583,11 @@ def _validate_startup(reports, topology, config, transport=_TRANSPORT) -> str | 
             _validate_native_worker_config(
                 rank, report.get("serving_config_observation"), scope
             )
+        devices = local_devices.setdefault(stage["node_ip"], set())
+        device_id = report.get("identity", {}).get("device_id")
+        if type(device_id) is not int or device_id < 0 or device_id in devices:
+            raise ValueError("profile requires distinct actual devices on each node")
+        devices.add(device_id)
         end += stage["layers"]
     keys: tuple[str, ...] = (
         "vllm",
@@ -590,12 +605,6 @@ def _validate_startup(reports, topology, config, transport=_TRANSPORT) -> str | 
             raise ValueError(f"workers disagree on actual {key}")
     if end != config.model_config.get_total_num_hidden_layers():
         raise ValueError("topology does not cover model layers")
-    for start in (0, 2):
-        ids = [
-            r.get("identity", {}).get("device_id") for r in reports[start : start + 2]
-        ]
-        if None in ids or len(set(ids)) != 2:
-            raise ValueError("profile requires two distinct actual devices per node")
     return _native_checkpoint_sha256(reports) if native else None
 
 
@@ -610,8 +619,9 @@ def _validate_flush(
     compute_timing=None,
     transport=_TRANSPORT,
 ):
-    if not isinstance(receipts, list) or len(receipts) != 4:
-        raise ValueError("flush must return exactly four rank receipts")
+    pp_size = len(topology["stages"])
+    if not isinstance(receipts, list) or len(receipts) != pp_size:
+        raise ValueError("flush must return one receipt per PP rank")
     ordered = sorted(receipts, key=lambda r: r.get("rank", r.get("pp_rank", -1)))
     timing = comm_timing or ordered[0].get("comm_timing", "shared-clock")
     compute_mode = compute_timing or ordered[0].get("compute_timing", "event")
@@ -663,13 +673,13 @@ def _validate_flush(
             if compute_mode == "host-sync":
                 from vllm.distributed.pp_layer_cost import _validate_layer_record
 
-                _validate_layer_record(row, 4)
+                _validate_layer_record(row, pp_size)
             if row.get("comm_timing", "shared-clock") != timing:
                 raise ValueError("rank raw communication timing mismatch")
             if (
                 row.get("pp_rank") != rank
                 or row.get("tp_rank") != 0
-                or row.get("pp_size") != 4
+                or row.get("pp_size") != pp_size
                 or row.get("tp_size") != 1
                 or row.get("trace_session") != session
                 or row.get("transport") != transport
@@ -686,7 +696,7 @@ def _validate_flush(
         from vllm.distributed.pp_partition import load_trace_records
 
         paired = load_trace_records(directory)
-        for rank in range(3):
+        for rank in range(pp_size - 1):
             for row in paired[rank]:
                 measured_transfer_ms(row)
     return ordered, raw_files
@@ -772,6 +782,7 @@ def _load_bound_manifest(directory, topology, transport=None):
 def _collect(*, directory, topology, args, llm_factory, workload, memory, transport):
     from vllm.distributed.hetero_pp.profile_memory import validate_fixed_kv_capacity
 
+    pp_size = len(topology["stages"])
     llm = None
     supplied_memory = memory is not None
     checkpoint_sha256 = None
@@ -794,11 +805,11 @@ def _collect(*, directory, topology, args, llm_factory, workload, memory, transp
                 ),
             )
             checkpoint_sha256 = _validate_startup(reports, topology, config, transport)
-        run_traced_generate(llm, workload)
+        run_traced_generate(llm, workload, pp_size=pp_size)
         receipts = llm.collective_rpc("flush_pp_profile")
         from vllm.distributed.hetero_pp.trace_export import collect_profile_traces
 
-        collect_profile_traces(llm, directory, receipts)
+        collect_profile_traces(llm, directory, receipts, pp_size=pp_size)
         receipts, raw_files = _validate_flush(
             directory,
             receipts,
@@ -935,8 +946,8 @@ def profile_pp_partition(
     workload_kind="prefill",
     warmup_steps=0,
     num_layers=None,
-    min_pp_size=4,
-    max_pp_size=4,
+    min_pp_size=None,
+    max_pp_size=None,
     memory_profile=None,
     allow_unchecked_memory=False,
     output_json=None,
@@ -951,16 +962,19 @@ def profile_pp_partition(
 ):
     """Collect/validate bound staged traces and optionally run fixed-order DP."""
     topology = _load_topology(hetero_plan)
+    pp_size = len(topology["stages"])
     transports = {"gloo": _TRANSPORT, "hccl": _NATIVE_TRANSPORT}
     if pp_transport is not None and pp_transport not in transports:
         raise ValueError("unknown PP transport")
     transport = transports.get(pp_transport, _TRANSPORT)
     if transport == _NATIVE_TRANSPORT:
         if any(s["soc"] != "910B" for s in topology["stages"]):
-            raise ValueError("native HCCL profiling requires four 910B devices")
+            raise ValueError("native HCCL profiling requires 910B devices")
         if comm_timing == "shared-clock":
             raise ValueError("native HCCL profiling requires ACK timing")
         comm_timing = "ack"
+    elif pp_size != 4:
+        raise ValueError("PP2 profiling requires native HCCL")
     if comm_timing not in (None, "shared-clock", "ack"):
         raise ValueError("unknown communication timing")
     if compute_timing not in (None, "event", "host-sync"):
@@ -971,12 +985,12 @@ def profile_pp_partition(
         compute_model != "layer-measured"
         or device_selection
         or fit_trace_dirs
-        or min_pp_size != 4
-        or max_pp_size != 4
+        or min_pp_size not in (None, pp_size)
+        or max_pp_size not in (None, pp_size)
         or warmup_steps != 0
     ):
         raise ValueError(
-            "profile backend requires layer-measured, fixed PP4 order, "
+            "profile backend requires layer-measured, fixed stage order, "
             "no extra fit traces and warmup_steps=0"
         )
     if allow_unchecked_memory:
@@ -1074,13 +1088,13 @@ def profile_pp_partition(
 
     plan = plan_from_trace_dir(
         directory,
-        expected_pp_size=4,
+        expected_pp_size=pp_size,
         objective=objective,
         workload=workload_kind,
         warmup_steps=0,
         num_layers=manifest["engine_config"]["num_layers"],
-        min_pp_size=4,
-        max_pp_size=4,
+        min_pp_size=pp_size,
+        max_pp_size=pp_size,
         memory_profile=memory,
         compute_model="layer-measured",
         device_selection=False,
@@ -1119,13 +1133,12 @@ def _native_trace_off_args(
     topology, scope, engine_args, checkpoint_sha256
 ) -> list[str]:
     stages = topology["stages"]
-    arguments = [
-        "--transport",
-        "hccl",
-        "--head",
-        stages[0]["node_ip"],
-        "--peer",
-        stages[-1]["node_ip"],
+    arguments = ["--transport", "hccl", "--head", stages[0]["node_ip"]]
+    if stages[-1]["node_ip"] != stages[0]["node_ip"]:
+        arguments += ["--peer", stages[-1]["node_ip"]]
+    if len(stages) == 2:
+        arguments += ["--pp-size", "2"]
+    arguments += [
         "--layers",
         ",".join(str(stage["layers"]) for stage in stages),
         "--npu-core-fractions",
@@ -1221,7 +1234,7 @@ def format_serve_command(plan: PPPartitionPlan, dump_dir=None) -> str:
             str(stage["layers"]) for stage in manifest["hetero_plan"]["stages"]
         )
         return (
-            "Trace-off HCCL candidate using the profiled capacity on both nodes:\n"
+            "Trace-off HCCL candidate using the profiled capacity:\n"
             f"{shlex.join(args)}\n"
             "Reuse the local model path and device selection on each node. "
             "Use synchronous scheduling with prefix caching disabled. "

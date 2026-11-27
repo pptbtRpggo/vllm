@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Agreement between the two independently configured HCCL launchers."""
+"""Agreement across native HCCL workers before model loading."""
 
 import os
 from pathlib import Path
@@ -24,10 +24,10 @@ def _first_difference(expected, actual, prefix=""):
     return None
 
 
-def validate_native_reports(reports):
+def validate_native_reports(reports, *, pp_size=4, local_size=2):
     """Reject mismatched effective options before any rank loads weights."""
-    if len(reports) != 4 or [r.get("rank") for r in reports] != list(range(4)):
-        raise ValueError("HCCL startup agreement requires reports from ranks 0–3")
+    if [r.get("rank") for r in reports] != list(range(pp_size)):
+        raise ValueError("HCCL startup agreement requires reports from all PP ranks")
     reference = reports[0]
     for rank, report in enumerate(reports):
         difference = _first_difference(reference["settings"], report["settings"])
@@ -43,7 +43,7 @@ def validate_native_reports(reports):
         # Direct Python users hash once on the first rank of each node.
         if (
             digest is None
-            and rank in (1, 3)
+            and rank % local_size != 0
             and reference["settings"]["mode"] == "direct"
         ):
             continue
@@ -54,7 +54,7 @@ def validate_native_reports(reports):
 
 
 def check_native_startup(worker, plan):
-    """Use the existing CPU control group to compare the four startup reports."""
+    """Use the existing CPU control group to compare the PP startup reports."""
     import torch.distributed as dist
 
     from vllm.distributed.hetero_pp.profiling import serving_config_observation
@@ -62,8 +62,10 @@ def check_native_startup(worker, plan):
 
     cfg = worker.vllm_config
     group = get_pp_group()
-    if group.ranks != list(range(4)) or group.rank_in_group != worker.rank:
-        raise ValueError("HCCL startup agreement requires a four-rank PP group")
+    pp_size = len(plan.stages)
+    local_size = pp_size // len(plan.nodes)
+    if group.ranks != list(range(pp_size)) or group.rank_in_group != worker.rank:
+        raise ValueError("HCCL startup agreement requires all configured PP ranks")
     settings = serving_config_observation(worker)
     settings["model"].pop("model")
     settings["cache"].pop("num_gpu_blocks")
@@ -89,15 +91,15 @@ def check_native_startup(worker, plan):
             "HETERO_PP_PROFILE_COMPUTE_TIMING"
         )
     digest = os.environ.get("HETERO_PP_CHECKPOINT_SHA256")
-    if digest is None and mode == "direct" and worker.rank in (0, 2):
+    if digest is None and mode == "direct" and worker.rank % local_size == 0:
         from vllm.distributed.hetero_pp.checkpoint_identity import checkpoint_identity
 
         digest = checkpoint_identity(Path(cfg.model_config.model))
-    reports: list[dict[str, Any]] = [{} for _ in range(4)]
+    reports: list[dict[str, Any]] = [{} for _ in range(pp_size)]
     dist.all_gather_object(
         reports,
         dict(rank=worker.rank, settings=settings, checkpoint=digest),
         group=group.cpu_group,
     )
-    validate_native_reports(reports)
+    validate_native_reports(reports, pp_size=pp_size, local_size=local_size)
     return reports[0]["checkpoint"]

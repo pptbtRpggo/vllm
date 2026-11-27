@@ -131,16 +131,17 @@ class NativeWorkerMixin(ProfileWorkerMixin):
             json.loads(os.environ["VLLM_HETERO_PP_PLAN"]),
             cfg.model_config.get_total_num_hidden_layers(),
         )
+        pp_size = len(plan.stages)
         if (
             any(s.soc != "910B" for s in plan.stages)
-            or parallel.nnodes != 2
+            or parallel.nnodes != len(plan.nodes)
             or parallel.tensor_parallel_size != 1
-            or parallel.pipeline_parallel_size != 4
-            or parallel.world_size != 4
+            or parallel.pipeline_parallel_size != pp_size
+            or parallel.world_size != pp_size
             or parallel.data_parallel_size != 1
             or plan.partition != os.environ.get("VLLM_PP_LAYER_PARTITION")
         ):
-            raise ValueError("native HCCL plan requires two 910B nodes with PP4/TP1")
+            raise ValueError("native HCCL requires a matching 910B PP plan and TP1")
         self._native_plan = plan
         stage = plan.stages[self.rank]
         self._native_node_ip = get_ip()
@@ -204,6 +205,7 @@ class NativeWorkerMixin(ProfileWorkerMixin):
             raise ValueError("native profiling is already active")
         cfg = self.vllm_config
         group = get_pp_group()
+        pp_size = len(self._native_plan.stages)
         backend = str(torch.distributed.get_backend(group.device_group))
         world_backend = str(torch.distributed.get_backend())
         if (
@@ -211,7 +213,7 @@ class NativeWorkerMixin(ProfileWorkerMixin):
             or str(torch.distributed.get_backend(group.cpu_group)) != "gloo"
             or group.use_cpu_custom_send_recv
             or group.rank_in_group != self.rank
-            or group.ranks != list(range(4))
+            or group.ranks != list(range(pp_size))
             or not cfg.model_config.enforce_eager
             or cfg.scheduler_config.async_scheduling is not False
             or cfg.use_v2_model_runner
@@ -219,7 +221,7 @@ class NativeWorkerMixin(ProfileWorkerMixin):
             or cfg.kv_transfer_config is not None
             or getattr(self.model_runner, "broadcast_pp_output", False)
         ):
-            raise ValueError("profile requires native HCCL tensor P2P and eager PP4")
+            raise ValueError("profile requires native HCCL tensor P2P and eager PP")
         base = Path(__file__).parent
         sources = {
             p.name: hashlib.sha256(p.read_bytes()).hexdigest()
@@ -259,7 +261,7 @@ class NativeWorkerMixin(ProfileWorkerMixin):
             model,
             self.device,
             self.rank,
-            4,
+            pp_size,
             identity=self._hetero_profile_identity,
             timeout_s=self._native_plan.timeout_s,
             transport="native_hccl",

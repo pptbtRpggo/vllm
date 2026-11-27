@@ -9,13 +9,13 @@ set -euo pipefail
 IP_PREFIX="${IP_PREFIX:-141.147.135}"
 head="${HEAD_IP:-${HEAD_LAST:-}}"
 peer="${PEER_IP:-${PEER_LAST:-}}"
-head_soc=910b peer_soc="" transport=gloo
+head_soc=910b peer_soc="" transport="" pp_size=4
 model="${HOST_MODEL_DIR:-}"
 log_dir="${HOST_LOG_DIR:-${HOME:?需要 HOME 或 HOST_LOG_DIR}/vllm_hetero_pp_logs}"
 image_910b="${IMAGE_910B:-quay.io/ascend/vllm-ascend:v0.23.0-openeuler}"
 image_310p="${IMAGE_310P:-quay.io/ascend/vllm-ascend:v0.23.0-310p-openeuler}"
 image="${IMAGE:-}"
-devices="${HOST_NPU_DEVICES:-0,1}"
+devices="${HOST_NPU_DEVICES:-}"
 ray_port="${RAY_PORT:-16379}" api_port="${SERVICE_PORT:-8000}"
 master_port="${MASTER_PORT:-29501}"
 layers="${PP_LAYERS:-}"
@@ -27,17 +27,19 @@ usage() {
   cat <<'EOF'
 两边宿主机使用同一命令（不依赖宿主机 npu-smi / TorchNPU）：
   bash start_hetero_pp_docker.sh --head 53 --peer 54 --model /host/model
+  bash start_hetero_pp_docker.sh --pp-size 2 --model /host/model --devices 0,1
 --head / --peer 可填 IP 最后一个数字；默认前缀 141.147.135，也可填完整 IPv4。
 先在 head 运行，等待时在 peer 运行；两边可使用不同宿主机模型路径。
 选项：
   --head VALUE         主端 IP 或末段；也可设置 HEAD_LAST / HEAD_IP
   --peer VALUE         另一个节点 IP 或末段；也可设置 PEER_LAST / PEER_IP
+  --pp-size 2|4        默认 PP4；PP2 用 HCCL，省略两端地址表示单机
   --head-soc 910b|310p  head 两张卡型号，默认 910b；两边填相同配置
   --peer-soc 910b|310p  peer 型号：gloo 默认 310p，hccl 默认 910b
   --transport gloo|hccl 默认 gloo + Ray；hccl 为原生 mp，仅支持两边 910B
   --model DIR          本机完整模型目录，挂载到容器 /workspace/model
   --log-dir DIR        宿主机可读日志根目录，默认 $HOME/vllm_hetero_pp_logs
-  --devices 0,1        宿主机两张卡设备文件编号，只影响 Docker 映射
+  --devices 0,1        宿主机本地卡号；双机 PP2 每端传一个卡号
   --interface NAME     默认按到对端的路由自动识别
   --image IMAGE        覆盖本机镜像；也可分别设置 IMAGE_910B / IMAGE_310P
   --name NAME          本机容器名，默认 hetero-pp-head / hetero-pp-worker
@@ -88,9 +90,10 @@ while (($#)); do
     --verify-overlap) verify_overlap=true; shift ;;
     --async-scheduling|--no-async-scheduling|--enable-chunked-prefill|--no-enable-chunked-prefill|--model-runner-v1)
       forward+=("$1"); shift ;;
-    --head|--peer|--head-soc|--peer-soc|--transport|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--master-port|--api-port|--layers|--npu-core-fractions|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python|--chat-template|--trace-root|--profile-timeout|--profile-compute-timing|--block-size|--num-gpu-blocks-override|--seed|--expected-checkpoint-sha256)
+    --head|--peer|--head-soc|--peer-soc|--pp-size|--transport|--model|--log-dir|--devices|--interface|--image|--name|--ray-port|--master-port|--api-port|--layers|--npu-core-fractions|--startup-timeout|--max-model-len|--max-num-batched-tokens|--max-num-seqs|--gpu-memory-utilization|--cann-env|--python|--chat-template|--trace-root|--profile-timeout|--profile-compute-timing|--block-size|--num-gpu-blocks-override|--seed|--expected-checkpoint-sha256)
       (($# >= 2)) && [[ -n "$2" && "$2" != --* ]] || die "$1 缺少参数"
       case "$1" in
+        --pp-size) pp_size="$2" ;;
         --head) head="$2" ;; --peer) peer="$2" ;; --model) model="$2" ;;
         --head-soc) head_soc="$2" ;; --peer-soc) peer_soc="$2" ;;
         --transport) transport="$2" ;; --master-port) master_port="$2" ;;
@@ -115,6 +118,15 @@ normalize_soc() {
   esac
 }
 head_soc="$(normalize_soc "$head_soc")"
+[[ "$pp_size" == 2 || "$pp_size" == 4 ]] || die '--pp-size 只能是 2 或 4'
+single_node=false
+if [[ "$pp_size" == 2 ]]; then
+  transport="${transport:-hccl}"
+  [[ "$transport" == hccl ]] || die 'PP2 使用原生 HCCL'
+  if [[ -z "$peer" ]]; then single_node=true; fi
+else
+  transport="${transport:-gloo}"
+fi
 [[ "$transport" == gloo || "$transport" == hccl ]] || die '--transport 只能是 gloo 或 hccl'
 if [[ -z "$peer_soc" ]]; then
   if [[ "$transport" == hccl ]]; then peer_soc=910b; else peer_soc=310p; fi
@@ -161,11 +173,21 @@ expand_ip() {
   [[ "${parts[0]}" != 127 && "$result" != 0.0.0.0 ]] || die "不能使用回环或未指定地址"
   echo "$result"
 }
-head="$(expand_ip "$head")" peer="$(expand_ip "$peer")"
-[[ "$head" != "$peer" ]] || die "head 和 peer 不能相同"
-[[ "$devices" =~ ^(0|[1-9][0-9]*),(0|[1-9][0-9]*)$ ]] || die "devices 需为两个设备号，例如 0,1"
-first="${devices%,*}" second="${devices#*,}"
-[[ "$first" != "$second" ]] || die "两张卡设备号不能相同"
+if "$single_node"; then
+  if [[ -n "$head" ]]; then head="$(expand_ip "$head")"; fi
+else
+  head="$(expand_ip "$head")" peer="$(expand_ip "$peer")"
+  [[ "$head" != "$peer" ]] || die "head 和 peer 不能相同"
+fi
+if [[ "$pp_size" == 2 ]] && ! "$single_node"; then
+  devices="${devices:-0}"
+  [[ "$devices" =~ ^(0|[1-9][0-9]*)$ ]] || die "双机 PP2 每端需要一个设备号"
+else
+  devices="${devices:-0,1}"
+  [[ "$devices" =~ ^(0|[1-9][0-9]*),(0|[1-9][0-9]*)$ ]] || die "devices 需为两个设备号，例如 0,1"
+  [[ "${devices%,*}" != "${devices#*,}" ]] || die "两张卡设备号不能相同"
+fi
+IFS=, read -r -a local_devices <<< "$devices"
 coordination_port="$ray_port"
 if [[ "$transport" == hccl ]]; then coordination_port="$master_port"; fi
 for port in "$coordination_port" "$api_port"; do
@@ -173,9 +195,13 @@ for port in "$coordination_port" "$api_port"; do
     die "端口需在 1024..65535"
   fi
 done
-[[ "$coordination_port" != "$api_port" ]] || die "主端通信和 API 不能使用同一端口"
+if ! "$single_node"; then
+  [[ "$coordination_port" != "$api_port" ]] || die "主端通信和 API 不能使用同一端口"
+fi
 if [[ -n "$layers" ]]; then
-  [[ "$layers" =~ ^[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]*$ ]] || die "layers 需要四个正整数"
+  [[ "$layers" =~ ^[1-9][0-9]*(,[1-9][0-9]*)+$ ]] || die "layers 需要逗号分隔的正整数"
+  IFS=, read -r -a counts <<< "$layers"
+  [[ "${#counts[@]}" == "$pp_size" ]] || die "layers 需要 $pp_size 个层数"
 fi
 if ! "$debug_shell"; then
   [[ -d "$model" ]] || die "模型目录不存在：$model"
@@ -191,6 +217,15 @@ owns_head=false owns_peer=false
 while read -r _ nic family cidr _; do
   [[ "$family" == inet ]] || continue
   address="${cidr%/*}"
+  nic="${nic%%@*}"
+  if "$single_node" && [[ "$nic" != lo && "$address" != 127.* &&
+        ( -z "$interface" || "$interface" == "$nic" ) &&
+        ( -z "$head" || "$head" == "$address" ) ]]; then
+    head="$address" interface="$nic"
+    owns_head=true
+    break
+  fi
+  if "$single_node"; then continue; fi
   if [[ "$address" == "$head" ]]; then owns_head=true; fi
   if [[ "$address" == "$peer" ]]; then owns_peer=true; fi
 done <<< "$addresses"
@@ -244,9 +279,10 @@ command=(docker run --rm --name "$name" --net=host --shm-size=1g)
 if [[ "$local_soc" == 310p ]]; then command+=(--security-opt seccomp=unconfined); fi
 if [[ -t 0 && -t 1 ]]; then command+=(-it); fi
 fi
-for device in "davinci$first" "davinci$second" davinci_manager hisi_hdc; do
-  command+=(--device "/dev/$device")
+for device in "${local_devices[@]}"; do
+  command+=(--device "/dev/davinci$device")
 done
+command+=(--device /dev/davinci_manager --device /dev/hisi_hdc)
 # Some 310P installations do not expose this node; never create a substitute.
 if [[ -c /dev/devmm_svm ]]; then command+=(--device /dev/devmm_svm); fi
 for path in /usr/local/dcmi /usr/local/Ascend/driver/lib64 \
@@ -283,11 +319,13 @@ if ((status != 0)); then exit "$status"; fi
 echo "peer Ray 已加入；保持此容器运行。head 完成本轮服务/采集后 Ctrl+C 停止本容器。"
 trap "exit 0" INT TERM HUP
 while true; do sleep 5 & wait $!; done
-' hetero-pp --head "$head" --peer "$peer" --model /workspace/model
+' hetero-pp --head "$head" --model /workspace/model
   --head-soc "$head_soc" --peer-soc "$peer_soc"
   --transport "$transport" --master-port "$master_port"
   --node-ip "$local_ip" --interface "$interface"
   --ray-port "$ray_port" --api-port "$api_port" --output /work/hetero_logs/start)
+if ! "$single_node"; then command+=(--peer "$peer"); fi
+if [[ "$pp_size" == 2 ]]; then command+=(--pp-size 2); fi
 if [[ -n "$layers" ]]; then command+=(--layers "$layers"); fi
 if "$profile"; then
   profile_root=/work/hetero_logs/profiles
@@ -309,7 +347,7 @@ if "$debug_shell"; then
   echo "调试容器禁用 seccomp 过滤；退出后保留，可用 docker start -ai $name 再次进入。" >&2
   echo "另开终端进入：docker exec -it $name /bin/bash" >&2
 else
-echo "选择镜像依据节点型号配置；容器内将实际校验两张 NPU 型号及初始化。" >&2
+echo "选择镜像依据节点型号配置；容器内将校验 ${#local_devices[@]} 张 NPU 的型号及初始化。" >&2
 if [[ "$transport" == hccl ]]; then
   echo "原生 HCCL/mp，主端端口=$master_port，API端口=$api_port；需跨机 HCCL 网络可用。" >&2
 else

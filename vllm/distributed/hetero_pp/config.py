@@ -28,7 +28,12 @@ class PipelinePlan:
         if set(value) - {"stages", "timeout_s", "validation_mode"}:
             raise ValueError("unknown pipeline plan fields")
         raw = value.get("stages", [])
-        if len(raw) != 4:
+        mode = value.get("validation_mode", "mixed")
+        if mode not in ("mixed", "910b_only", "explicit", "910b_pp2"):
+            raise ValueError("unknown validation_mode")
+        if mode == "910b_pp2" and len(raw) != 2:
+            raise ValueError("910B PP2 requires two stages")
+        if mode != "910b_pp2" and len(raw) != 4:
             raise ValueError("first backend requires four stages")
         stages = []
         for item in raw:
@@ -54,11 +59,10 @@ class PipelinePlan:
             )
         if sum(s.layers for s in stages) != total_layers:
             raise ValueError("stage layers must sum to model hidden layers")
-        mode = value.get("validation_mode", "mixed")
+        if mode == "910b_pp2" and any(s.soc != "910B" for s in stages):
+            raise ValueError("910B PP2 requires two 910B devices")
         expected = ["910B", "910B", "310P", "310P"] if mode == "mixed" else ["910B"] * 4
-        if mode not in ("mixed", "910b_only", "explicit"):
-            raise ValueError("unknown validation_mode")
-        if not (
+        if mode != "910b_pp2" and not (
             stages[0].node_ip == stages[1].node_ip
             and stages[2].node_ip == stages[3].node_ip
             and stages[0].node_ip != stages[2].node_ip

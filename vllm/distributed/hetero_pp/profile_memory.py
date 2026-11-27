@@ -72,7 +72,7 @@ def memory_envelope_assumptions() -> dict[str, Any]:
         "kv": "native page bytes times fixed block count, pool-owner reconciled",
         "reserve": "peak_reserved minus model minus KV, plus current non-Torch",
         "margin": "explicit caller-supplied bytes, not a measured allocation",
-        "roles": "four original devices in original order; endpoints stay fixed",
+        "roles": "original devices in original order; endpoints stay fixed",
         "guarantee_for_unprofiled_workloads": False,
         "requires_live_redeployment_validation": True,
     }
@@ -86,7 +86,7 @@ def build_fixed_block_memory_profile(
     """Build v2 bounds without charging the observed KV pool twice.
 
     Args:
-        observations: Four drained worker observations with native KV specs and
+        observations: Drained worker observations with native KV specs and
             actual unique KV storage-owner bytes.
         config: The live VllmConfig used to obtain the observations.
         safety_margin_bytes: Explicit additional reserve per device.
@@ -108,8 +108,9 @@ def build_fixed_block_memory_profile(
     blocks = _integer(cache.num_gpu_blocks_override, "fixed block count", 1)
     if cache.kv_cache_memory_bytes is not None:
         raise ValueError("fixed-byte KV overrides are not supported")
-    if (parallel.pipeline_parallel_size, parallel.tensor_parallel_size) != (4, 1):
-        raise ValueError("automatic envelope requires fixed PP4 and TP1")
+    pp_size = parallel.pipeline_parallel_size
+    if pp_size not in (2, 4) or parallel.tensor_parallel_size != 1:
+        raise ValueError("automatic envelope requires PP2 or PP4 with TP1")
     if scope["dtype"] != "float16" or model.quantization is not None:
         raise ValueError("automatic envelope supports unquantized FP16 only")
     if model.hf_config.architectures not in (
@@ -117,14 +118,11 @@ def build_fixed_block_memory_profile(
         ["Qwen2ForCausalLM"],
     ):
         raise ValueError("automatic envelope requires supported dense architecture")
-    if len(observations) != 4:
-        raise ValueError("four complete worker observations are required")
+    if len(observations) != pp_size:
+        raise ValueError("complete observations from every PP worker are required")
     ordered = sorted(observations, key=lambda row: row["pp_rank"])
     if [(r["pp_rank"], r["tp_rank"]) for r in ordered] != [
-        (0, 0),
-        (1, 0),
-        (2, 0),
-        (3, 0),
+        (r, 0) for r in range(pp_size)
     ]:
         raise ValueError("observations must cover each original PP rank once")
     all_layers, partitions, devices = [], [], []
@@ -214,21 +212,21 @@ def build_fixed_block_memory_profile(
                 layer_kv_bytes=(blocks * next(iter(page_bytes.values())),) * n_layers,
                 runtime_bytes=other_peak
                 + non_torch
-                + (endpoints if rank in (1, 2) else 0),
+                + (endpoints if 0 < rank < pp_size - 1 else 0),
                 activation_bytes=0,
                 workspace_bytes=0,
                 communication_bytes=0,
                 graph_bytes=0,
                 safety_margin_bytes=safety_margin_bytes,
                 first_stage_bytes=endpoints if rank == 0 else 0,
-                last_stage_bytes=endpoints if rank == 3 else 0,
+                last_stage_bytes=endpoints if rank == pp_size - 1 else 0,
             )
         )
     if all_layers != list(range(n_layers)):
         raise ValueError("worker layers must cover the whole model in rank order")
     profile = PPMemoryProfile(
         n_layers,
-        4,
+        pp_size,
         1,
         scope,
         tuple(devices),

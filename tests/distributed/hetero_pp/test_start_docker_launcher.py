@@ -64,6 +64,84 @@ def invoke(environment, *arguments):
     )
 
 
+@pytest.mark.parametrize(
+    "local, topology, devices, rank, nnodes",
+    [
+        ("141.147.135.53", (), ["0", "2"], "0", "1"),
+        ("141.147.135.53", ("--head", "53", "--peer", "54"), ["2"], "0", "2"),
+        ("141.147.135.54", ("--head", "53", "--peer", "54"), ["6"], "1", "2"),
+    ],
+)
+@pytest.mark.parametrize("profile", [(), ("--profile",)])
+def test_pp2_vnpu_docker_launches_the_correct_local_ranks(
+    environment, local, topology, devices, rank, nnodes, profile
+):
+    environment["TEST_LOCAL_IP"] = local
+    model = Path(environment["TEST_MODEL"])
+    (model / "config.json").write_text(
+        '{"architectures":["LlamaForCausalLM"],"num_hidden_layers":48}'
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT),
+            "--pp-size",
+            "2",
+            *topology,
+            "--model",
+            str(model),
+            "--devices",
+            ",".join(devices),
+            "--npu-core-fractions",
+            "1,1/2",
+            *profile,
+            "--dry-run",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    docker = shlex.split(result.stdout)
+    assert [
+        d
+        for d in docker
+        if d.startswith("/dev/davinci") and d != "/dev/davinci_manager"
+    ] == [f"/dev/davinci{d}" for d in devices]
+    inner = docker[docker.index("hetero-pp") + 1 :]
+    inner[inner.index("--model") + 1] = str(model)
+    result = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT.with_name("start_hetero_pp.sh")),
+            *inner,
+            "--python",
+            sys.executable,
+            "--dry-run",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    launch = json.loads(result.stdout)
+    assert launch["ray_command"] is None
+    assert [s["layers"] for s in launch["plan"]["stages"]] == [24, 24]
+    assert launch["plan"]["stages"][1]["npu_core_fraction"] == "1/2"
+    command = launch["profile_command" if profile else "serve_command"]
+    if rank == "0" and profile:
+        assert command[-1].endswith("profile_edgeshard.sh")
+        assert launch["profile_environment"]["PROFILE_NNODES"] == nnodes
+        assert launch["profile_environment"]["PROFILE_PP_SIZE"] == "2"
+    else:
+        assert command[command.index("--pipeline-parallel-size") + 1] == "2"
+        assert command[command.index("--nnodes") + 1] == nnodes
+        assert command[command.index("--node-rank") + 1] == rank
+        assert ("--headless" in command) == (rank == "1")
+
+
 @pytest.mark.parametrize("local", ["141.147.135.53", "141.147.135.54"])
 def test_docker_forwards_overlap_flag_on_both_hosts(environment, local):
     environment["TEST_LOCAL_IP"] = local

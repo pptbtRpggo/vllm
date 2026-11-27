@@ -12,7 +12,7 @@
 
 ## 1. 当前范围与启动前提
 
-当前入口固定为四个 PP stage、TP=1、FP16、eager、同步调度、原四设备顺序。
+CPU/Gloo 入口固定为四个 PP stage、TP=1、FP16、eager、同步调度、原四设备顺序。
 每节点两个 Ray actor，每个 actor 占一张卡。代码准入允许
 `LlamaForCausalLM` / `Qwen2ForCausalLM` 的普通 dense 文本模型；
 本轮实际只验证 CodeLlama-7B-Instruct / Llama，没有 Qwen2 实机验收。
@@ -179,6 +179,48 @@ headless worker。
 此 HCCL 启动入口的采集和普通服务默认使用同步调度、V1 runner 和 chunked
 prefill，并关闭前缀缓存。生成的回测参数保留同步调度、采集时的 checkpoint、
 V1 runner、seed 和 chunked prefill 设置。
+
+### 单机两卡或两机各一卡，用 HCCL 做 PP2 profile
+
+用 `--pp-size 2` 选择两段 PP，每段一张 910B。以下示例沿用现有的 CANN 核心额度，
+`1,1/2` 分别给 Stage 0 全额和 Stage 1 半额。它按进程限制 Cube/Vector Core，
+显存容量保持原值。脚本使用当前映射的设备。
+
+单机在宿主机执行一次。多网卡环境可用 `--head` 指定本机 IP，或用 `--interface`
+指定网口。默认按模型层数均分，48 层模型从 `24,24` 起测。
+
+```bash
+bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
+  --pp-size 2 --model /本机/模型目录 --devices 0,1 \
+  --npu-core-fractions 1,1/2 --profile
+```
+
+双机在两台宿主机使用同样的拓扑和核心额度，每端各选一个本地卡号。先启动 head，
+再启动 peer。下面的 IP、模型路径和设备号按实际环境填写。
+
+```bash
+# head
+bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
+  --pp-size 2 --head 192.168.23.28 --peer 192.168.23.29 \
+  --model /head/模型目录 --devices 0 --npu-core-fractions 1,1/2 --profile
+
+# peer
+bash examples/online_serving/hetero_pp/start_hetero_pp_docker.sh \
+  --pp-size 2 --head 192.168.23.28 --peer 192.168.23.29 \
+  --model /peer/模型目录 --devices 1 --npu-core-fractions 1,1/2 --profile
+```
+
+两种模式都由 head 自动完成 32 条预热、64 条正式 prefill、统计和 DP。
+每条请求生成 1 个 token。看 head 的 `profiles/edgeshard_*` 目录：
+
+- `stage_and_link_timing_summary.csv` 有两个 stage 的计算和 `stage0->1` 的交接耗时。
+- `recommended_hetero_plan.json` 的两个 `stages[].layers` 是推荐层数。
+- `profile_manifest.json` 记录两个 rank 的实际层区间、HCCL 后端和核心额度。
+
+启动正式服务时去掉 `--profile`，把 head 输出的回测参数加到命令里，
+保留各自的 `--model`、`--devices` 和网络参数。回测参数包含推荐的 `--layers A,B`、
+checkpoint SHA、组批和 KV 容量。做均分对照时只换回原层数。双机的 API 由 head
+启动，peer 只运行模型 worker。
 
 已有容器且 Ray 已连好、推理服务已退出：只在 head 容器中运行：
 

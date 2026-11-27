@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Four-stage PP profiling and fixed-order EdgeShard-style DP."""
+"""PP profiling and fixed-order EdgeShard-style DP."""
 
 import argparse
 
@@ -31,7 +31,7 @@ class PPProfileSubcommand(CLISubcommand):
     def subparser_init(self, subparsers):
         parser = subparsers.add_parser(
             self.name,
-            help="Profile PP layers over Gloo or HCCL and plan a four-stage split.",
+            help="Profile PP layers over Gloo or HCCL and plan a fixed-order split.",
             description=__doc__,
         )
         parser = add_cli_args(parser)

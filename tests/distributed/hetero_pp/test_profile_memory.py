@@ -95,6 +95,24 @@ class MemoryBuilderTests(unittest.TestCase):
         self.assertEqual(profile.devices[0].estimate(0, 1, 4)["required_bytes"], 712)
         profile.validate_engine_config(config())
 
+    def test_pp2_preserves_input_and_output_storage_on_the_new_endpoints(self):
+        cfg = config()
+        cfg.parallel_config.pipeline_parallel_size = 2
+        cfg.model_config.get_total_num_hidden_layers = lambda: 2
+        head, _, _, tail = observations()
+        tail["pp_rank"] = 1
+        tail["layer_storage_bytes"] = {"1": 100}
+        tail["kv_cache_specs"] = {
+            "model.layers.1.self_attn.attn": next(iter(tail["kv_cache_specs"].values()))
+        }
+        profile = self.mod.build_fixed_block_memory_profile(
+            [head, tail], cfg, safety_margin_bytes=64
+        )
+        self.assertEqual(profile.pp_size, 2)
+        self.assertEqual(profile.devices[0].first_stage_bytes, 20)
+        self.assertEqual(profile.devices[1].last_stage_bytes, 30)
+        self.assertEqual(profile.devices[1].runtime_bytes, 400)
+
     def test_peer_budget_setting_cannot_be_replaced_with_head_setting(self):
         data = observations()
         data[2]["serving_config_observation"] = {

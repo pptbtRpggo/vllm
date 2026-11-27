@@ -53,3 +53,19 @@ def test_agreement_rejects_different_checkpoint_content():
     actual[2]["checkpoint"] = actual[3]["checkpoint"] = "b" * 64
     with pytest.raises(ValueError, match="checkpoint"):
         validate_native_reports(actual)
+
+
+@pytest.mark.parametrize("local_size", [1, 2])
+def test_direct_pp2_requires_a_checkpoint_digest_from_each_node(local_size):
+    from vllm.distributed.hetero_pp.native_startup import validate_native_reports
+
+    actual = reports()[:2]
+    for row in actual:
+        row["settings"]["mode"] = "direct"
+    validate_native_reports(actual, pp_size=2, local_size=local_size)
+    actual[1]["checkpoint"] = None
+    if local_size == 1:
+        with pytest.raises(ValueError, match="rank 1.*checkpoint"):
+            validate_native_reports(actual, pp_size=2, local_size=local_size)
+    else:
+        validate_native_reports(actual, pp_size=2, local_size=local_size)

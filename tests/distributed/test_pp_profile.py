@@ -123,14 +123,23 @@ class FixtureEngine:
         missing_rank=False,
         bad_device=False,
         expose_executor=True,
+        layout=None,
     ):
+        layout = layout or topology()
+        self.pp_size = len(layout["stages"])
         self.calls = []
         self.bad_sha, self.missing_rank = bad_sha, missing_rank
         self.bad_device = bad_device
         self.closed = False
-        self.rows: list[list[dict[str, Any]]] = [[] for _ in range(4)]
+        self.rows: list[list[dict[str, Any]]] = [[] for _ in range(self.pp_size)]
         self.warmup = False
         cfg = config()
+        cfg.parallel_config.pipeline_parallel_size = self.pp_size
+        cfg.model_config.get_total_num_hidden_layers = lambda: 2 * self.pp_size
+        if self.pp_size == 2:
+            cfg.model_config.hf_config.to_json_string = (
+                lambda: '{"num_hidden_layers":4}'
+            )
         model_sha = hashlib.sha256(
             cfg.model_config.hf_config.to_json_string().encode()
         ).hexdigest()
@@ -145,7 +154,7 @@ class FixtureEngine:
             dict(
                 rank=r,
                 soc="910B",
-                node_ip=topology()["stages"][r]["node_ip"],
+                node_ip=layout["stages"][r]["node_ip"],
                 layers=[r * 2, r * 2 + 2],
                 identity={"node_id": "node" + str(r // 2), "device_id": r % 2},
                 vllm="0.23.0",
@@ -156,7 +165,7 @@ class FixtureEngine:
                 model_config_sha256=model_sha,
                 world_backend="gloo",
             )
-            for r in range(4)
+            for r in range(self.pp_size)
         ]
         self.llm_engine = NS(
             vllm_config=cfg,
@@ -173,13 +182,14 @@ class FixtureEngine:
     def generate(self, prompts, sampling_params, use_tqdm=False):
         self.calls.append(("generate", self.warmup, prompts))
         step = len(self.rows[0])
-        for rank in range(4):
+        last = self.pp_size - 1
+        for rank in range(self.pp_size):
             self.rows[rank].append(
                 dict(
                     step=step,
                     sequence=step,
                     pp_rank=rank,
-                    pp_size=4,
+                    pp_size=self.pp_size,
                     tp_rank=0,
                     tp_size=1,
                     trace_session=os.environ["VLLM_PP_TRACE_SESSION"],
@@ -204,19 +214,25 @@ class FixtureEngine:
                     compute_ms=3.0,
                     compute_wall_ms=3.0,
                     non_layer_compute_ms=1.0,
-                    runner_overhead_ms=0.75 if rank == 0 else 0.5 if rank == 3 else 1.0,
+                    runner_overhead_ms=0.75
+                    if rank == 0
+                    else 0.5
+                    if rank == last
+                    else 1.0,
                     embedding_ms=0.25 if rank == 0 else None,
-                    final_norm_ms=0.25 if rank == 3 else None,
-                    lm_head_ms=0.25 if rank == 3 else None,
+                    final_norm_ms=0.25 if rank == last else None,
+                    lm_head_ms=0.25 if rank == last else None,
                     compute_scale=1.0,
                     comm_scale=1.0,
                     recv_bytes=None if rank == 0 else 8,
-                    send_bytes=None if rank == 3 else 8,
+                    send_bytes=None if rank == last else 8,
                     send_start_ns=(
-                        None if rank == 3 else step * 1_000_000 + rank * 10_000 + 1
+                        None if rank == last else step * 1_000_000 + rank * 10_000 + 1
                     ),
                     send_end_ns=(
-                        None if rank == 3 else step * 1_000_000 + rank * 10_000 + 1001
+                        None
+                        if rank == last
+                        else step * 1_000_000 + rank * 10_000 + 1001
                     ),
                     recv_start_ns=(
                         None
@@ -236,9 +252,12 @@ class FixtureEngine:
         self.calls.append(("rpc", method))
         if method == "set_pp_profile_warmup":
             self.warmup = args[0]
-            return [None] * 4
+            return [None] * self.pp_size
         if method == "get_pp_memory_observation":
-            return [dict(pp_rank=r, tp_rank=0, observation="fixture") for r in range(4)]
+            return [
+                dict(pp_rank=r, tp_rank=0, observation="fixture")
+                for r in range(self.pp_size)
+            ]
         if method != "flush_pp_profile":
             raise AssertionError(method)
         receipts = []
@@ -616,7 +635,7 @@ class ProfileControllerTests(unittest.TestCase):
                             checkpoint_sha256=checkpoint_sha256,
                             serving_config_observation=self.serving_scope(),
                         )
-                        if rank >= 2:
+                        if "npu_core_fraction" in plan["stages"][rank]:
                             report["npu_core_limit"] = {
                                 "fraction": plan["stages"][rank]["npu_core_fraction"]
                             }
@@ -658,7 +677,9 @@ class ProfileControllerTests(unittest.TestCase):
 
         def collect(engine, directory):
             args = engine_args()
-            args.nnodes, args.node_rank, args.master_addr = 2, 0, "10.0.0.1"
+            args.nnodes = len({stage["node_ip"] for stage in plan["stages"]})
+            args.node_rank, args.master_addr = 0, "10.0.0.1"
+            args.pipeline_parallel_size = len(plan["stages"])
             args.master_port = 29501
             args.worker_cls, args.enable_prefix_caching = "auto", False
             args.max_num_seqs, args.max_num_batched_tokens = 2, 128
@@ -772,6 +793,57 @@ class ProfileControllerTests(unittest.TestCase):
                 pp_transport="hccl",
                 skip_run=True,
             )
+
+        fixed_profile = replace(
+            fixed_profile,
+            num_layers=4,
+            pp_size=2,
+            devices=tuple(
+                replace(d, layer_weights_bytes=(1,) * 4, layer_kv_bytes=(1,) * 4)
+                for d in fixed_profile.devices[:2]
+            ),
+        )
+        for peer in ("10.0.0.1", "10.0.0.2"):
+            with self.subTest(peer=peer):
+                plan = {
+                    "validation_mode": "910b_pp2",
+                    "stages": [
+                        {"node_ip": "10.0.0.1", "soc": "910B", "layers": 2},
+                        {
+                            "node_ip": peer,
+                            "soc": "910B",
+                            "layers": 2,
+                            "npu_core_fraction": "1/2",
+                        },
+                    ],
+                }
+                engine = NativeEngine(layout=plan)
+                if peer != "10.0.0.1":
+                    engine.worker_reports[1]["identity"]["device_id"] = 0
+                directory = self.directory.with_name("pp2-" + peer)
+                collect(engine, directory)
+                self.assertTrue(engine.closed)
+                manifest = json.loads((directory / "profile_manifest.json").read_text())
+                self.assertEqual(
+                    set(manifest["raw_files"]),
+                    {
+                        "pp_stage_pp0_tp0.jsonl",
+                        "pp_stage_pp1_tp0.jsonl",
+                    },
+                )
+                result = self.mod.profile_pp_partition(
+                    dump_dir=directory,
+                    hetero_plan=plan,
+                    pp_transport="hccl",
+                    skip_run=True,
+                )
+                self.assertEqual(len(result.partitions), 2)
+                self.assertEqual(sum(result.partitions), 4)
+                self.assertTrue(all(layers > 0 for layers in result.partitions))
+                command = self.mod.format_serve_command(result, directory)
+                self.assertIn("--pp-size 2", command)
+                self.assertIn("--npu-core-fractions 1,1/2", command)
+                self.assertEqual("--peer" in command, peer != "10.0.0.1")
 
     def test_collection_rejects_incomplete_or_corrupt_rank_receipts(self):
         for engine in (

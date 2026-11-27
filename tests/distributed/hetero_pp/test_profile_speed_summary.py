@@ -19,9 +19,10 @@ SCRIPT = (
 )
 
 
-def write_trace(directory, *, defect=None, compute_timing="event"):
+def write_trace(directory, *, defect=None, compute_timing="event", pp_size=4):
     directory.mkdir()
-    rows: list[list[dict]] = [[] for _ in range(4)]
+    rows: list[list[dict]] = [[] for _ in range(pp_size)]
+    transport = "native_hccl" if pp_size == 2 else "cpu_gloo"
     # Prefill speeds 8 / 2 Gbps; ignore warmup, decode and mixed steps.
     for step, (payload, duration, ctx, gen) in enumerate(
         [
@@ -32,12 +33,12 @@ def write_trace(directory, *, defect=None, compute_timing="event"):
             (500_000, 2_000_000, 4, 0),
         ]
     ):
-        for rank in range(4):
+        for rank in range(pp_size):
             compute = 10_000 if step == 0 else 10 * step * (rank + 1)
-            sample = 2 if rank == 3 else 0
+            sample = 2 if rank == pp_size - 1 else 0
             row = dict(
                 pp_rank=rank,
-                pp_size=4,
+                pp_size=pp_size,
                 tp_rank=0,
                 tp_size=1,
                 trace_session="test-session",
@@ -45,7 +46,7 @@ def write_trace(directory, *, defect=None, compute_timing="event"):
                 batch_id=f"b{step}",
                 is_warmup=step == 0,
                 comm_timing="ack",
-                transport="cpu_gloo",
+                transport=transport,
                 num_ctx_tokens=ctx,
                 num_generation_tokens=gen,
                 compute_wall_ms=compute,
@@ -55,7 +56,7 @@ def write_trace(directory, *, defect=None, compute_timing="event"):
                 execute_host_ms=123456,
                 compute_ms=999999,
             )
-            if rank < 3:
+            if rank < pp_size - 1:
                 start = 100_000_000
                 row.update(
                     send_bytes=payload,
@@ -143,7 +144,8 @@ def write_trace(directory, *, defect=None, compute_timing="event"):
     manifest = dict(
         version=1,
         complete=True,
-        transport="cpu_gloo",
+        transport=transport,
+        engine_config={"pipeline_parallel_size": pp_size},
         comm_timing="ack",
         trace_session="test-session",
         raw_files=raw,
@@ -163,6 +165,21 @@ def run_summary(directory):
         text=True,
         timeout=15,
     )
+
+
+def test_pp2_summary_reports_two_compute_stages_and_one_link(tmp_path):
+    directory = tmp_path / "pp2-trace"
+    write_trace(directory, pp_size=2)
+    result = run_summary(directory)
+    assert result.returncode == 0, result.stderr
+    with (directory / "stage_and_link_timing_summary.csv").open() as stream:
+        assert [row["item"] for row in csv.DictReader(stream)] == [
+            "stage0",
+            "stage1",
+            "stage0->1",
+        ]
+    with (directory / "communication_speed_summary.csv").open() as stream:
+        assert [row["link"] for row in csv.DictReader(stream)] == ["stage0->1"]
 
 
 def test_host_sync_summary_uses_host_costs_without_claiming_device_events(tmp_path):
@@ -353,9 +370,12 @@ def test_timing_table_rejects_missing_or_invalid_device_intervals(tmp_path, defe
 
 
 @pytest.mark.parametrize("collect_exit", [0, 42])
-def test_profile_automatically_summarizes_only_after_success(tmp_path, collect_exit):
+@pytest.mark.parametrize("pp_size, nnodes", [(4, 2), (2, 1), (2, 2)])
+def test_profile_automatically_summarizes_only_after_success(
+    tmp_path, collect_exit, pp_size, nnodes
+):
     fixture = tmp_path / "fixture"
-    write_trace(fixture)
+    write_trace(fixture, pp_size=pp_size)
     model = tmp_path / "model"
     model.mkdir()
     plan = tmp_path / "plan.json"
@@ -382,6 +402,11 @@ def test_profile_automatically_summarizes_only_after_success(tmp_path, collect_e
             "MODEL": str(model),
             "PLAN": str(plan),
             "RAY_ADDRESS": "141.147.135.53:16379",
+            "PROFILE_TRANSPORT": "hccl" if pp_size == 2 else "gloo",
+            "PROFILE_PP_SIZE": str(pp_size),
+            "PROFILE_NNODES": str(nnodes),
+            "PROFILE_MASTER_ADDR": "141.147.135.53",
+            "PROFILE_MASTER_PORT": "29501",
             "TRACE_ROOT": str(tmp_path / "shared"),
             "CALL_LOG": str(calls),
             "FIXTURE": str(fixture),
@@ -401,6 +426,9 @@ def test_profile_automatically_summarizes_only_after_success(tmp_path, collect_e
     assert "--num-prompts 4 " in captured[0]
     assert "--num-iters-warmup 8 " in captured[0]
     assert "--num-iters 16 " in captured[0]
+    if pp_size == 2:
+        assert f"--nnodes {nnodes} --node-rank 0" in captured[0]
+        assert "--pp-transport hccl --pipeline-parallel-size 2" in captured[0]
     summaries = list((tmp_path / "shared").glob("*/communication_speed_summary.csv"))
     if collect_exit:
         assert len(captured) == 1 and not summaries
@@ -408,4 +436,6 @@ def test_profile_automatically_summarizes_only_after_success(tmp_path, collect_e
         assert len(captured) == 2 and len(summaries) == 1
         assert "--skip-run" in captured[1]
         assert "--objective latency --workload prefill" in captured[1]
-        assert "stage1->2" in result.stdout
+        assert "stage0->1" in result.stdout
+        assert ("stage1->2" in result.stdout) == (pp_size == 4)
+        assert f"--pipeline-parallel-size {pp_size}" in captured[1]

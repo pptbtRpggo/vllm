@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Start configurable two-node Ascend PP from the same CLI on both nodes.
+"""Start Ascend PP in existing containers, with optional EdgeShard profiling.
 
 Run inside each already working container. No Docker, package installation,
 device remapping or global Ray stop is performed. Explicit profile mode runs
@@ -41,15 +41,15 @@ from check_cpu_gloo import (
 
 def argument_parser():
     parser = argparse.ArgumentParser(
-        description="两机各两卡 PP：CPU/Gloo + Ray 或原生 HCCL + mp"
+        description="Ascend PP 与 EdgeShard：双机 PP4 或单机/双机 PP2"
     )
-    parser.add_argument("--head", required=True, help="主端 IPv4；两边填一样")
-    parser.add_argument("--peer", required=True, help="另一个节点 IPv4；两边填一样")
+    parser.add_argument("--head", help="主端 IPv4；单机 PP2 可省略")
+    parser.add_argument("--peer", help="另一个节点 IPv4；单机 PP2 省略")
+    parser.add_argument("--pp-size", type=int, choices=(2, 4), default=4)
     parser.add_argument(
         "--transport",
         choices=("gloo", "hccl"),
-        default="gloo",
-        help="默认 gloo；hccl 使用原生双机 mp，目前限两端 910B，不启用 Ray",
+        help="PP4 默认 gloo；PP2 默认 hccl。HCCL 使用原生 mp 和 910B。",
     )
     parser.add_argument(
         "--head-soc",
@@ -69,12 +69,12 @@ def argument_parser():
         "--model", required=True, type=Path, help="两端同路径的本地完整模型"
     )
     parser.add_argument(
-        "--layers", help="四 stage 层数；原 910B→310P 默认 18,18,6,6，其他组合均分"
+        "--layers", help="各 stage 层数；原 910B→310P 默认 18,18,6,6，其他组合均分"
     )
     parser.add_argument(
         "--npu-core-fractions",
         type=parse_npu_core_fractions,
-        help="按 PP stage 0–3 设置核心比例，例如 1,1,1/2,1/4",
+        help="按 stage 设置核心比例，例如 PP2 用 1,1/2",
     )
     parser.add_argument("--python", help="已有 NPU Python，默认沿用环境探测")
     parser.add_argument("--cann-env", help="可选，本机已有 CANN set_env.sh")
@@ -83,7 +83,7 @@ def argument_parser():
         help="codellama-instruct 或模板文件路径；省略时使用 tokenizer 自带模板",
     )
     parser.add_argument(
-        "--devices", help="可选，当前 runtime 的两个逻辑卡号；默认不更改可见性"
+        "--devices", help="当前 runtime 的本地逻辑卡号；默认不更改可见性"
     )
     parser.add_argument("--interface", help="本机 Gloo 网卡，默认自动选择")
     parser.add_argument(
@@ -175,9 +175,9 @@ def parse_npu_core_fractions(value):
         raise argparse.ArgumentTypeError(
             "--npu-core-fractions 需要四个有效比例，例如 1,1,1/2,1/4"
         ) from None
-    if len(fractions) != 4 or any(not 0 < ratio <= 1 for ratio in fractions):
+    if len(fractions) not in (2, 4) or any(not 0 < ratio <= 1 for ratio in fractions):
         raise argparse.ArgumentTypeError(
-            "--npu-core-fractions 需要四个比例，每项满足 0 < x <= 1"
+            "--npu-core-fractions 需要四个（PP4）或两个（PP2）比例，每项满足 0 < x <= 1"
         )
     return tuple(map(str, fractions))
 
@@ -187,6 +187,17 @@ def _valid_sha256(value: str) -> bool:
 
 
 def validate_options(args):
+    args.transport = args.transport or ("hccl" if args.pp_size == 2 else "gloo")
+    if args.pp_size == 2 and args.transport != "hccl":
+        raise ValueError("PP2 使用原生 HCCL")
+    if (args.pp_size == 4 or args.peer) and (not args.head or not args.peer):
+        raise ValueError("双机模式需要 --head 和 --peer")
+    if (
+        args.npu_core_fractions is not None
+        and len(args.npu_core_fractions) != args.pp_size
+    ):
+        expected = "两个" if args.pp_size == 2 else "四个"
+        raise ValueError(f"--npu-core-fractions 需要{expected}比例，与 PP stage 数一致")
     if args.verify_overlap and (args.profile or args.transport != "gloo"):
         raise ValueError("--verify-overlap 仅用于 Gloo 在线验证")
     if (
@@ -198,7 +209,7 @@ def validate_options(args):
     if args.peer_soc is None:
         args.peer_soc = "910b" if args.transport == "hccl" else "310p"
     if args.transport == "hccl" and (args.head_soc, args.peer_soc) != ("910b", "910b"):
-        raise ValueError("HCCL 模式当前只支持两端各两张 910B；异构请用 gloo")
+        raise ValueError("HCCL 模式当前只支持 910B；310P/910B 混用请用 PP4 Gloo")
     if args.transport != "hccl" and (
         args.async_scheduling is not None
         or args.enable_chunked_prefill is not None
@@ -240,19 +251,22 @@ def validate_options(args):
         if value is not None and value <= 0:
             raise ValueError("KV block 参数必须为正整数")
     for name in ("head", "peer"):
-        address = ipaddress.IPv4Address(getattr(args, name))
+        value = getattr(args, name)
+        if value is None:
+            continue
+        address = ipaddress.IPv4Address(value)
         if address.is_loopback or address.is_multicast or address.is_unspecified:
             raise ValueError("head/peer 必须是两端互通的非回环 IPv4")
         setattr(args, name, str(address))
-    if args.head == args.peer:
+    if args.peer is not None and args.head == args.peer:
         raise ValueError("head 和 peer 不能相同")
-    if args.node_ip and args.node_ip not in (args.head, args.peer):
+    if args.head and args.node_ip and args.node_ip not in (args.head, args.peer):
         raise ValueError("本机 IP 必须是 head 或 peer")
     coordination_port = args.master_port if args.transport == "hccl" else args.ray_port
     if (
         not 1024 <= coordination_port <= 65535
         or not 1024 <= args.api_port <= 65535
-        or coordination_port == args.api_port
+        or (args.peer is not None and coordination_port == args.api_port)
     ):
         raise ValueError("主端通信/API 端口需不同且在 1024..65535")
     if (
@@ -272,21 +286,24 @@ def validate_options(args):
     if config.get("architectures") not in (["LlamaForCausalLM"], ["Qwen2ForCausalLM"]):
         raise ValueError("当前入口只支持 LlamaForCausalLM/Qwen2ForCausalLM")
     total = config.get("num_hidden_layers")
-    if type(total) is not int or total < 4:
-        raise ValueError("模型 num_hidden_layers 必须是至少 4 的整数")
+    if type(total) is not int or total < args.pp_size:
+        raise ValueError("模型 num_hidden_layers 必须为整数且至少等于 PP stage 数")
     if args.layers is None:
         if (args.head_soc, args.peer_soc) == ("910b", "310p"):
             args.layers = "18,18,6,6"
         else:
-            base, remainder = divmod(total, 4)
-            args.layers = ",".join(str(base + (rank < remainder)) for rank in range(4))
+            base, remainder = divmod(total, args.pp_size)
+            args.layers = ",".join(
+                str(base + (rank < remainder)) for rank in range(args.pp_size)
+            )
     counts = args.layers.split(",")
-    if len(counts) != 4 or not all(
+    if len(counts) != args.pp_size or not all(
         s.isascii() and s.isdigit() and int(s) > 0 for s in counts
     ):
-        raise ValueError("layers 需为四个正整数，例如 18,18,6,6")
+        expected = "两个" if args.pp_size == 2 else "四个"
+        raise ValueError(f"layers 需为{expected}正整数，与 PP stage 数一致")
     if sum(map(int, counts)) != total:
-        raise ValueError("四个 stage 层数之和必须等于模型 num_hidden_layers")
+        raise ValueError("stage 层数之和必须等于模型 num_hidden_layers")
 
 
 def select_network(head, peer, interfaces, route_ip, interface=None):
@@ -315,15 +332,23 @@ def resolve_chat_template(value):
 
 def make_launch(args, node_ip, python, environment, output=None):
     validate_options(args)
+    if args.peer is None:
+        args.head = args.head or node_ip
     role = "head" if node_ip == args.head else "worker"
+    per_node = args.pp_size // (2 if args.peer else 1)
+    ips = (args.head,) * per_node + ((args.peer,) * per_node if args.peer else ())
+    socs = (args.head_soc.upper(),) * per_node + (
+        (args.peer_soc.upper(),) * per_node if args.peer else ()
+    )
     plan = {
         "timeout_s": args.startup_timeout,
         "stages": [
             {"node_ip": ip, "soc": soc, "layers": int(count)}
             for ip, soc, count in zip(
-                (args.head, args.head, args.peer, args.peer),
-                (args.head_soc.upper(),) * 2 + (args.peer_soc.upper(),) * 2,
+                ips,
+                socs,
                 args.layers.split(","),
+                strict=True,
             )
         ],
     }
@@ -331,7 +356,9 @@ def make_launch(args, node_ip, python, environment, output=None):
         for stage, ratio in zip(plan["stages"], args.npu_core_fractions, strict=True):
             if ratio != "1":
                 stage["npu_core_fraction"] = ratio
-    if (args.head_soc, args.peer_soc) != ("910b", "310p"):
+    if args.pp_size == 2:
+        plan["validation_mode"] = "910b_pp2"
+    elif (args.head_soc, args.peer_soc) != ("910b", "310p"):
         plan["validation_mode"] = (
             "910b_only" if args.head_soc == args.peer_soc == "910b" else "explicit"
         )
@@ -458,6 +485,8 @@ def profile_head_command(args, role):
         "TRACE_ROOT": str(args.trace_root),
         "PROFILE_COMPUTE_TIMING": args.profile_compute_timing,
         "PROFILE_TRANSPORT": args.transport,
+        "PROFILE_NNODES": "2" if args.peer else "1",
+        "PROFILE_PP_SIZE": str(args.pp_size),
     }
     environment.update(
         {
@@ -496,9 +525,9 @@ def make_native_launch(args, node_ip, python, environment, plan, role):
         "--tensor-parallel-size",
         "1",
         "--pipeline-parallel-size",
-        "4",
+        str(args.pp_size),
         "--nnodes",
-        "2",
+        "2" if args.peer else "1",
         "--node-rank",
         "0" if role == "head" else "1",
         "--master-addr",
@@ -538,7 +567,8 @@ def make_native_launch(args, node_ip, python, environment, plan, role):
         updates["HETERO_PP_PROFILE_COMPUTE_TIMING"] = args.profile_compute_timing
         if role == "head":
             profile_environment.update(
-                PROFILE_MASTER_ADDR=args.head, PROFILE_MASTER_PORT=str(args.master_port)
+                PROFILE_MASTER_ADDR=args.head,
+                PROFILE_MASTER_PORT=str(args.master_port),
             )
         else:
             profile_command = command + ["--seed", "7"]
@@ -867,9 +897,30 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         validate_options(args)
-        if args.dry_run and args.node_ip:
-            node_ip = args.node_ip
+        if args.dry_run and (args.node_ip or args.head):
+            node_ip = args.node_ip or args.head
             network = {"node_ip": node_ip, "interface": args.interface}
+        elif args.peer is None:
+            interface = args.interface or os.environ.get("GLOO_SOCKET_IFNAME")
+            interfaces = ipv4_interfaces()
+            address = args.head or args.node_ip
+            if not address:
+                address = next(
+                    (
+                        ip
+                        for name, addresses in interfaces.items()
+                        if name != "lo" and interface in (None, name)
+                        for ip in addresses
+                        if not ipaddress.IPv4Address(ip).is_loopback
+                    ),
+                    None,
+                )
+            if not address:
+                raise ValueError("找不到本机非回环 IPv4，请指定 --head/--interface")
+            network = choose_network(address, interfaces, address, interface)
+            node_ip = network["node_ip"]
+            if node_ip != address:
+                raise ValueError("--head/--node-ip 必须属于本机所选网卡")
         else:
             interfaces = ipv4_interfaces()
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
@@ -886,9 +937,14 @@ def main(argv=None):
             node_ip = network["node_ip"]
             if args.node_ip and node_ip != args.node_ip:
                 raise ValueError("--node-ip 不属于本机所选网卡")
+        if args.peer is None:
+            args.head = node_ip
         if node_ip == args.head and not args.profile:
             resolve_chat_template(args.chat_template)
-        env = prepare_environment(ROOT, os.environ, args.devices)
+        local_devices = args.pp_size // (2 if args.peer else 1)
+        env = prepare_environment(
+            ROOT, os.environ, args.devices, device_count=local_devices
+        )
         if network["interface"]:
             env["GLOO_SOCKET_IFNAME"] = network["interface"]
         if args.dry_run:
@@ -918,7 +974,7 @@ def main(argv=None):
     try:
         if node_ip == args.head:
             port = args.master_port if args.transport == "hccl" else args.ray_port
-            ports = [(node_ip, port)]
+            ports = [(node_ip, port)] if args.peer else []
             if not args.profile:
                 host = "0.0.0.0" if args.transport == "hccl" else "127.0.0.1"
                 ports.append((host, args.api_port))
@@ -929,6 +985,7 @@ def main(argv=None):
             args,
             output,
             time.monotonic() + args.startup_timeout,
+            local_devices,
         )
         expected = (args.head_soc if node_ip == args.head else args.peer_soc).upper()
         if inventory["soc"] != expected:
@@ -941,7 +998,7 @@ def main(argv=None):
         write_json(output / "local_preflight.json", dict(inventory, network=network))
         write_json(output / "plan.json", launch["plan"])
         if args.transport == "hccl":
-            print("校验本机模型文件内容，用于两端启动比对……", flush=True)
+            print("校验本机模型文件内容，用于 PP rank 启动比对……", flush=True)
             helper = ROOT / "vllm/distributed/hetero_pp/checkpoint_identity.py"
             rc, result = capture(
                 [python, "-S", str(helper), str(args.model)], env, args.startup_timeout
