@@ -98,6 +98,8 @@ def test_overlap_verification_selects_head_profiler_and_small_batches(model):
     command = launch["serve_command"]
     assert launch["environment"]["VLLM_HETERO_PP_VERIFY_OVERLAP"] == "1"
     assert command[command.index("--max-num-batched-tokens") + 1] == "128"
+    assert command.count("--no-enable-prefix-caching") == 1
+    assert command.count("--enable-chunked-prefill") == 1
     profiler = json.loads(command[command.index("--profiler-config") + 1])
     assert profiler["profiler"] == "torch"
 
@@ -179,9 +181,11 @@ def test_hccl_starts_native_mp_on_each_node_without_ray(model, ip, rank):
     assert ("--headless" in command) is (rank == "1")
     assert ("--chat-template" in command) is (rank == "0")
     assert command.count("--no-enable-prefix-caching") == 1
-    assert "--no-async-scheduling" not in command
+    assert command.count("--no-async-scheduling") == 1
+    assert command.count("--enable-chunked-prefill") == 1
     assert "--max-model-len" not in command
     env = launch["environment"]
+    assert env["VLLM_USE_V2_MODEL_RUNNER"] == "0"
     assert env["VLLM_PP_LAYER_PARTITION"] == "18,18,6,6"
     assert env["HCCL_IF_IP"] == ip
     assert env["TP_SOCKET_IFNAME"] == env["GLOO_SOCKET_IFNAME"] == "eth1"
@@ -219,13 +223,22 @@ def test_hccl_uses_balanced_layers_and_native_capacity_defaults(model):
         assert flag not in launch["serve_command"]
 
 
-def test_hccl_serve_accepts_explicit_scheduling_and_chunked_prefill(model):
+@pytest.mark.parametrize(
+    "scheduling,prefill",
+    [
+        ("--no-async-scheduling", "--enable-chunked-prefill"),
+        ("--async-scheduling", "--no-enable-chunked-prefill"),
+    ],
+)
+def test_hccl_serve_accepts_explicit_scheduling_and_chunked_prefill(
+    model, scheduling, prefill
+):
     result = invoke(
         model,
         "--transport",
         "hccl",
-        "--no-async-scheduling",
-        "--enable-chunked-prefill",
+        scheduling,
+        prefill,
         "--model-runner-v1",
         "--seed",
         "7",
@@ -233,8 +246,8 @@ def test_hccl_serve_accepts_explicit_scheduling_and_chunked_prefill(model):
     assert result.returncode == 0, result.stderr
     launch = json.loads(result.stdout)
     command = launch["serve_command"]
-    assert "--no-async-scheduling" in command
-    assert "--enable-chunked-prefill" in command
+    assert [arg for arg in command if arg.endswith("async-scheduling")] == [scheduling]
+    assert [arg for arg in command if arg.endswith("chunked-prefill")] == [prefill]
     assert command[command.index("--seed") + 1] == "7"
     assert launch["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "0"
 
@@ -269,7 +282,7 @@ def test_hccl_service_removes_inherited_gloo_profile_and_ray_state(
         VLLM_PP_TRACE_SESSION="old",
         VLLM_PP_COMPUTE_MODEL="old",
         VLLM_PP_COMPUTE_TIMING="old",
-        VLLM_USE_V2_MODEL_RUNNER="0",
+        VLLM_USE_V2_MODEL_RUNNER="1",
     )
     launch = launcher.make_launch(args, ip, sys.executable, inherited)
     calls = []
@@ -282,9 +295,9 @@ def test_hccl_service_removes_inherited_gloo_profile_and_ray_state(
             "VLLM_PP_TRACE_SESSION",
             "VLLM_PP_COMPUTE_MODEL",
             "VLLM_PP_COMPUTE_TIMING",
-            "VLLM_USE_V2_MODEL_RUNNER",
         ):
             assert name not in env
+        assert env["VLLM_USE_V2_MODEL_RUNNER"] == "0"
         assert json.loads(env["VLLM_HETERO_PP_PLAN"]) == launch["plan"]
         assert env["VLLM_PP_LAYER_PARTITION"] == "12,12,12,12"
         assert kwargs["headless"] is (ip == "192.0.2.20")
@@ -472,12 +485,12 @@ def test_service_uses_vllm_capacity_and_batch_defaults(model):
         "--max-num-batched-tokens",
         "--max-num-seqs",
         "--gpu-memory-utilization",
-        "--enable-chunked-prefill",
-        "--no-enable-prefix-caching",
     ):
         assert flag not in command
     assert "--enforce-eager" in command
     assert "--no-async-scheduling" in command
+    assert command.count("--no-enable-prefix-caching") == 1
+    assert command.count("--enable-chunked-prefill") == 1
 
 
 def test_service_forwards_explicit_capacity_and_batch_overrides(model):
@@ -565,10 +578,10 @@ def test_direct_serve_script_uses_vllm_defaults_and_forwards_overrides(
     for flag in (
         "--max-num-batched-tokens",
         "--max-num-seqs",
-        "--enable-chunked-prefill",
-        "--no-enable-prefix-caching",
     ):
         assert flag not in command
+    assert command.count("--no-enable-prefix-caching") == 1
+    assert command.count("--enable-chunked-prefill") == 1
 
 
 @pytest.mark.parametrize("ip,role", [("192.0.2.10", "head"), ("192.0.2.20", "worker")])

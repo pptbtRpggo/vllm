@@ -118,16 +118,16 @@ def argument_parser():
         "--async-scheduling",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="HCCL 普通服务可显式选择；profiling 使用同步调度",
+        help="HCCL 普通服务可显式开启异步调度，默认同步",
     )
     parser.add_argument(
         "--enable-chunked-prefill",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="HCCL 普通服务可显式选择；profiling 开启",
+        help="HCCL 普通服务可显式选择，默认开启",
     )
     parser.add_argument(
-        "--model-runner-v1", action="store_true", help="HCCL 使用 V1 runner"
+        "--model-runner-v1", action="store_true", help="HCCL 使用 V1 runner（默认）"
     )
     parser.add_argument("--seed", type=int, help="HCCL 普通服务的模型随机种子")
     parser.add_argument(
@@ -384,6 +384,8 @@ def make_launch(args, node_ip, python, environment, output=None):
             "float16",
             "--enforce-eager",
             "--no-async-scheduling",
+            "--enable-chunked-prefill",
+            "--no-enable-prefix-caching",
             "--host",
             "127.0.0.1",
             "--port",
@@ -405,8 +407,6 @@ def make_launch(args, node_ip, python, environment, output=None):
             options.update(max_num_batched_tokens=128, max_num_seqs=4)
             trace_root = (output or args.output or ROOT / "output/preview").absolute()
             serve += [
-                "--enable-chunked-prefill",
-                "--no-enable-prefix-caching",
                 "--profiler-config",
                 json.dumps(
                     {
@@ -473,6 +473,7 @@ def make_native_launch(args, node_ip, python, environment, plan, role):
     updates = {
         "VLLM_HOST_IP": node_ip,
         "HCCL_IF_IP": node_ip,
+        "VLLM_USE_V2_MODEL_RUNNER": "0",
         "VLLM_PP_LAYER_PARTITION": args.layers,
         "VLLM_HETERO_PP_PLAN": json.dumps(plan),
         "HETERO_PP_RUN_MODE": "profile" if args.profile else "serve",
@@ -507,23 +508,16 @@ def make_native_launch(args, node_ip, python, environment, plan, role):
         "--dtype",
         "float16",
         "--enforce-eager",
+        "--async-scheduling" if args.async_scheduling else "--no-async-scheduling",
+        "--no-enable-chunked-prefill"
+        if args.enable_chunked_prefill is False
+        else "--enable-chunked-prefill",
         "--no-enable-prefix-caching",
         "--worker-cls",
         "vllm.distributed.hetero_pp.native_worker.Native910BWorker",
     ]
-    if (
-        args.profile
-        or args.model_runner_v1
-        or any("npu_core_fraction" in stage for stage in plan["stages"])
-    ):
-        updates["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-    if not args.profile:
-        if args.seed is not None:
-            command += ["--seed", str(args.seed)]
-        for name in ("async_scheduling", "enable_chunked_prefill"):
-            value = getattr(args, name)
-            if value is not None:
-                command.append(("--" if value else "--no-") + name.replace("_", "-"))
+    if not args.profile and args.seed is not None:
+        command += ["--seed", str(args.seed)]
     if role == "head" and not args.profile:
         # The peer checks this API for a bounded startup, then remains attached
         # to its own headless worker process. Health is not inference validation.
@@ -547,12 +541,7 @@ def make_native_launch(args, node_ip, python, environment, plan, role):
                 PROFILE_MASTER_ADDR=args.head, PROFILE_MASTER_PORT=str(args.master_port)
             )
         else:
-            profile_command = command + [
-                "--no-async-scheduling",
-                "--enable-chunked-prefill",
-                "--seed",
-                "7",
-            ]
+            profile_command = command + ["--seed", "7"]
     return dict(
         transport="hccl",
         role=role,

@@ -140,6 +140,7 @@ head 自动采集、回收 peer trace、打印表格和输出 DP。peer 不重�
 统一启动入口的普通服务已改为沿用 vLLM 的容量/组批默认值；`--profile` 仍独立
 保留上下文 512、token budget 256、序列数 4、显存比例 0.8 的原采集配置，均可
 显式覆盖。验证推荐方案时，普通服务须显式对齐本轮采集配置。
+Gloo 与 HCCL 的采集和普通服务均通过启动脚本关闭前缀缓存。
 
 ### 两机四张 910B，用 HCCL 对不同核心额度做 profile
 
@@ -175,11 +176,9 @@ headless worker。
 各自填写本机的 `--model` 和 `--devices`。原分层对照只替换 `--layers`，
 两轮使用相同核心额度、容量和组批设置。固定 KV block 数不足时，采集会在加载
 权重前给出所需的最小 block 数。
-此 HCCL 启动入口的采集和普通服务均关闭前缀缓存。采集使用同步调度，
-生成的回测参数显式开启异步调度，并保留采集时的 checkpoint、V1 runner、
-seed 和 chunked prefill 设置。
-手动启动普通服务时，也可以用对应的 `--no-async-scheduling` 和
-`--no-enable-chunked-prefill` 关闭这些功能。
+此 HCCL 启动入口的采集和普通服务默认使用同步调度、V1 runner 和 chunked
+prefill，并关闭前缀缓存。生成的回测参数保留同步调度、采集时的 checkpoint、
+V1 runner、seed 和 chunked prefill 设置。
 
 已有容器且 Ray 已连好、推理服务已退出：只在 head 容器中运行：
 

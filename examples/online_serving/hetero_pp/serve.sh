@@ -13,4 +13,5 @@ export VLLM_USE_V2_MODEL_RUNNER=0
 python -m vllm.distributed.hetero_pp.serve --model "$MODEL" \
   --pipeline-parallel-size 4 --tensor-parallel-size 1 \
   --dtype float16 --enforce-eager --no-async-scheduling \
+  --enable-chunked-prefill --no-enable-prefix-caching \
   --host 127.0.0.1 --port 8000 "$@"

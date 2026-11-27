@@ -321,11 +321,11 @@ embedding 和输出 head 仍在首末 stage，也会占用显存和计算时间�
 | `--gpu-memory-utilization N` | 普通服务省略时使用当前 vLLM 的显存比例默认值 |
 | `--output /可写路径/新目录` | 日志目录；已存在时拒绝覆盖 |
 
-普通服务不再预设 `512/256/4/0.8`，也不再强制开启 chunked prefill 或关闭
-prefix caching；由所用 vLLM 版本、模型和设备选择默认值。显式传入上述容量参数
-仍覆盖默认值。Docker 入口只转发这些参数，不额外定义一套容量默认值。
-已有 Ray 集群使用 `serve.sh` 时也沿用 vLLM 默认，并可在脚本后追加 vLLM 参数。
-FP16、eager、同步调度、PP4/TP1 是当前 CPU/Gloo 后端的支持条件，仍明确传入。
+普通服务的容量参数沿用 vLLM 根据模型与设备选择的默认值，显式传入的容量参数
+会覆盖默认值。Gloo、HCCL 普通服务和使用已有 Ray 集群的 `serve.sh` 默认使用
+FP16、eager、PP4/TP1、V1 runner 和同步调度，开启 chunked prefill，关闭前缀缓存。
+HCCL 普通服务可显式传 `--async-scheduling` 开启异步调度，或传
+`--no-enable-chunked-prefill` 关闭分块 prefill。
 
 `--profile` 是独立的小规模采集模式，省略容量参数时仍使用上下文 512、token
 budget 256、序列上限 4、显存比例 0.8，并保持 chunked prefill 开启、prefix

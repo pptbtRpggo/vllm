@@ -1148,7 +1148,7 @@ def _native_trace_off_args(
     ):
         if scope[key] is not None:
             arguments += ["--" + key.replace("_", "-"), str(scope[key])]
-    arguments.append("--async-scheduling")
+    arguments.append("--no-async-scheduling")
     arguments.append(
         "--enable-chunked-prefill"
         if scope["enable_chunked_prefill"]
@@ -1224,7 +1224,7 @@ def format_serve_command(plan: PPPartitionPlan, dump_dir=None) -> str:
             "Trace-off HCCL candidate using the profiled capacity on both nodes:\n"
             f"{shlex.join(args)}\n"
             "Reuse the local model path and device selection on each node. "
-            "Prefix caching stays off and asynchronous scheduling is enabled. "
+            "Use synchronous scheduling with prefix caching disabled. "
             f"For the baseline, change only --layers to {original_layers}. "
             "Validate full token IDs and actual memory after re-serve."
         )

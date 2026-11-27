@@ -731,7 +731,7 @@ class ProfileControllerTests(unittest.TestCase):
             f"--expected-checkpoint-sha256 {checkpoint_sha256}",
             "--model-runner-v1",
             "--seed 7",
-            "--async-scheduling",
+            "--no-async-scheduling",
             "--no-enable-chunked-prefill",
             "change only --layers to 2,2,2,2",
         ):
